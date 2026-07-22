@@ -4,7 +4,7 @@ include $(CLEAR_VARS)
 LOCAL_MODULE := avc_bypass
 LOCAL_SRC_FILES := avc_bypass.c
 
-LOCAL_CFLAGS := -fPIE -Wall -Wextra -O2 -Wno-unused-result -Wno-format
+LOCAL_CFLAGS := -fPIE -Wall -Wextra -O2 -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -pthread
 LOCAL_LDFLAGS := -fPIE -pie
 
 include $(BUILD_EXECUTABLE)
