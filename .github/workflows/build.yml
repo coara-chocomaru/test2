@@ -47,7 +47,6 @@ jobs:
       - name: Build with ndk-build
         run: |
           export PATH="${{ env.NDK_HOME }}:${{ env.NDK_HOME }}/bin:$PATH"
-          which ndk-build || { echo "ndk-build not found!"; exit 1; }
           ndk-build \
             NDK_PROJECT_PATH=. \
             APP_BUILD_SCRIPT=./Android.mk \
@@ -55,8 +54,6 @@ jobs:
             APP_PLATFORM=${{ env.API_LEVEL }} \
             -j$(nproc) \
             V=1
-
-          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
