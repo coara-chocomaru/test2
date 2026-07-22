@@ -43,6 +43,38 @@ jobs:
           echo "${{ env.NDK_HOME }}" >> $GITHUB_PATH
           echo "NDK_HOME=${{ env.NDK_HOME }}" >> $GITHUB_ENV
 
+      - name: Ensure source file exists
+        run: |
+          if [ ! -f "${{ env.SOURCE_FILE }}" ]; then
+            C_FILE=$(ls *.c 2>/dev/null | head -n1)
+            if [ -n "$C_FILE" ]; then
+              echo "Renaming $C_FILE to ${{ env.SOURCE_FILE }}"
+              mv "$C_FILE" "${{ env.SOURCE_FILE }}"
+            else
+              echo "Error: No .c file found!"
+              exit 1
+            fi
+          fi
+          echo "Source file: ${{ env.SOURCE_FILE }}"
+          ls -la *.c *.h 2>/dev/null || true
+
+      - name: Generate Android.mk
+        run: |
+          cat > Android.mk << 'EOF'
+          LOCAL_PATH := $(call my-dir)
+          include $(CLEAR_VARS)
+
+          LOCAL_MODULE := ${{ env.MODULE_NAME }}
+          LOCAL_SRC_FILES := ${{ env.SOURCE_FILE }}
+
+          LOCAL_CFLAGS := -fPIE -Wall -Wextra -O2 -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -pthread
+          LOCAL_LDFLAGS := -fPIE -pie
+
+          include $(BUILD_EXECUTABLE)
+          EOF
+          echo "Generated Android.mk:"
+          cat Android.mk
+
       - name: Build with ndk-build
         run: |
           export PATH=${{ env.NDK_HOME }}/bin:$PATH
@@ -52,7 +84,29 @@ jobs:
             APP_ABI=${{ env.TARGET_ABI }} \
             APP_PLATFORM=${{ env.API_LEVEL }} \
             -j$(nproc) \
-            V=1 
+            V=1
+
+      - name: Verify and prepare binary for upload
+        run: |
+          EXPECTED_DIR="libs/${{ env.TARGET_ABI }}"
+          EXPECTED_BIN="$EXPECTED_DIR/${{ env.MODULE_NAME }}"
+          echo "Looking for binary at $EXPECTED_BIN"
+          if [ -f "$EXPECTED_BIN" ]; then
+            echo "Binary found."
+            file "$EXPECTED_BIN"
+            ls -la "$EXPECTED_BIN"
+          else
+            ALT_BIN=$(find libs -type f -executable 2>/dev/null | head -n1)
+            if [ -n "$ALT_BIN" ]; then
+              echo "Found alternative binary: $ALT_BIN"
+              mkdir -p "$EXPECTED_DIR"
+              mv "$ALT_BIN" "$EXPECTED_BIN"
+              echo "Renamed to $EXPECTED_BIN"
+            else
+              echo "Error: No binary found in libs/"
+              exit 1
+            fi
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
