@@ -77,7 +77,8 @@ jobs:
 
       - name: Build with ndk-build
         run: |
-          export PATH=${{ env.NDK_HOME }}/bin:$PATH
+          # PATH に NDK のルートと bin を追加（ndk-build はルートにあり、ツール類は bin にある）
+          export PATH="${{ env.NDK_HOME }}:${{ env.NDK_HOME }}/bin:$PATH"
           ndk-build \
             NDK_PROJECT_PATH=. \
             APP_BUILD_SCRIPT=./Android.mk \
