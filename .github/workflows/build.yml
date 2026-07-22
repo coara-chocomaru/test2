@@ -40,19 +40,23 @@ jobs:
         run: |
           wget -q https://dl.google.com/android/repository/android-ndk-${{ env.NDK_VERSION }}-linux.zip
           unzip -q android-ndk-${{ env.NDK_VERSION }}-linux.zip
-          echo "${{ env.NDK_HOME }}" >> $GITHUB_PATH
           echo "NDK_HOME=${{ env.NDK_HOME }}" >> $GITHUB_ENV
+          echo "${{ env.NDK_HOME }}" >> $GITHUB_PATH
+
 
       - name: Build with ndk-build
         run: |
-          export PATH=${{ env.NDK_HOME }}/bin:$PATH
+          export PATH="${{ env.NDK_HOME }}:${{ env.NDK_HOME }}/bin:$PATH"
+          which ndk-build || { echo "ndk-build not found!"; exit 1; }
           ndk-build \
             NDK_PROJECT_PATH=. \
             APP_BUILD_SCRIPT=./Android.mk \
             APP_ABI=${{ env.TARGET_ABI }} \
             APP_PLATFORM=${{ env.API_LEVEL }} \
             -j$(nproc) \
-            V=1 
+            V=1
+
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
