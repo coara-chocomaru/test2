@@ -1,4 +1,3 @@
-// root_shell.h
 #ifndef ROOT_SHELL_H
 #define ROOT_SHELL_H
 
