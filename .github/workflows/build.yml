@@ -15,8 +15,8 @@ jobs:
       NDK_HOME: ${{ github.workspace }}/android-ndk-r25c
       TARGET_ABI: arm64-v8a
       API_LEVEL: android-31
-      MODULE_NAME: avc_bypass
-      SOURCE_FILE: avc_bypass.c
+      MODULE_NAME: root_shell
+      SOURCE_FILE: root_shell.c
 
     steps:
       - name: Checkout repository
