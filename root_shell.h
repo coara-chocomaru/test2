@@ -82,10 +82,10 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
-#define VMLINUX_TEXT      0xffffffc010080000ULL
-#define VMLINUX_INIT_CRED 0xffffffc012197d08ULL
-#define VMLINUX_SELINUX_STATE 0xffffffc0123a4000ULL
-#define VMLINUX_SELINUX_ENFORCING_BOOT 0xffffffc01240744cULL
+#define VMLINUX_TEXT      0xffffffee85a80000ULL
+#define VMLINUX_INIT_CRED 0xffffffee8817b738ULL
+#define VMLINUX_SELINUX_STATE 0xffffffee8833a000ULL
+#define VMLINUX_SELINUX_ENFORCING_BOOT 0xffffffee883a7f14ULL
 
 #define CRED_OFF    0x740
 #define REAL_CRED_OFF 0x738
