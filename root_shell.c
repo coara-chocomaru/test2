@@ -1,4 +1,3 @@
-// root_shell.c
 #include "root_shell.h"
 
 int kgsl_fd = -1;
