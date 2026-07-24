@@ -19,7 +19,6 @@
 #include <linux/perf_event.h>
 #include <asm/unistd.h>
 #include <sys/wait.h>
-#include <signal.h>
 #include <sys/select.h>
 #include <poll.h>
 #include <sys/stat.h>
@@ -89,6 +88,7 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 
 #define CRED_OFF    0x740
 #define REAL_CRED_OFF 0x738
+#define CRED_COPY_SIZE 0x100
 
 #define SPRAY_PIDS 2000
 #define SCAN_DWORDS 560
