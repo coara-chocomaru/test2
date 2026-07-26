@@ -118,6 +118,9 @@ struct kgsl_cmdstream_readtimestamp_ctxtid {
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
+/* 成功時の固定アドレス（ランタイム） */
+#define FIXED_SELINUX_STATE  0xFFFFFFEEB3A3A000ULL
+
 #define SCAN_DWORDS 1024
 #define N_AVC_CHILD 10
 
