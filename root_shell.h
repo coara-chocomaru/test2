@@ -89,7 +89,6 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define VMLINUX_SELINUX_ENFORCING_BOOT 0xffffffee883a7f14ULL
 
 #define SCAN_DWORDS 1024
-#define N_AVC_CHILD 48
 #define SPRAY_PIDS 2000
 #define CRED_COPY_SIZE 0x100
 
