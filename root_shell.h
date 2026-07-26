@@ -111,6 +111,7 @@ unsigned int create_context(int fd);
 int wait_timestamp(int fd, unsigned int ctx_id, unsigned int target);
 int submit_ib(int fd, unsigned int ctx_id, uint64_t ib_ga, size_t bytes, unsigned int ib_id, unsigned int *out_ts);
 void *race_thread(void *arg);
+uint64_t get_selinux_state_from_file(void);
 uint64_t get_kaslr_offset(void);
 void flush_cpu_cache(void *start, size_t len);
 void gen_avc_entries_enhanced(void);
