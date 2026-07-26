@@ -90,6 +90,8 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 
 #define SCAN_DWORDS 1024
 #define N_AVC_CHILD 48
+#define SPRAY_PIDS 2000
+#define CRED_COPY_SIZE 0x100
 
 #define CP_NOP 0x10
 #define CP_MEM_TO_MEM 0x73
