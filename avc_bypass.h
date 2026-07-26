@@ -1,4 +1,3 @@
-// avc_bypass.h
 #ifndef AVC_BYPASS_H
 #define AVC_BYPASS_H
 
@@ -119,7 +118,7 @@ struct kgsl_cmdstream_readtimestamp_ctxtid {
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
-/* 成功時の固定アドレス（ランタイム） */
+/* 成功時の固定アドレス（ランタイム） - あなたの端末の正しい値に合わせてください */
 #define FIXED_SELINUX_STATE  0xFFFFFFEEB3A3A000ULL
 
 #define SCAN_DWORDS 1024
