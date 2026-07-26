@@ -1,4 +1,4 @@
-
+// root_shell.h
 #ifndef ROOT_SHELL_H
 #define ROOT_SHELL_H
 
@@ -83,8 +83,9 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
-#define VMLINUX_TEXT      0xffffffee85a81000ULL   /* _stext */
-#define VMLINUX_INIT_CRED 0xffffffee8817b738ULL   /* init_cred */
+
+#define VMLINUX_INIT_CRED 0xffffffee8817b738ULL   /* init_cred *
+#define VMLINUX_TEXT      0xffffffee85a81000ULL   /* 使用しない */
 #define VMLINUX_SELINUX_STATE 0xffffffc0123a4000ULL
 #define VMLINUX_SELINUX_ENFORCING_BOOT 0xffffffc01240744cULL
 
