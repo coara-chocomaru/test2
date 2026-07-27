@@ -20,7 +20,6 @@
 #include <linux/perf_event.h>
 #include <asm/unistd.h>
 #include <sys/wait.h>
-#include <signal.h>
 #include <sys/select.h>
 #include <poll.h>
 #include <sys/stat.h>
