@@ -83,14 +83,9 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
-
-#define VMLINUX_INIT_CRED 0xffffffee8817b738ULL   /* init_cred *
-#define VMLINUX_TEXT      0xffffffee85a81000ULL   /* 使用しない */
-#define VMLINUX_SELINUX_STATE 0xffffffc0123a4000ULL
-#define VMLINUX_SELINUX_ENFORCING_BOOT 0xffffffc01240744cULL
-
-#define CRED_OFF    0x740
-#define REAL_CRED_OFF 0x738
+#define FIXED_INIT_CRED 0xFFFFFFEE8817B738ULL
+#define FIXED_SELINUX_STATE 0xFFFFFFEE8833A000ULL
+#define FIXED_ENFORCING_BOOT 0xFFFFFFEE883A7F14ULL
 
 #define SPRAY_PIDS 2000
 #define SCAN_DWORDS 560
@@ -98,8 +93,5 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define CP_NOP 0x10
 #define CP_MEM_WRITE 0x3D
 #define CP_MEM_TO_MEM 0x73
-#define CP_WAIT_MEM_WRITES 0x12
-#define CP_EVENT_WRITE 0x46
-#define CACHE_FLUSH_TS 0x1C
 
 #endif
