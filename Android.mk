@@ -1,5 +1,7 @@
+# Android.mk
 LOCAL_PATH := $(call my-dir)
 include $(CLEAR_VARS)
+
 LOCAL_MODULE := root_shell
 LOCAL_SRC_FILES := root_shell.c
 
