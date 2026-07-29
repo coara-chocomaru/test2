@@ -22,6 +22,7 @@
 #include <sys/select.h>
 #include <poll.h>
 #include <sys/stat.h>
+#include <dirent.h>
 
 #define KGSL_IOC_TYPE 0x09
 
@@ -81,13 +82,14 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
-#define OFFSET_INIT_CRED                  0x2117d08ULL
-#define OFFSET_SELINUX_STATE              0x28b9000ULL
-#define OFFSET_SELINUX_ENFORCING_BOOT     0x2926f14ULL
+#define OFFSET_INIT_CRED               0x2117d08ULL
+#define OFFSET_SELINUX_STATE           0x28b9000ULL
+#define OFFSET_SELINUX_ENFORCING_BOOT  0x2926f14ULL
 
 #define SPRAY_PIDS 3000
 #define SCAN_DWORDS 560
 #define AVC_SCAN_DWORDS 1024
+#define AVC_CHILD_COUNT 10
 
 #define CP_NOP 0x10
 #define CP_MEM_WRITE 0x3D
