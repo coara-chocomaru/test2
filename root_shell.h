@@ -81,9 +81,9 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
-#define OFFSET_INIT_CRED 0x2117d08ULL
-#define VMLINUX_TEXT      0xffffffc010080000ULL
-#define VMLINUX_INIT_CRED 0xffffffc012197d08ULL
+#define OFFSET_INIT_CRED                  0x2117d08ULL
+#define OFFSET_SELINUX_STATE              0x28b9000ULL
+#define OFFSET_SELINUX_ENFORCING_BOOT     0x2926f14ULL
 
 #define SPRAY_PIDS 3000
 #define SCAN_DWORDS 560
