@@ -28,9 +28,6 @@
 #define KGSL_USER_MEM_TYPE_ADDR              0x1
 #define KGSL_GPUOBJ_IMPORT_WRITE             0x1
 
-#define CP_NOP                               0x10
-#define CP_MEM_WRITE                         0x19
-
 struct kgsl_gpuobj_info {
     uint64_t gpuaddr;
     uint64_t size;
@@ -61,6 +58,40 @@ struct kgsl_drawobj_sync {
     uint32_t type;
     uint32_t handle;
     uint32_t id;
+};
+
+struct kgsl_drawobj {
+    uint32_t type;
+    uint32_t flags;
+    uint32_t context_id;
+    uint32_t timestamp;
+};
+
+struct kgsl_drawobj_cmd {
+    uint32_t type;
+    uint32_t flags;
+    uint32_t context_id;
+    uint32_t timestamp;
+    uint32_t cmdlist_count;
+    uint32_t cmdlist_offset;
+    uint32_t synclist_count;
+    uint32_t synclist_offset;
+    uint32_t privdata;
+    uint32_t priority;
+};
+
+struct kgsl_drawobj_cmdlist {
+    uint64_t gpuaddr;
+    uint64_t size;
+    uint32_t type;
+    uint32_t flags;
+};
+
+struct kgsl_drawobj_synclist {
+    uint64_t gpuaddr;
+    uint64_t size;
+    uint32_t type;
+    uint32_t flags;
 };
 
 #endif
