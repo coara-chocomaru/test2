@@ -22,6 +22,7 @@
 #include <elf.h>
 #include <link.h>
 
+
 #define KGSL_IOC_TYPE 0x09
 
 struct kgsl_gpuobj_alloc {
