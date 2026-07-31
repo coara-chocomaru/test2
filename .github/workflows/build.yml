@@ -2,9 +2,9 @@ name: Build ARM64 Binary for Android 11+
 
 on:
   push:
-    branches: check
+    branches: p_check
   pull_request:
-    branches: check
+    branches: p_check
   workflow_dispatch:
 
 jobs:
