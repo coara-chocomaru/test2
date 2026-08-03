@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <sys/types.h>
+#include <sys/ioctl.h>
 
 #define KGSL_IOC_TYPE 0x09
 
@@ -12,7 +13,6 @@ struct kgsl_gpuobj_alloc {
     uint64_t mmapsize; unsigned int id;
     unsigned int metadata_len; uint64_t metadata;
 };
-
 #define IOCTL_KGSL_GPUOBJ_ALLOC _IOWR(KGSL_IOC_TYPE, 0x45, struct kgsl_gpuobj_alloc)
 
 struct kgsl_gpuobj_free { uint64_t flags; uint64_t priv; unsigned int id; unsigned int type; unsigned int len; unsigned int __pad; };
@@ -68,6 +68,5 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define AVC_LOOP_SECONDS 150
 
 #define SPRAY_PIDS 2000
-#define CHURN_MAX_PATHS 4096
 
 #endif
