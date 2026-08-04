@@ -1,7 +1,4 @@
-// check_poc_dynamic.c
-// Fully dynamic information gatherer for KGSL kernel exploit porting.
-// No hardcoded addresses; all symbols and offsets are obtained at runtime.
-// Compile with: gcc -pthread -o check_poc check_poc_dynamic.c
+
 
 #include <stdio.h>
 #include <stdlib.h>
