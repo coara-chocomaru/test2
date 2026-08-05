@@ -55,8 +55,6 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define UAF_SIZE  0x10004000ULL
 #define OVERLAP_SIZE 0x1000
 #define AVC_ENFORCE_PATH "/sys/fs/selinux/enforce"
-#define AVC_NODE_STRIDE  72
-#define AVC_NODES_PER_PAGE (4096 / AVC_NODE_STRIDE)
 #define SPRAY_PIDS 2000
 
 #define VMLINUX_TEXT 0xffffffc010080000ULL
