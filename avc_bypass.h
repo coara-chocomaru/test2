@@ -51,7 +51,7 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CONTEXT_NO_GMEM_ALLOC 0x00000002
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
-
+#define OVERLAP_COUNT 100
 #define UAF_SIZE  0x10004000ULL
 #define OVERLAP_SIZE 0x1000
 #define AVC_ENFORCE_PATH "/sys/fs/selinux/enforce"
