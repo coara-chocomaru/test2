@@ -73,9 +73,9 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define UAF_ADDR  0x7001ff000ULL
 #define UAF_SIZE  0x10004000ULL          // 16MB+16KB
 #define OVERLAP_ADDR 0x7001fe000ULL
-#define OVERLAP_SIZE 0x1000ULL
+#define OVERLAP_SIZE 0x7000ULL
 #define BOGUS_ADDR 0x700204000ULL
-#define BOGUS_SIZE 0x1000ULL
+#define BOGUS_SIZE 0xffffffffffefd000ULL
 #define PLACEHOLDER_ADDR 0x710204000ULL   // UAF終端直後
 #define PLACEHOLDER_SIZE 0x10400000ULL    // 16MB+256KB
 
