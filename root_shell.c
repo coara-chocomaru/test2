@@ -1,8 +1,4 @@
-/*
- * cve33107_exploit – 移植至 Android 9 (内核 4.14) / MSM8940 (Adreno 505)
- * 原始链: KGSL UAF → 抢占 task_struct → GPU 扫描并覆写 cred → 提权
- * 修改: 符号偏移适配 4.14，增强 KASLR 检测鲁棒性
- */
+
 
 #include <stdio.h>
 #include <stdlib.h>
