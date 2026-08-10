@@ -170,9 +170,10 @@ static uint64_t detect_kaslr(void) {
 
     if (n_ips == 0) { printf("  perf: no kernel IPs\n"); return 0; }
 
-    uint64_t ic_addr = (first_kernel_ip & ~0x1FFFFFULL) + (VMLINUX_INIT_CRED & 0x1FFFFFULL);
-    printf("    first_kernel_ip=0x%lX init_cred=0x%lX\n",
-        (unsigned long)first_kernel_ip, (unsigned long)ic_addr);
+    uint64_t kaslr = first_kernel_ip - VMLINUX_TEXT;
+    uint64_t ic_addr = VMLINUX_INIT_CRED + kaslr;
+    printf("    first_kernel_ip=0x%lX kaslr=0x%lX init_cred=0x%lX\n",
+        (unsigned long)first_kernel_ip, (unsigned long)kaslr, (unsigned long)ic_addr);
     return ic_addr;
 }
 
