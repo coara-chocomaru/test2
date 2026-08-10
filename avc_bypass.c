@@ -371,9 +371,28 @@ static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
     int nodes_per_page = 4096 / stride;
     if (nodes_per_page == 0) return 0;
 
+    // Calculate max pages per batch to avoid IB overflow
+    // Each node read: 4 dwords * (1 opcode + 5 params) = 24 dwords
+    int dwords_per_node_read = 4 * 6;
+    int dwords_per_page = nodes_per_page * dwords_per_node_read;
+    int max_pages_read = (0x10000 - 512) / (dwords_per_page * 4);
+    if (max_pages_read < 1) max_pages_read = 1;
+    if (max_pages_read > AVC_PAGES_PER_IB) max_pages_read = AVC_PAGES_PER_IB;
+
+    // Also limit by write buffer: each write is 5 dwords, worst-case all nodes match
+    int dwords_per_node_write = 5;
+    int dwords_per_page_write = nodes_per_page * dwords_per_node_write;
+    int max_pages_write = (0x10000 - 512) / (dwords_per_page_write * 4);
+    if (max_pages_write < 1) max_pages_write = 1;
+    if (max_pages_write > AVC_PAGES_PER_IB) max_pages_write = AVC_PAGES_PER_IB;
+
+    int max_batch = (max_pages_read < max_pages_write) ? max_pages_read : max_pages_write;
+    if (max_batch < 1) max_batch = 1;
+
     while (idx < npages) {
         int batch = npages - idx;
-        if (batch > AVC_PAGES_PER_IB) batch = AVC_PAGES_PER_IB;
+        if (batch > max_batch) batch = max_batch;
+
         int node_dws = batch * nodes_per_page * 4;
         memset(ib_m, 0, 0x10000);
         memset(dst_m, 0, node_dws * 4);
