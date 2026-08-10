@@ -368,12 +368,21 @@ static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
     uint32_t *data = (uint32_t *)dst_m;
     int total_flips = 0, idx = 0;
     unsigned int ts;
+
     int nodes_per_page = 4096 / stride;
     if (nodes_per_page == 0) return 0;
 
+    int max_dwords = (0x10000 - 512) / 4;
+    int dwords_per_node_read = 4 * 6;
+    int dwords_per_page = nodes_per_page * dwords_per_node_read;
+    int max_pages_per_batch = max_dwords / dwords_per_page;
+    if (max_pages_per_batch < 1) max_pages_per_batch = 1;
+    if (max_pages_per_batch > AVC_PAGES_PER_IB) max_pages_per_batch = AVC_PAGES_PER_IB;
+
     while (idx < npages) {
         int batch = npages - idx;
-        if (batch > AVC_PAGES_PER_IB) batch = AVC_PAGES_PER_IB;
+        if (batch > max_pages_per_batch) batch = max_pages_per_batch;
+
         int node_dws = batch * nodes_per_page * 4;
         memset(ib_m, 0, 0x10000);
         memset(dst_m, 0, node_dws * 4);
