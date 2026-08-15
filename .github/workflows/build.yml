@@ -1,20 +1,20 @@
-name: Build ARM64 Binary for Android 11+
+name: Build ARM32 Binary for Android 8
 
 on:
   push:
-    branches: shell
+    branches: a7_shell
   pull_request:
-    branches: shell
+    branches: a7_shell
   workflow_dispatch:
 
 jobs:
-  build-android-arm64:
+  build-android-arm32:
     runs-on: ubuntu-latest
     env:
-      NDK_VERSION: r25c
-      NDK_HOME: ${{ github.workspace }}/android-ndk-r25c
-      TARGET_ABI: arm64-v8a
-      API_LEVEL: android-31
+      NDK_VERSION: r23b
+      NDK_HOME: ${{ github.workspace }}/android-ndk-r23b
+      TARGET_ABI: armeabi-v7a
+      API_LEVEL: android-26
       MODULE_NAME: root_shell
       SOURCE_FILE: root_shell.c
 
@@ -43,7 +43,6 @@ jobs:
           echo "NDK_HOME=${{ env.NDK_HOME }}" >> $GITHUB_ENV
           echo "${{ env.NDK_HOME }}" >> $GITHUB_PATH
 
-
       - name: Build with ndk-build
         run: |
           export PATH="${{ env.NDK_HOME }}:${{ env.NDK_HOME }}/bin:$PATH"
@@ -58,6 +57,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.MODULE_NAME }}_arm64_android11
+          name: ${{ env.MODULE_NAME }}_arm32_android8
           path: libs/${{ env.TARGET_ABI }}/${{ env.MODULE_NAME }}
           if-no-files-found: error
