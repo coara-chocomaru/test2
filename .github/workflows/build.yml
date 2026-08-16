@@ -1,4 +1,4 @@
-name: Build ARM64 Binary for Android 11+
+name: Build ARM64 Binary for Android 9
 
 on:
   push:
@@ -13,7 +13,7 @@ jobs:
     env:
       NDK_VERSION: r23c
       NDK_HOME: ${{ github.workspace }}/android-ndk-r23c
-      TARGET_ABI: arm64-v8a
+      TARGET_ABI: armeabi-v7a
       API_LEVEL: android-28
       MODULE_NAME: root_shell
       SOURCE_FILE: root_shell.c
@@ -58,6 +58,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.MODULE_NAME }}_arm64_android11
+          name: ${{ env.MODULE_NAME }}_arm64_android9
           path: libs/${{ env.TARGET_ABI }}/${{ env.MODULE_NAME }}
           if-no-files-found: error
