@@ -9,7 +9,7 @@
 #ifdef CONFIG_SECCOMP
 
 #include <linux/thread_info.h>
-#include <asm/seccomp.h>
+#include "asm/seccomp.h"
 
 struct seccomp_filter;
 /**
