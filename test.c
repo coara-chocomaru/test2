@@ -27,8 +27,6 @@
 #include <sys/reboot.h>
 #include <stdint.h>
 #include <sys/fsuid.h>
-#include <linux/binder.h>
-#include <linux/android/binder.h>
 #include "binder.h"
 
 extern int setfsuid(uid_t);
