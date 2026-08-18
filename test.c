@@ -27,8 +27,8 @@
 #include <sys/reboot.h>
 #include <stdint.h>
 #include <sys/fsuid.h>
-#include "seccomp.hu
-#include "binder.h"                /* 提供されたヘッダ（存在する場合） */
+#include "seccomp.h"
+#include "binder.h"
 
 /* ---------- 定数 ---------- */
 #define PAGE_SIZE 4096
