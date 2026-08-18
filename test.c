@@ -28,7 +28,6 @@
 #include <sys/reboot.h>
 #include <stdint.h>
 #include <sys/fsuid.h>
-#include <linux/binder.h>          /* Binder 構造体定義 */
 #include <linux/android/binder.h>  /* 互換用 */
 
 #include "binder.h"                /* 提供されたヘッダ（存在する場合） */
