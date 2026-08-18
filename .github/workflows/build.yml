@@ -11,7 +11,7 @@ jobs:
   build-android-arm64:
     runs-on: ubuntu-latest
     env:
-      NDK_VERSION: r23c
+      NDK_VERSION: r25c
       NDK_HOME: ${{ github.workspace }}/android-ndk-r25c
       TARGET_ABI: arm64-v8a
       API_LEVEL: android-28
