@@ -16,7 +16,6 @@
 #include <sched.h>
 #include <signal.h>
 #include <sys/prctl.h>
-#include <linux/seccomp.h>
 #include <sys/capability.h>
 #include <grp.h>
 #include <sys/ptrace.h>
@@ -28,7 +27,7 @@
 #include <sys/reboot.h>
 #include <stdint.h>
 #include <sys/fsuid.h>
-
+#include "seccomp.hu
 #include "binder.h"                /* 提供されたヘッダ（存在する場合） */
 
 /* ---------- 定数 ---------- */
