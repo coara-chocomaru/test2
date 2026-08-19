@@ -28,7 +28,7 @@
 #include <stdint.h>
 #include <sys/fsuid.h>
 #include <sys/shm.h>
-#include <linux/ashmem.h>
+#include "ashmem.h"
 #include "ion.h"
 #include "binder.h"
 #include "offsets.h"
