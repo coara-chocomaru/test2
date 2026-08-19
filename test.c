@@ -127,7 +127,7 @@ int main(int argc, char **argv) {
     sigaction(SIGBUS, &sa, NULL);
 
     // バイナリをダイナミックロード（共有ライブラリとして）
-    const char *libpath = "/data/local/tmp/wac_flash";
+    const char *libpath = "/vendor/bin/wac_flash";
     if (argc > 1) libpath = argv[1];
 
     void *handle = dlopen(libpath, RTLD_LAZY);
