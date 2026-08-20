@@ -12,15 +12,10 @@
 
 void setup_test_environment(void) {
     struct stat st;
-    if (stat(TEST_DIR, &st) == 0) {
-        cleanup_test_environment();
-    }
+    if (stat(TEST_DIR, &st) == 0) cleanup_test_environment();
     mkdir(TEST_DIR, 0755);
+    mkdir(TARGET_DIR, 0755);  // chown対象のディレクトリ
 
-    // ターゲットディレクトリ（chown対象）を作成
-    mkdir(TARGET_DIR, 0755);
-
-    // シンボリックリンク先を TARGET_DIR に変更
     char parent[PATH_MAX];
     strcpy(parent, CACHE_DIR);
     char *slash = strrchr(parent, '/');
@@ -32,7 +27,7 @@ void setup_test_environment(void) {
         perror("symlink");
         exit(1);
     }
-    printf("[ENV] セットアップ完了: %s -> %s\n", CACHE_DIR, TARGET_DIR);
+    printf("[ENV] %s -> %s\n", CACHE_DIR, TARGET_DIR);
 }
 
 void cleanup_test_environment(void) {
