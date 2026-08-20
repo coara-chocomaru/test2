@@ -141,6 +141,7 @@ int connect_to_port(int port, const char *host) {
     return sock;
 }
 
+// 送信関数: データを送信。len=0 の場合は strlen を使用
 int send_data(int sock, const char *data, size_t len) {
     if (len == 0) len = strlen(data);
     ssize_t sent = send(sock, data, len, MSG_NOSIGNAL);
@@ -167,9 +168,10 @@ int recv_data(int sock, char *buf, size_t buf_size) {
     return (int)n;
 }
 
-int send_recv_exchange(int sock, const char *send_data, char *recv_buf, size_t recv_size) {
-    if (send_data && send_data[0]) {
-        if (send_data(sock, send_data, 0) < 0) return -1;
+// 送受信交換: 引数名を変更して競合を解消
+int send_recv_exchange(int sock, const char *data_to_send, char *recv_buf, size_t recv_size) {
+    if (data_to_send && data_to_send[0]) {
+        if (send_data(sock, data_to_send, 0) < 0) return -1;
     }
     if (recv_buf && recv_size > 0) {
         return recv_data(sock, recv_buf, recv_size);
