@@ -7,7 +7,7 @@ int main(int argc, char **argv) {
     // 32bit でテストする場合は下記を有効化
     // const char *app_path = APP_PROCESS_32;
 
-    printf("===== app_process 多角的セキュリティ検証 =====\n");
+    printf("===== app_process 多角的セキュリティ検証 (拡張版) =====\n");
     printf("ターゲット: %s\n", app_path);
     printf("セキュリティパッチレベル: 2022 (想定)\n\n");
 
@@ -16,6 +16,12 @@ int main(int argc, char **argv) {
     test_argv_overflow(app_path);
     test_dl_hijack(app_path);
     test_toctou_race(app_path);
+
+    // 拡張テスト
+    test_chmod_setuid(app_path);
+    test_ptrace_toctou(app_path);
+    test_property_overflow(app_path);
+    test_null_byte_injection(app_path);
 
     printf("\nすべてのテストが完了しました。\n");
     return 0;
