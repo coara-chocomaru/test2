@@ -17,10 +17,10 @@ void setup_test_environment(void) {
     }
     mkdir(TEST_DIR, 0755);
 
-    int fd = open(TARGET_FILE, O_CREAT | O_WRONLY, 0644);
-    if (fd < 0) { perror("open target"); exit(1); }
-    close(fd);
+    // ターゲットディレクトリ（chown対象）を作成
+    mkdir(TARGET_DIR, 0755);
 
+    // シンボリックリンク先を TARGET_DIR に変更
     char parent[PATH_MAX];
     strcpy(parent, CACHE_DIR);
     char *slash = strrchr(parent, '/');
@@ -28,11 +28,11 @@ void setup_test_environment(void) {
     mkdir(parent, 0755);
 
     unlink(CACHE_DIR);
-    if (symlink(TARGET_FILE, CACHE_DIR) != 0) {
+    if (symlink(TARGET_DIR, CACHE_DIR) != 0) {
         perror("symlink");
         exit(1);
     }
-    printf("[ENV] セットアップ完了: %s -> %s\n", CACHE_DIR, TARGET_FILE);
+    printf("[ENV] セットアップ完了: %s -> %s\n", CACHE_DIR, TARGET_DIR);
 }
 
 void cleanup_test_environment(void) {
