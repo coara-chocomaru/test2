@@ -1,5 +1,5 @@
 /*
- * Android RTSP Fuzzer - 拡張版
+ * Android RTSP Fuzzer - 拡張版（修正: pthread を fork に置き換え）
  * 対象: /system/bin/rtspclient および /system/bin/rtspserver
  * 脆弱性検証: スタック/ヒープオーバーフロー, 書式文字列, 整数オーバーフロー, コマンドインジェクション等
  * コンパイル: Android NDK または AOSP ビルド環境
@@ -18,7 +18,6 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <time.h>
-#include <pthread.h>
 #include <stdarg.h>
 #include <fcntl.h>
 #include <sys/select.h>
@@ -96,7 +95,7 @@ pid_t start_target(const char *target, int port) {
             snprintf(url, sizeof(url), "rtsp://%s:%d/", g_config.target_host, port);
             execl("/system/bin/rtspclient", "rtspclient", url, NULL);
         } else if (strcmp(target, "server") == 0) {
-            // 一部のサーバーバージョンは -p を受け付けない場合があるが、その場合はデフォルトポートを使用
+            // サーバーによっては -p を受け付けない場合もある
             execl("/system/bin/rtspserver", "rtspserver", "-p", port_str, NULL);
         } else {
             fprintf(stderr, "Unknown target: %s\n", target);
@@ -137,6 +136,7 @@ int connect_target(int port, const char *host) {
 }
 
 // ---------- テストケース実装 ----------
+// （前回と同様、省略せずに全て含める）
 
 // 1. 超長 URI（スタック破壊）
 void test_long_uri(int sock, void *arg) {
@@ -387,13 +387,13 @@ void test_server_mode() {
     waitpid(server_pid, NULL, 0);
 }
 
-// クライアントモード: モックサーバーを立て、クライアントを起動し、悪意応答を送信
-void *mock_server_thread(void *arg) {
-    int port = *(int*)arg;
+// クライアントモード: モックサーバーを子プロセスで起動し、クライアントを起動
+// モックサーバープロセス
+void mock_server_process(int port) {
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         perror("socket");
-        return NULL;
+        return;
     }
     int opt = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -405,33 +405,23 @@ void *mock_server_thread(void *arg) {
     if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind");
         close(listen_fd);
-        return NULL;
+        return;
     }
     if (listen(listen_fd, 5) < 0) {
         perror("listen");
         close(listen_fd);
-        return NULL;
+        return;
     }
-    printf("[*] Mock RTSP server listening on port %d\n", port);
+    printf("[Mock] RTSP mock server running on port %d (pid=%d)\n", port, getpid());
 
-    // 様々な悪意応答を用意
+    // 悪意応答のリスト
     const char *malicious_responses[] = {
-        // 超大Content-Length
         "RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 999999999\r\n\r\n",
-        // 異常に長いSession
         "RTSP/1.0 200 OK\r\nCSeq: 1\r\nSession: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n\r\n",
-        // 不正なバージョン
         "RTSP/2.0 200 OK\r\nCSeq: 1\r\n\r\n",
-        // 書式文字列を含む応答（クライアントがログに出力する場合）
         "RTSP/1.0 200 OK\r\nCSeq: 1\r\nServer: %s%s%s%s%s%s%s%s%s%s\r\n\r\n",
-        // 空の応答（切断）
         "",
-        // 巨大なヘッダー群
-        "RTSP/1.0 200 OK\r\nCSeq: 1\r\n" 
-        "X-Data: " 
-        "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789"
-        "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789"
-        "\r\n\r\n"
+        "RTSP/1.0 200 OK\r\nCSeq: 1\r\nX-Data: 0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789\r\n\r\n"
     };
     int num_responses = sizeof(malicious_responses)/sizeof(malicious_responses[0]);
     int response_index = 0;
@@ -444,7 +434,7 @@ void *mock_server_thread(void *arg) {
             perror("accept");
             continue;
         }
-        // クライアントからのリクエストを読み取り（一部）
+        // リクエスト受信（ログ用）
         char req_buf[4096];
         int n = recv(client, req_buf, sizeof(req_buf)-1, 0);
         if (n > 0) req_buf[n] = '\0';
@@ -452,31 +442,41 @@ void *mock_server_thread(void *arg) {
             printf("[Mock] Received request: %.100s...\n", req_buf);
         }
 
-        // 順番に応答を送信（テストケース数に合わせるため、ループで回す）
+        // 応答送信
         const char *resp = malicious_responses[response_index % num_responses];
         if (strlen(resp) > 0) {
             send(client, resp, strlen(resp), 0);
         }
         close(client);
         response_index++;
-        // 一定数送信したら終了（クライアントがクラッシュするのを待つ）
-        if (response_index >= 20) break;
+        // 適当な回数で終了（親プロセスが kill するので、ここでは無限ループ）
+        // 実際は親が kill するまで続ける
     }
     close(listen_fd);
-    return NULL;
 }
 
 void test_client_mode() {
     int mock_port = g_config.target_port;
-    pthread_t server_thread;
-    pthread_create(&server_thread, NULL, mock_server_thread, &mock_port);
+    pid_t mock_pid = fork();
+    if (mock_pid == 0) {
+        // 子プロセス：モックサーバー実行
+        mock_server_process(mock_port);
+        exit(0);
+    } else if (mock_pid < 0) {
+        perror("fork mock");
+        return;
+    }
 
-    // クライアント起動（数回試行）
+    // サーバー起動待ち
+    sleep(1);
+
+    // クライアント起動（複数回試行）
     for (int i = 0; i < 3; i++) {
         printf("[*] Starting client target (attempt %d)\n", i+1);
         pid_t client_pid = start_target("client", mock_port);
         if (client_pid < 0) {
-            pthread_cancel(server_thread);
+            kill(mock_pid, SIGTERM);
+            waitpid(mock_pid, NULL, 0);
             return;
         }
         // クライアントが接続し、応答を受け取るまで待つ
@@ -497,13 +497,11 @@ void test_client_mode() {
             kill(client_pid, SIGTERM);
             waitpid(client_pid, NULL, 0);
         }
-        // サーバースレッドは継続しているが、次のクライアント起動前にリセットが必要な場合は再起動
-        // ここではスレッドはそのまま継続させる
     }
 
     // モックサーバー停止
-    pthread_cancel(server_thread);
-    pthread_join(server_thread, NULL);
+    kill(mock_pid, SIGTERM);
+    waitpid(mock_pid, NULL, 0);
 }
 
 // ---------- メイン ----------
@@ -546,7 +544,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    signal(SIGPIPE, SIG_IGN); // 切断時のパイプエラーを無視
+    signal(SIGPIPE, SIG_IGN);
 
     if (g_config.target_type == 0) {
         test_client_mode();
