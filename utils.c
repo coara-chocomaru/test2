@@ -4,14 +4,10 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 #include <errno.h>
-#include <limits.h>
 #include <dirent.h>
 #include "tests.h"
-
-#define TEST_DIR "/data/local/tmp/exploit_test"
-#define TARGET_FILE TEST_DIR "/target"
-#define CACHE_DIR TEST_DIR "/dalvik-cache/arm64"
 
 void setup_test_environment(void) {
     struct stat st;
@@ -19,17 +15,20 @@ void setup_test_environment(void) {
         cleanup_test_environment();
     }
     mkdir(TEST_DIR, 0755);
+
     // ダミーターゲットファイル作成
     int fd = open(TARGET_FILE, O_CREAT | O_WRONLY, 0644);
     if (fd < 0) { perror("open target"); exit(1); }
     close(fd);
+
     // キャッシュディレクトリの親を作成
     char parent[PATH_MAX];
     strcpy(parent, CACHE_DIR);
     char *slash = strrchr(parent, '/');
     if (slash) *slash = '\0';
     mkdir(parent, 0755);
-    // シンボリックリンク作成
+
+    // シンボリックリンク作成（最初は実ディレクトリではなくターゲットファイルへ）
     unlink(CACHE_DIR);
     if (symlink(TARGET_FILE, CACHE_DIR) != 0) {
         perror("symlink");
@@ -39,7 +38,9 @@ void setup_test_environment(void) {
 }
 
 void cleanup_test_environment(void) {
-    system("rm -rf " TEST_DIR);
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", TEST_DIR);
+    system(cmd);
     printf("[ENV] クリーンアップ完了\n");
 }
 
