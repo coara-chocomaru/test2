@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <dirent.h>
+#include <limits.h>
 #include "tests.h"
 
 void setup_test_environment(void) {
@@ -16,19 +17,16 @@ void setup_test_environment(void) {
     }
     mkdir(TEST_DIR, 0755);
 
-    // ダミーターゲットファイル作成
     int fd = open(TARGET_FILE, O_CREAT | O_WRONLY, 0644);
     if (fd < 0) { perror("open target"); exit(1); }
     close(fd);
 
-    // キャッシュディレクトリの親を作成
     char parent[PATH_MAX];
     strcpy(parent, CACHE_DIR);
     char *slash = strrchr(parent, '/');
     if (slash) *slash = '\0';
     mkdir(parent, 0755);
 
-    // シンボリックリンク作成（最初は実ディレクトリではなくターゲットファイルへ）
     unlink(CACHE_DIR);
     if (symlink(TARGET_FILE, CACHE_DIR) != 0) {
         perror("symlink");
@@ -66,6 +64,15 @@ int check_file_owner(const char *path, uid_t *uid, gid_t *gid) {
     if (stat(path, &st) == 0) {
         if (uid) *uid = st.st_uid;
         if (gid) *gid = st.st_gid;
+        return 0;
+    }
+    return -1;
+}
+
+int check_file_mode(const char *path, mode_t *mode) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        if (mode) *mode = st.st_mode;
         return 0;
     }
     return -1;
