@@ -2,11 +2,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #include <errno.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <signal.h>
-#include <time.h>
 #include "tests.h"
 
 /* ================================================================
@@ -21,15 +20,8 @@ void test_symlink_chown(const char *app_path) {
         printf("  変更前: %s (uid=%d, gid=%d)\n", TARGET_FILE, uid_before, gid_before);
     }
 
-    char *envp[] = {
-        "ANDROID_DATA=" TEST_DIR,
-        NULL
-    };
-    char *argv[] = {
-        (char*)app_path,
-        "--zygote",   // キャッシュ作成ルートを起動
-        NULL
-    };
+    char *envp[] = { "ANDROID_DATA=" TEST_DIR, NULL };
+    char *argv[] = { (char*)app_path, "--zygote", NULL };
 
     int ret = run_app_process(app_path, argv, envp);
     printf("  app_process 終了コード: %d\n", ret);
@@ -56,7 +48,6 @@ void test_env_overflow(const char *app_path) {
     char long_data[16384];
     memset(long_data, 'A', sizeof(long_data)-1);
     long_data[sizeof(long_data)-1] = '\0';
-    // パスとして有効にするため先頭に /data を付与 (ただし長すぎる)
     char env_value[32768];
     snprintf(env_value, sizeof(env_value), "ANDROID_DATA=%s", long_data);
 
@@ -84,7 +75,7 @@ void test_argv_overflow(const char *app_path) {
     char *argv[ARG_COUNT + 2];
     argv[0] = (char*)app_path;
     for (int i = 1; i <= ARG_COUNT; i++) {
-        argv[i] = "-classpath";  // 既存オプションを大量に与える
+        argv[i] = "-classpath";
     }
     argv[ARG_COUNT + 1] = NULL;
 
@@ -101,7 +92,6 @@ void test_dl_hijack(const char *app_path) {
     printf("\n[TEST-4] 動的リンカハイジャック (LD_LIBRARY_PATH)\n");
     setup_test_environment();
 
-    // 偽装ライブラリが /data/local/tmp/libc.so に存在する想定
     char *envp[] = {
         "LD_LIBRARY_PATH=/data/local/tmp",
         "ANDROID_DATA=" TEST_DIR,
