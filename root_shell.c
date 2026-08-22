@@ -8,7 +8,7 @@
 #include <signal.h>
 #include <errno.h>
 
-#define PORT 9981
+#define PORT 1234
 #define BUFFER_SIZE 1024
 #define MAX_CLIENTS 10
 #define BACKLOG 5
