@@ -1,186 +1,436 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <errno.h>
 #include <fcntl.h>
-#include <time.h>
-#include <sys/types.h>
-#include <sys/wait.h>
 #include <sys/stat.h>
-#include <signal.h>
+#include <sys/types.h>
+#include <dirent.h>
+#include <pthread.h>
+#include <errno.h>
+#include <sys/sendfile.h>
+#include <sys/time.h>
+#include <sys/resource.h>
 
-#define PORT "1234"
-#define LOG_PATH "/sdcard/nc_launcher.log"
-#define MAX_ATTEMPTS 3
+// ==================== 設定 ====================
+#define OUTPUT_DIR          "/sdcard/download"
+#define BLOCK_DEV_BASE      "/dev/block/mmcblk0p"
+#define BLOCK_START         1
+#define BLOCK_END           69
+#define DATA_SYSTEM_DIR     "/data/system"
 
-// ============================================================
-// ログ関数（タイムスタンプ＋追記）
-// ============================================================
-void log_append(const char *tag, const char *fmt, ...) {
-    FILE *fp = fopen(LOG_PATH, "a");
-    if (!fp) return;
+// スレッド数（同時実行制御）
+#define MAX_BLOCK_WORKERS   4
+#define MAX_FILE_WORKERS    8
 
-    time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
-    char time_buf[32];
-    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+// I/Oバッファ（ブロック用：1MB / ファイル用：64KB）
+#define BLOCK_BUFFER_SIZE   (1024 * 1024)      // 1MiB (512で割り切れる)
+#define FILE_BUFFER_SIZE    (64 * 1024)        // 64KB
 
-    fprintf(fp, "[%s] [%s] ", time_buf, tag);
+// ==================== ブロックデバイス用スレッドプール ====================
+static int block_queue[BLOCK_END - BLOCK_START + 1];
+static int block_front = 0;
+static int block_rear = 0;
+static int block_done = 0;
+static pthread_mutex_t block_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t block_cond = PTHREAD_COND_INITIALIZER;
 
-    va_list args;
-    va_start(args, fmt);
-    vfprintf(fp, fmt, args);
-    va_end(args);
+// ==================== ファイル用スレッドプール ====================
+typedef struct file_job {
+    char src[512];
+    char dst[512];
+    struct file_job *next;
+} file_job_t;
 
-    fprintf(fp, "\n");
-    fflush(fp);
-    fclose(fp);
+static file_job_t *file_head = NULL;
+static file_job_t *file_tail = NULL;
+static int file_done = 0;
+static pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t file_cond = PTHREAD_COND_INITIALIZER;
+
+// ==================== ユーティリティ関数 ====================
+// スレッドセーフなprintf代わり（競合しても許容）
+#define LOG(fmt, ...) printf("[copy] " fmt, ##__VA_ARGS__)
+
+// 出力ディレクトリを再帰的に作成（親階層も含む簡易実装）
+static void mkdir_recursive(const char *path) {
+    char tmp[512];
+    char *p = NULL;
+    size_t len;
+
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    len = strlen(tmp);
+    if (tmp[len - 1] == '/') tmp[len - 1] = 0;
+
+    for (p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+            mkdir(tmp, 0777);
+            *p = '/';
+        }
+    }
+    mkdir(tmp, 0777);
 }
 
-// ============================================================
-// 手法の定義（各手法は argv 配列を返す）
-// ============================================================
-typedef struct {
-    const char *name;
-    char *const *argv;
-} method_t;
+// ==================== ブロックデバイス ダンプ本体 ====================
+static void dump_single_block(int num) {
+    char src_path[128];
+    char dst_path[128];
+    snprintf(src_path, sizeof(src_path), "%s%d", BLOCK_DEV_BASE, num);
+    snprintf(dst_path, sizeof(dst_path), "%s/mmcblk0p%d.img", OUTPUT_DIR, num);
 
-// 手法1: toybox nc -s 127.0.0.1 -p 1234 -L /system/bin/sh -l
-char *const method1_argv[] = {
-    "toybox", "nc", "-s", "127.0.0.1", "-p", PORT, "-L", "/system/bin/sh", "-l", NULL
-};
-
-// 手法2: toybox nc -l -p 1234 -e /system/bin/sh (toybox は -e 非対応かもしれないが一応)
-char *const method2_argv[] = {
-    "toybox", "nc", "-l", "-p", PORT, "-e", "/system/bin/sh", NULL
-};
-
-// 手法3: sh -c "toybox nc -s 127.0.0.1 -p 1234 -L /system/bin/sh -l"
-char *const method3_argv[] = {
-    "sh", "-c", "toybox nc -s 127.0.0.1 -p " PORT " -L /system/bin/sh -l", NULL
-};
-
-// 手法4: nc (busybox 版など) で試す
-char *const method4_argv[] = {
-    "nc", "-s", "127.0.0.1", "-p", PORT, "-L", "/system/bin/sh", "-l", NULL
-};
-
-// 手法5: /system/bin/sh -c "toybox nc ..." (絶対パス)
-char *const method5_argv[] = {
-    "/system/bin/sh", "-c", "toybox nc -s 127.0.0.1 -p " PORT " -L /system/bin/sh -l", NULL
-};
-
-// 手法6: toybox nc -l -p 1234 -L /system/bin/sh -s 127.0.0.1 (順序入れ替え)
-char *const method6_argv[] = {
-    "toybox", "nc", "-l", "-p", PORT, "-L", "/system/bin/sh", "-s", "127.0.0.1", NULL
-};
-
-// 全手法のリスト
-method_t methods[] = {
-    { "toybox nc -s -p -L", method1_argv },
-    { "toybox nc -l -p -e", method2_argv },
-    { "sh -c \"toybox nc ...\"", method3_argv },
-    { "nc -s -p -L (busybox)", method4_argv },
-    { "/system/bin/sh -c \"toybox nc ...\"", method5_argv },
-    { "toybox nc -l -p -L -s", method6_argv },
-};
-const int num_methods = sizeof(methods) / sizeof(methods[0]);
-
-// ============================================================
-// 各手法を試行（子プロセスで exec し、即死したら失敗と判定）
-// ============================================================
-int try_method(method_t *m, int *status_out) {
-    pid_t pid = fork();
-    if (pid < 0) {
-        log_append("ERROR", "fork() failed: %s", strerror(errno));
-        return -1;
+    // 1. 入力デバイスを開く（O_DIRECT を試行）
+    int fd_in = open(src_path, O_RDONLY | O_DIRECT);
+    int use_direct = 1;
+    if (fd_in < 0) {
+        // O_DIRECT非対応の場合、通常オープン
+        fd_in = open(src_path, O_RDONLY);
+        use_direct = 0;
+        if (fd_in < 0) {
+            LOG("ブロックデバイスを開けません: %s (%s)\n", src_path, strerror(errno));
+            return;
+        }
     }
 
-    if (pid == 0) {
-        // 子プロセス: 手法を exec
-        // シグナルリセット
-        signal(SIGPIPE, SIG_DFL);
-        // stdout/stderr を /dev/null にリダイレクト（エラーメッセージはログに記録しない）
-        int fd = open("/dev/null", O_RDWR);
-        if (fd >= 0) {
-            dup2(fd, STDOUT_FILENO);
-            dup2(fd, STDERR_FILENO);
-            close(fd);
-        }
-        execvp(m->argv[0], m->argv);
-        // exec 失敗
-        fprintf(stderr, "execvp failed: %s\n", strerror(errno));
-        exit(127);
+    // 2. 出力ファイルを開く
+    int fd_out = open(dst_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd_out < 0) {
+        LOG("出力ファイルを作成できません: %s (%s)\n", dst_path, strerror(errno));
+        close(fd_in);
+        return;
     }
 
-    // 親プロセス: 子の終了を監視（最大2秒待機）
-    int status;
-    pid_t result = waitpid(pid, &status, WNOHANG);
-    if (result == 0) {
-        // まだ動いている ＝ 成功（nc が待機状態）
-        log_append("INFO", "Method '%s' succeeded (process %d running)", m->name, pid);
-        *status_out = 0;
-        return 1; // 成功
-    } else if (result == pid) {
-        // 子が終了した ＝ 失敗
-        if (WIFEXITED(status)) {
-            log_append("FAIL", "Method '%s' exited with code %d", m->name, WEXITSTATUS(status));
-            *status_out = WEXITSTATUS(status);
-        } else if (WIFSIGNALED(status)) {
-            log_append("FAIL", "Method '%s' killed by signal %d", m->name, WTERMSIG(status));
-            *status_out = -1;
-        } else {
-            log_append("FAIL", "Method '%s' terminated abnormally", m->name);
-            *status_out = -1;
+    // 3. デバイスサイズを取得
+    off_t size = lseek(fd_in, 0, SEEK_END);
+    if (size <= 0) {
+        LOG("サイズ取得失敗 %s (size=%ld)\n", src_path, (long)size);
+        close(fd_in);
+        close(fd_out);
+        return;
+    }
+    lseek(fd_in, 0, SEEK_SET);
+
+    LOG("ダンプ開始: %s (サイズ: %lld MB)\n", src_path, (long long)(size / (1024*1024)));
+
+    // 4. 高速化: シーケンシャルアクセスをカーネルに指示
+    posix_fadvise(fd_in, 0, 0, POSIX_FADV_SEQUENTIAL);
+
+    // 5. sendfile() でゼロコピー転送を試行
+    off_t offset = 0;
+    int use_sendfile = 1;
+    while (offset < size) {
+        ssize_t ret = sendfile(fd_out, fd_in, &offset, (size_t)(size - offset));
+        if (ret <= 0) {
+            if (errno == EINTR) continue;
+            // sendfile失敗時はフォールバックへ
+            use_sendfile = 0;
+            break;
         }
-        return 0; // 失敗
+    }
+    if (use_sendfile && offset == size) {
+        LOG("  → sendfile 成功: %s\n", dst_path);
+        close(fd_in);
+        close(fd_out);
+        return;
+    }
+
+    // 6. sendfile が使えなかった場合のフォールバック（read/write）
+    //    O_DIRECT使用時はアライメントされたバッファが必要
+    char *buf = NULL;
+    size_t buf_size = BLOCK_BUFFER_SIZE;
+    if (use_direct) {
+        if (posix_memalign((void**)&buf, 4096, buf_size) != 0) {
+            // アライメント確保失敗 → directを諦めて通常malloc
+            use_direct = 0;
+            buf = malloc(buf_size);
+        }
     } else {
-        // waitpid エラー
-        log_append("ERROR", "waitpid() failed: %s", strerror(errno));
-        return -1;
+        buf = malloc(buf_size);
     }
+    if (!buf) {
+        // それでもダメなら小さいバッファ（スタック）で再挑戦（ただしdirect時はアライメント違反で失敗する可能性あり）
+        LOG("  メモリ確保失敗、小バッファで再試行\n");
+        char small_buf[8192];
+        lseek(fd_in, 0, SEEK_SET);
+        while (1) {
+            ssize_t r = read(fd_in, small_buf, sizeof(small_buf));
+            if (r <= 0) break;
+            ssize_t w = write(fd_out, small_buf, r);
+            if (w != r) break;
+        }
+        close(fd_in);
+        close(fd_out);
+        return;
+    }
+
+    // バッファを使ったコピー
+    lseek(fd_in, 0, SEEK_SET);
+    while (1) {
+        ssize_t r = read(fd_in, buf, buf_size);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            // O_DIRECTでアライメントエラーが起きた場合は再試行しない
+            break;
+        }
+        if (r == 0) break;
+        ssize_t w = write(fd_out, buf, r);
+        if (w != r) {
+            break;
+        }
+    }
+    free(buf);
+    close(fd_in);
+    close(fd_out);
+    LOG("  → フォールバック完了: %s\n", dst_path);
 }
 
-// ============================================================
-// メイン（起動時に /system/bin/sh を port に待機させる）
-// ============================================================
-int main(int argc, char **argv) {
-    int port = 1234;
-    if (argc >= 2) {
-        port = atoi(argv[1]);
-        if (port <= 0 || port > 65535) port = 1234;
-    }
-
-    log_append("START", "=== nc_launcher starting (target port %d) ===", port);
-
-    // 多重起動防止: ロックファイル（任意）
-    // 今回は省略（必要に応じて実装）
-
-    // 各手法を順に試行
-    int success = 0;
-    for (int i = 0; i < num_methods; i++) {
-        log_append("INFO", "Trying method %d/%d: %s", i+1, num_methods, methods[i].name);
-        int status;
-        int result = try_method(&methods[i], &status);
-        if (result == 1) {
-            // 成功 → 子プロセスがバックグラウンドで動いているので、親は終了しても良い
-            log_append("SUCCESS", "Method '%s' succeeded. Shell is listening on port %d", methods[i].name, port);
-            // 子プロセスをデタッチするために親は終了
-            // ただし、子プロセスはまだ動いているので、init に引き継がれる
-            return 0;
-        } else if (result == -1) {
-            log_append("ERROR", "try_method returned -1, skipping remaining methods?");
-            // ここで続行するか中断するか
-            // とりあえず次の手法へ
-            continue;
+// ==================== ブロックデバイス ワーカースレッド ====================
+static void *block_worker(void *arg) {
+    (void)arg;
+    while (1) {
+        pthread_mutex_lock(&block_mutex);
+        while (block_front == block_rear && !block_done) {
+            pthread_cond_wait(&block_cond, &block_mutex);
         }
-        // 失敗なら次の手法へ
-        sleep(1); // ポート解放待ち
+        if (block_front == block_rear && block_done) {
+            pthread_mutex_unlock(&block_mutex);
+            break;
+        }
+        int num = block_queue[block_front++];
+        pthread_mutex_unlock(&block_mutex);
+
+        dump_single_block(num);
+    }
+    return NULL;
+}
+
+// ==================== 通常ファイル コピー本体 ====================
+static int copy_file(const char *src, const char *dst) {
+    int fd_in = open(src, O_RDONLY);
+    if (fd_in < 0) {
+        LOG("  ファイル開けず: %s (%s)\n", src, strerror(errno));
+        return -1;
     }
 
-    // すべて失敗
-    log_append("FATAL", "All %d methods failed. No shell listening.", num_methods);
-    fprintf(stderr, "All methods failed. Check log: %s\n", LOG_PATH);
-    return 1;
+    // 出力先ディレクトリが存在することを確認（既に作成済みだが念のため）
+    char dst_dir[512];
+    strcpy(dst_dir, dst);
+    char *last_slash = strrchr(dst_dir, '/');
+    if (last_slash) {
+        *last_slash = 0;
+        mkdir_recursive(dst_dir);
+    }
+
+    int fd_out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd_out < 0) {
+        LOG("  出力開けず: %s (%s)\n", dst, strerror(errno));
+        close(fd_in);
+        return -1;
+    }
+
+    // サイズ取得
+    off_t size = lseek(fd_in, 0, SEEK_END);
+    lseek(fd_in, 0, SEEK_SET);
+    if (size == 0) {
+        // 空ファイルは作成のみで終了
+        close(fd_in);
+        close(fd_out);
+        return 0;
+    }
+
+    // シーケンシャルアクセスヒント
+    posix_fadvise(fd_in, 0, 0, POSIX_FADV_SEQUENTIAL);
+
+    // 1. sendfile 優先
+    off_t offset = 0;
+    int sendfile_ok = 1;
+    while (offset < size) {
+        ssize_t ret = sendfile(fd_out, fd_in, &offset, (size_t)(size - offset));
+        if (ret <= 0) {
+            if (errno == EINTR) continue;
+            sendfile_ok = 0;
+            break;
+        }
+    }
+    if (sendfile_ok && offset == size) {
+        close(fd_in);
+        close(fd_out);
+        return 0;
+    }
+
+    // 2. フォールバック: read/write
+    char buf[FILE_BUFFER_SIZE];
+    lseek(fd_in, 0, SEEK_SET);
+    while (1) {
+        ssize_t r = read(fd_in, buf, sizeof(buf));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (r == 0) break;
+        ssize_t w = write(fd_out, buf, r);
+        if (w != r) break;
+    }
+
+    close(fd_in);
+    close(fd_out);
+    return 0;
+}
+
+// ==================== ファイル ワーカースレッド ====================
+static void *file_worker(void *arg) {
+    (void)arg;
+    while (1) {
+        pthread_mutex_lock(&file_mutex);
+        while (file_head == NULL && !file_done) {
+            pthread_cond_wait(&file_cond, &file_mutex);
+        }
+        if (file_head == NULL && file_done) {
+            pthread_mutex_unlock(&file_mutex);
+            break;
+        }
+        file_job_t *job = file_head;
+        file_head = file_head->next;
+        if (file_head == NULL) file_tail = NULL;
+        pthread_mutex_unlock(&file_mutex);
+
+        copy_file(job->src, job->dst);
+        free(job);
+    }
+    return NULL;
+}
+
+// ==================== ディレクトリウォーカー（再帰） ====================
+static void walk_directory(const char *base, const char *out_base) {
+    DIR *dir = opendir(base);
+    if (!dir) {
+        LOG("ディレクトリを開けません: %s (%s)\n", base, strerror(errno));
+        return;
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        char src_path[512];
+        char dst_path[512];
+        snprintf(src_path, sizeof(src_path), "%s/%s", base, entry->d_name);
+        snprintf(dst_path, sizeof(dst_path), "%s/%s", out_base, entry->d_name);
+
+        struct stat st;
+        if (lstat(src_path, &st) < 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            // ディレクトリは再帰 + 出力先にmkdir
+            mkdir_recursive(dst_path);
+            walk_directory(src_path, dst_path);
+        } else if (S_ISREG(st.st_mode)) {
+            // 通常ファイル → ジョブキューに投入
+            file_job_t *job = (file_job_t *)malloc(sizeof(file_job_t));
+            if (!job) {
+                LOG("メモリ不足、ファイルスキップ: %s\n", src_path);
+                continue;
+            }
+            strncpy(job->src, src_path, sizeof(job->src) - 1);
+            job->src[sizeof(job->src) - 1] = 0;
+            strncpy(job->dst, dst_path, sizeof(job->dst) - 1);
+            job->dst[sizeof(job->dst) - 1] = 0;
+            job->next = NULL;
+
+            pthread_mutex_lock(&file_mutex);
+            if (file_tail) {
+                file_tail->next = job;
+                file_tail = job;
+            } else {
+                file_head = file_tail = job;
+            }
+            pthread_cond_signal(&file_cond);
+            pthread_mutex_unlock(&file_mutex);
+        }
+        // シンボリックリンクやスペシャルファイルは無視
+    }
+    closedir(dir);
+}
+
+// ==================== メイン ====================
+int main(void) {
+    umask(0); // パーミッション強制
+
+    // 出力ルートディレクトリ作成
+    mkdir_recursive(OUTPUT_DIR);
+
+    LOG("=== ブロックデバイス ダンプ開始 (mmcblk0p1 ~ p69) ===\n");
+
+    // ---- ブロックデバイス用スレッドプール起動 ----
+    pthread_t block_threads[MAX_BLOCK_WORKERS];
+    for (int i = 0; i < MAX_BLOCK_WORKERS; i++) {
+        pthread_create(&block_threads[i], NULL, block_worker, NULL);
+    }
+
+    // ブロックキューにタスク投入
+    pthread_mutex_lock(&block_mutex);
+    for (int i = BLOCK_START; i <= BLOCK_END; i++) {
+        block_queue[block_rear++] = i;
+    }
+    pthread_cond_broadcast(&block_cond);
+    pthread_mutex_unlock(&block_mutex);
+
+    // ブロックキューが空になるまで待機
+    while (1) {
+        pthread_mutex_lock(&block_mutex);
+        if (block_front == block_rear) {
+            block_done = 1;
+            pthread_cond_broadcast(&block_cond);
+            pthread_mutex_unlock(&block_mutex);
+            break;
+        }
+        pthread_mutex_unlock(&block_mutex);
+        usleep(100000); // 100ms待機
+    }
+
+    // ブロックワーカースレッド終了待ち
+    for (int i = 0; i < MAX_BLOCK_WORKERS; i++) {
+        pthread_join(block_threads[i], NULL);
+    }
+    LOG("=== ブロックデバイス ダンプ完了 ===\n");
+
+    // ---- ファイルコピー ( /data/system/ ) ----
+    LOG("=== /data/system/ スキャン & コピー開始 ===\n");
+
+    // ファイル用スレッドプール起動
+    pthread_t file_threads[MAX_FILE_WORKERS];
+    for (int i = 0; i < MAX_FILE_WORKERS; i++) {
+        pthread_create(&file_threads[i], NULL, file_worker, NULL);
+    }
+
+    // 出力ベースディレクトリ
+    char data_out_dir[512];
+    snprintf(data_out_dir, sizeof(data_out_dir), "%s/data_system", OUTPUT_DIR);
+    mkdir_recursive(data_out_dir);
+
+    // 再帰ウォーク開始（この関数内でキューにジョブを投入し続ける）
+    walk_directory(DATA_SYSTEM_DIR, data_out_dir);
+
+    // キューが空になるまで待機し、完了フラグをセット
+    while (1) {
+        pthread_mutex_lock(&file_mutex);
+        if (file_head == NULL) {
+            file_done = 1;
+            pthread_cond_broadcast(&file_cond);
+            pthread_mutex_unlock(&file_mutex);
+            break;
+        }
+        pthread_mutex_unlock(&file_mutex);
+        usleep(100000);
+    }
+
+    // ファイルワーカースレッド終了待ち
+    for (int i = 0; i < MAX_FILE_WORKERS; i++) {
+        pthread_join(file_threads[i], NULL);
+    }
+
+    LOG("=== 全処理完了 (/sdcard/download/ に出力済み) ===\n");
+    return 0;
 }
