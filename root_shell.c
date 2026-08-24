@@ -3,434 +3,253 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <fcntl.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <dirent.h>
-#include <pthread.h>
+#include <fcntl.h>
 #include <errno.h>
-#include <sys/sendfile.h>
-#include <sys/time.h>
-#include <sys/resource.h>
+#include <time.h>
+#include <limits.h>
+#include <libgen.h>
 
-// ==================== 設定 ====================
-#define OUTPUT_DIR          "/sdcard/download"
-#define BLOCK_DEV_BASE      "/dev/block/mmcblk0p"
-#define BLOCK_START         1
-#define BLOCK_END           69
-#define DATA_SYSTEM_DIR     "/data/system"
+// ダンプ先（デフォルト）
+#ifndef DUMP_BASE
+#define DUMP_BASE "/cache/dump"
+#endif
 
-// スレッド数（同時実行制御）
-#define MAX_BLOCK_WORKERS   4
-#define MAX_FILE_WORKERS    8
+#define MAX_PATH 4096
+#define CHUNK_SIZE (1024 * 1024)      // 1MB
+#define MAX_FILE_SIZE (64 * 1024 * 1024) // 64MB
+#define BLOCK_READ_SIZE (2 * 1024 * 1024) // ブロックデバイスは先頭2MB
 
-// I/Oバッファ（ブロック用：1MB / ファイル用：64KB）
-#define BLOCK_BUFFER_SIZE   (1024 * 1024)      // 1MiB (512で割り切れる)
-#define FILE_BUFFER_SIZE    (64 * 1024)        // 64KB
+// 安全な文字列結合
+static void safe_concat(char *dest, const char *src, size_t max) {
+    size_t len = strlen(dest);
+    if (len + strlen(src) + 1 < max) {
+        strcat(dest, src);
+    }
+}
 
-// ==================== ブロックデバイス用スレッドプール ====================
-static int block_queue[BLOCK_END - BLOCK_START + 1];
-static int block_front = 0;
-static int block_rear = 0;
-static int block_done = 0;
-static pthread_mutex_t block_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t block_cond = PTHREAD_COND_INITIALIZER;
-
-// ==================== ファイル用スレッドプール ====================
-typedef struct file_job {
-    char src[512];
-    char dst[512];
-    struct file_job *next;
-} file_job_t;
-
-static file_job_t *file_head = NULL;
-static file_job_t *file_tail = NULL;
-static int file_done = 0;
-static pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t file_cond = PTHREAD_COND_INITIALIZER;
-
-// ==================== ユーティリティ関数 ====================
-// スレッドセーフなprintf代わり（競合しても許容）
-#define LOG(fmt, ...) printf("[copy] " fmt, ##__VA_ARGS__)
-
-// 出力ディレクトリを再帰的に作成（親階層も含む簡易実装）
+// 再帰的ディレクトリ作成
 static void mkdir_recursive(const char *path) {
-    char tmp[512];
-    char *p = NULL;
-    size_t len;
-
+    char tmp[MAX_PATH];
+    char *p;
     snprintf(tmp, sizeof(tmp), "%s", path);
-    len = strlen(tmp);
-    if (tmp[len - 1] == '/') tmp[len - 1] = 0;
-
     for (p = tmp + 1; *p; p++) {
         if (*p == '/') {
-            *p = 0;
-            mkdir(tmp, 0777);
+            *p = '\0';
+            mkdir(tmp, 0755);
             *p = '/';
         }
     }
-    mkdir(tmp, 0777);
+    mkdir(tmp, 0755);
 }
 
-// ==================== ブロックデバイス ダンプ本体 ====================
-static void dump_single_block(int num) {
-    char src_path[128];
-    char dst_path[128];
-    snprintf(src_path, sizeof(src_path), "%s%d", BLOCK_DEV_BASE, num);
-    snprintf(dst_path, sizeof(dst_path), "%s/mmcblk0p%d.img", OUTPUT_DIR, num);
-
-    // 1. 入力デバイスを開く（O_DIRECT を試行）
-    int fd_in = open(src_path, O_RDONLY | O_DIRECT);
-    int use_direct = 1;
-    if (fd_in < 0) {
-        // O_DIRECT非対応の場合、通常オープン
-        fd_in = open(src_path, O_RDONLY);
-        use_direct = 0;
-        if (fd_in < 0) {
-            LOG("ブロックデバイスを開けません: %s (%s)\n", src_path, strerror(errno));
-            return;
-        }
-    }
-
-    // 2. 出力ファイルを開く
-    int fd_out = open(dst_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd_out < 0) {
-        LOG("出力ファイルを作成できません: %s (%s)\n", dst_path, strerror(errno));
+// ファイルの完全コピー（サイズ制限付き）
+static void dump_file_full(const char *src, const char *dst) {
+    int fd_in = open(src, O_RDONLY | O_NOFOLLOW);
+    if (fd_in < 0) return;
+    struct stat st;
+    if (fstat(fd_in, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size > MAX_FILE_SIZE) {
         close(fd_in);
         return;
     }
-
-    // 3. デバイスサイズを取得
-    off_t size = lseek(fd_in, 0, SEEK_END);
-    if (size <= 0) {
-        LOG("サイズ取得失敗 %s (size=%ld)\n", src_path, (long)size);
-        close(fd_in);
-        close(fd_out);
-        return;
-    }
-    lseek(fd_in, 0, SEEK_SET);
-
-    LOG("ダンプ開始: %s (サイズ: %lld MB)\n", src_path, (long long)(size / (1024*1024)));
-
-    // 4. 高速化: シーケンシャルアクセスをカーネルに指示
-    posix_fadvise(fd_in, 0, 0, POSIX_FADV_SEQUENTIAL);
-
-    // 5. sendfile() でゼロコピー転送を試行
-    off_t offset = 0;
-    int use_sendfile = 1;
-    while (offset < size) {
-        ssize_t ret = sendfile(fd_out, fd_in, &offset, (size_t)(size - offset));
-        if (ret <= 0) {
-            if (errno == EINTR) continue;
-            // sendfile失敗時はフォールバックへ
-            use_sendfile = 0;
-            break;
-        }
-    }
-    if (use_sendfile && offset == size) {
-        LOG("  → sendfile 成功: %s\n", dst_path);
-        close(fd_in);
-        close(fd_out);
-        return;
-    }
-
-    // 6. sendfile が使えなかった場合のフォールバック（read/write）
-    //    O_DIRECT使用時はアライメントされたバッファが必要
-    char *buf = NULL;
-    size_t buf_size = BLOCK_BUFFER_SIZE;
-    if (use_direct) {
-        if (posix_memalign((void**)&buf, 4096, buf_size) != 0) {
-            // アライメント確保失敗 → directを諦めて通常malloc
-            use_direct = 0;
-            buf = malloc(buf_size);
-        }
-    } else {
-        buf = malloc(buf_size);
-    }
-    if (!buf) {
-        // それでもダメなら小さいバッファ（スタック）で再挑戦（ただしdirect時はアライメント違反で失敗する可能性あり）
-        LOG("  メモリ確保失敗、小バッファで再試行\n");
-        char small_buf[8192];
-        lseek(fd_in, 0, SEEK_SET);
-        while (1) {
-            ssize_t r = read(fd_in, small_buf, sizeof(small_buf));
-            if (r <= 0) break;
-            ssize_t w = write(fd_out, small_buf, r);
-            if (w != r) break;
-        }
-        close(fd_in);
-        close(fd_out);
-        return;
-    }
-
-    // バッファを使ったコピー
-    lseek(fd_in, 0, SEEK_SET);
-    while (1) {
-        ssize_t r = read(fd_in, buf, buf_size);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            // O_DIRECTでアライメントエラーが起きた場合は再試行しない
-            break;
-        }
-        if (r == 0) break;
-        ssize_t w = write(fd_out, buf, r);
-        if (w != r) {
-            break;
-        }
-    }
-    free(buf);
-    close(fd_in);
-    close(fd_out);
-    LOG("  → フォールバック完了: %s\n", dst_path);
-}
-
-// ==================== ブロックデバイス ワーカースレッド ====================
-static void *block_worker(void *arg) {
-    (void)arg;
-    while (1) {
-        pthread_mutex_lock(&block_mutex);
-        while (block_front == block_rear && !block_done) {
-            pthread_cond_wait(&block_cond, &block_mutex);
-        }
-        if (block_front == block_rear && block_done) {
-            pthread_mutex_unlock(&block_mutex);
-            break;
-        }
-        int num = block_queue[block_front++];
-        pthread_mutex_unlock(&block_mutex);
-
-        dump_single_block(num);
-    }
-    return NULL;
-}
-
-// ==================== 通常ファイル コピー本体 ====================
-static int copy_file(const char *src, const char *dst) {
-    int fd_in = open(src, O_RDONLY);
-    if (fd_in < 0) {
-        LOG("  ファイル開けず: %s (%s)\n", src, strerror(errno));
-        return -1;
-    }
-
-    // 出力先ディレクトリが存在することを確認（既に作成済みだが念のため）
-    char dst_dir[512];
-    strcpy(dst_dir, dst);
-    char *last_slash = strrchr(dst_dir, '/');
-    if (last_slash) {
-        *last_slash = 0;
-        mkdir_recursive(dst_dir);
-    }
-
     int fd_out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd_out < 0) {
-        LOG("  出力開けず: %s (%s)\n", dst, strerror(errno));
         close(fd_in);
-        return -1;
-    }
-
-    // サイズ取得
-    off_t size = lseek(fd_in, 0, SEEK_END);
-    lseek(fd_in, 0, SEEK_SET);
-    if (size == 0) {
-        // 空ファイルは作成のみで終了
-        close(fd_in);
-        close(fd_out);
-        return 0;
-    }
-
-    // シーケンシャルアクセスヒント
-    posix_fadvise(fd_in, 0, 0, POSIX_FADV_SEQUENTIAL);
-
-    // 1. sendfile 優先
-    off_t offset = 0;
-    int sendfile_ok = 1;
-    while (offset < size) {
-        ssize_t ret = sendfile(fd_out, fd_in, &offset, (size_t)(size - offset));
-        if (ret <= 0) {
-            if (errno == EINTR) continue;
-            sendfile_ok = 0;
-            break;
-        }
-    }
-    if (sendfile_ok && offset == size) {
-        close(fd_in);
-        close(fd_out);
-        return 0;
-    }
-
-    // 2. フォールバック: read/write
-    char buf[FILE_BUFFER_SIZE];
-    lseek(fd_in, 0, SEEK_SET);
-    while (1) {
-        ssize_t r = read(fd_in, buf, sizeof(buf));
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        if (r == 0) break;
-        ssize_t w = write(fd_out, buf, r);
-        if (w != r) break;
-    }
-
-    close(fd_in);
-    close(fd_out);
-    return 0;
-}
-
-// ==================== ファイル ワーカースレッド ====================
-static void *file_worker(void *arg) {
-    (void)arg;
-    while (1) {
-        pthread_mutex_lock(&file_mutex);
-        while (file_head == NULL && !file_done) {
-            pthread_cond_wait(&file_cond, &file_mutex);
-        }
-        if (file_head == NULL && file_done) {
-            pthread_mutex_unlock(&file_mutex);
-            break;
-        }
-        file_job_t *job = file_head;
-        file_head = file_head->next;
-        if (file_head == NULL) file_tail = NULL;
-        pthread_mutex_unlock(&file_mutex);
-
-        copy_file(job->src, job->dst);
-        free(job);
-    }
-    return NULL;
-}
-
-// ==================== ディレクトリウォーカー（再帰） ====================
-static void walk_directory(const char *base, const char *out_base) {
-    DIR *dir = opendir(base);
-    if (!dir) {
-        LOG("ディレクトリを開けません: %s (%s)\n", base, strerror(errno));
         return;
     }
+    char buf[8192];
+    ssize_t n;
+    while ((n = read(fd_in, buf, sizeof(buf))) > 0) {
+        if (write(fd_out, buf, n) != n) break;
+    }
+    close(fd_in);
+    close(fd_out);
+}
 
+// ブロックデバイス用（先頭2MBのみ）
+static void dump_block_partial(const char *src, const char *dst) {
+    int fd_in = open(src, O_RDONLY | O_NOFOLLOW);
+    if (fd_in < 0) return;
+    int fd_out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd_out < 0) {
+        close(fd_in);
+        return;
+    }
+    char buf[CHUNK_SIZE];
+    ssize_t n;
+    size_t total = 0;
+    while ((n = read(fd_in, buf, sizeof(buf))) > 0) {
+        if (write(fd_out, buf, n) != n) break;
+        total += n;
+        if (total >= BLOCK_READ_SIZE) break;
+    }
+    close(fd_in);
+    close(fd_out);
+}
+
+// ディレクトリ再帰ダンプ（相対パスを保持）
+static void dump_dir_recursive(const char *base, const char *rel, const char *dest_root) {
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s/%s", base, rel[0] ? rel : "");
+    DIR *dir = opendir(path);
+    if (!dir) return;
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
             continue;
-
-        char src_path[512];
-        char dst_path[512];
-        snprintf(src_path, sizeof(src_path), "%s/%s", base, entry->d_name);
-        snprintf(dst_path, sizeof(dst_path), "%s/%s", out_base, entry->d_name);
-
+        char full[MAX_PATH];
+        snprintf(full, sizeof(full), "%s/%s", path, entry->d_name);
         struct stat st;
-        if (lstat(src_path, &st) < 0) continue;
-
-        if (S_ISDIR(st.st_mode)) {
-            // ディレクトリは再帰 + 出力先にmkdir
-            mkdir_recursive(dst_path);
-            walk_directory(src_path, dst_path);
-        } else if (S_ISREG(st.st_mode)) {
-            // 通常ファイル → ジョブキューに投入
-            file_job_t *job = (file_job_t *)malloc(sizeof(file_job_t));
-            if (!job) {
-                LOG("メモリ不足、ファイルスキップ: %s\n", src_path);
-                continue;
+        if (lstat(full, &st) == 0) {
+            char dest_path[MAX_PATH];
+            snprintf(dest_path, sizeof(dest_path), "%s/%s/%s", dest_root, rel[0] ? rel : "", entry->d_name);
+            if (S_ISDIR(st.st_mode)) {
+                mkdir_recursive(dest_path);
+                char sub_rel[MAX_PATH];
+                snprintf(sub_rel, sizeof(sub_rel), "%s/%s", rel[0] ? rel : "", entry->d_name);
+                dump_dir_recursive(base, sub_rel, dest_root);
+            } else if (S_ISREG(st.st_mode)) {
+                char dest_dir[MAX_PATH];
+                strncpy(dest_dir, dest_path, sizeof(dest_dir));
+                char *last = strrchr(dest_dir, '/');
+                if (last) *last = '\0';
+                mkdir_recursive(dest_dir);
+                dump_file_full(full, dest_path);
             }
-            strncpy(job->src, src_path, sizeof(job->src) - 1);
-            job->src[sizeof(job->src) - 1] = 0;
-            strncpy(job->dst, dst_path, sizeof(job->dst) - 1);
-            job->dst[sizeof(job->dst) - 1] = 0;
-            job->next = NULL;
-
-            pthread_mutex_lock(&file_mutex);
-            if (file_tail) {
-                file_tail->next = job;
-                file_tail = job;
-            } else {
-                file_head = file_tail = job;
-            }
-            pthread_cond_signal(&file_cond);
-            pthread_mutex_unlock(&file_mutex);
         }
-        // シンボリックリンクやスペシャルファイルは無視
     }
     closedir(dir);
 }
 
-// ==================== メイン ====================
-int main(void) {
-    umask(0); // パーミッション強制
-
-    // 出力ルートディレクトリ作成
-    mkdir_recursive(OUTPUT_DIR);
-
-    LOG("=== ブロックデバイス ダンプ開始 (mmcblk0p1 ~ p69) ===\n");
-
-    // ---- ブロックデバイス用スレッドプール起動 ----
-    pthread_t block_threads[MAX_BLOCK_WORKERS];
-    for (int i = 0; i < MAX_BLOCK_WORKERS; i++) {
-        pthread_create(&block_threads[i], NULL, block_worker, NULL);
-    }
-
-    // ブロックキューにタスク投入
-    pthread_mutex_lock(&block_mutex);
-    for (int i = BLOCK_START; i <= BLOCK_END; i++) {
-        block_queue[block_rear++] = i;
-    }
-    pthread_cond_broadcast(&block_cond);
-    pthread_mutex_unlock(&block_mutex);
-
-    // ブロックキューが空になるまで待機
-    while (1) {
-        pthread_mutex_lock(&block_mutex);
-        if (block_front == block_rear) {
-            block_done = 1;
-            pthread_cond_broadcast(&block_cond);
-            pthread_mutex_unlock(&block_mutex);
-            break;
+// 特定のパス一覧をダンプ（ファイル or ディレクトリ）
+static void dump_path_list(const char *dest_root, const char *paths[], int count) {
+    for (int i = 0; i < count; i++) {
+        const char *src = paths[i];
+        struct stat st;
+        if (lstat(src, &st) == 0) {
+            char dest[MAX_PATH];
+            snprintf(dest, sizeof(dest), "%s/%s", dest_root, basename((char*)src));
+            if (S_ISDIR(st.st_mode)) {
+                mkdir_recursive(dest);
+                dump_dir_recursive(src, "", dest);
+            } else if (S_ISREG(st.st_mode)) {
+                dump_file_full(src, dest);
+            }
         }
-        pthread_mutex_unlock(&block_mutex);
-        usleep(100000); // 100ms待機
     }
+}
 
-    // ブロックワーカースレッド終了待ち
-    for (int i = 0; i < MAX_BLOCK_WORKERS; i++) {
-        pthread_join(block_threads[i], NULL);
-    }
-    LOG("=== ブロックデバイス ダンプ完了 ===\n");
-
-    // ---- ファイルコピー ( /data/system/ ) ----
-    LOG("=== /data/system/ スキャン & コピー開始 ===\n");
-
-    // ファイル用スレッドプール起動
-    pthread_t file_threads[MAX_FILE_WORKERS];
-    for (int i = 0; i < MAX_FILE_WORKERS; i++) {
-        pthread_create(&file_threads[i], NULL, file_worker, NULL);
-    }
-
-    // 出力ベースディレクトリ
-    char data_out_dir[512];
-    snprintf(data_out_dir, sizeof(data_out_dir), "%s/data_system", OUTPUT_DIR);
-    mkdir_recursive(data_out_dir);
-
-    // 再帰ウォーク開始（この関数内でキューにジョブを投入し続ける）
-    walk_directory(DATA_SYSTEM_DIR, data_out_dir);
-
-    // キューが空になるまで待機し、完了フラグをセット
-    while (1) {
-        pthread_mutex_lock(&file_mutex);
-        if (file_head == NULL) {
-            file_done = 1;
-            pthread_cond_broadcast(&file_cond);
-            pthread_mutex_unlock(&file_mutex);
-            break;
+// ブロックデバイス一括ダンプ（mmcblk0p0〜68）
+static void dump_block_devices(const char *dest_dir) {
+    for (int i = 0; i <= 68; i++) {
+        char src[MAX_PATH], dst[MAX_PATH];
+        snprintf(src, sizeof(src), "/dev/block/mmcblk0p%d", i);
+        if (access(src, F_OK) == 0) {
+            snprintf(dst, sizeof(dst), "%s/block_mmcblk0p%d", dest_dir, i);
+            dump_block_partial(src, dst);
         }
-        pthread_mutex_unlock(&file_mutex);
-        usleep(100000);
+    }
+}
+
+// メイン
+int main(int argc, char **argv) {
+    char base_dir[MAX_PATH] = DUMP_BASE;
+    if (argc > 1) {
+        snprintf(base_dir, sizeof(base_dir), "%s", argv[1]);
+    }
+    // タイムスタンプ付きサブディレクトリ
+    time_t t = time(NULL);
+    struct tm *tm = localtime(&t);
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", tm);
+    char dump_root[MAX_PATH];
+    snprintf(dump_root, sizeof(dump_root), "%s/dump_%s", base_dir, timestamp);
+    mkdir_recursive(dump_root);
+
+    // 1. /proc/self/ 以下
+    char proc_dest[MAX_PATH];
+    snprintf(proc_dest, sizeof(proc_dest), "%s/proc_self", dump_root);
+    mkdir_recursive(proc_dest);
+    dump_dir_recursive("/proc/self", "", proc_dest);
+
+    // 2. /vendor/bin/
+    char vendor_dest[MAX_PATH];
+    snprintf(vendor_dest, sizeof(vendor_dest), "%s/vendor_bin", dump_root);
+    mkdir_recursive(vendor_dest);
+    dump_dir_recursive("/vendor/bin", "", vendor_dest);
+
+    // 3. ブロックデバイス
+    char block_dest[MAX_PATH];
+    snprintf(block_dest, sizeof(block_dest), "%s/block", dump_root);
+    mkdir_recursive(block_dest);
+    dump_block_devices(block_dest);
+
+    // 4. システムディレクトリ（読み取り可能なもの）
+    const char *system_paths[] = {
+        "/system/build.prop",
+        "/default.prop",
+        "/vendor/build.prop",
+        "/data/system/packages.xml",
+        "/data/system/users.xml",
+        "/data/misc/wifi/wpa_supplicant.conf",
+        "/data/misc/keystore/",
+        "/data/misc/vpn/",
+        "/data/misc/bluetooth/",
+        "/etc/hosts",
+        "/system/etc/hosts"
+    };
+    char sys_dest[MAX_PATH];
+    snprintf(sys_dest, sizeof(sys_dest), "%s/system_misc", dump_root);
+    mkdir_recursive(sys_dest);
+    dump_path_list(sys_dest, system_paths, sizeof(system_paths)/sizeof(system_paths[0]));
+
+    // 5. /data/system/ 全体（権限があれば）
+    char data_sys_dest[MAX_PATH];
+    snprintf(data_sys_dest, sizeof(data_sys_dest), "%s/data_system", dump_root);
+    mkdir_recursive(data_sys_dest);
+    dump_dir_recursive("/data/system", "", data_sys_dest);
+
+    // 6. /data/misc/ 全体
+    char data_misc_dest[MAX_PATH];
+    snprintf(data_misc_dest, sizeof(data_misc_dest), "%s/data_misc", dump_root);
+    mkdir_recursive(data_misc_dest);
+    dump_dir_recursive("/data/misc", "", data_misc_dest);
+
+    // 7. /data/local/tmp/ など（もし権限があれば）→ シェルが読める場所にダンプ
+    // ただし system_app は通常読み書き不可なのでスキップ
+
+    // 8. ファイル一覧作成（find / -type f -readable 相当）
+    char list_path[MAX_PATH];
+    snprintf(list_path, sizeof(list_path), "%s/file_list.txt", dump_root);
+    int fd = open(list_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "find / -type f -readable 2>/dev/null | head -1000");
+        FILE *fp = popen(cmd, "r");
+        if (fp) {
+            char line[1024];
+            while (fgets(line, sizeof(line), fp)) {
+                write(fd, line, strlen(line));
+            }
+            pclose(fp);
+        }
+        close(fd);
     }
 
-    // ファイルワーカースレッド終了待ち
-    for (int i = 0; i < MAX_FILE_WORKERS; i++) {
-        pthread_join(file_threads[i], NULL);
+    // 完了メッセージ（ファイルに出力）
+    char done_path[MAX_PATH];
+    snprintf(done_path, sizeof(done_path), "%s/COMPLETE", dump_root);
+    fd = open(done_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Dump completed at %s\n", dump_root);
+        write(fd, msg, strlen(msg));
+        close(fd);
     }
 
-    LOG("=== 全処理完了 (/sdcard/download/ に出力済み) ===\n");
+    // 標準出力にも表示（logcatで見えるように）
+    fprintf(stderr, "Dump completed: %s\n", dump_root);
     return 0;
 }
