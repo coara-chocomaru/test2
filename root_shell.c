@@ -10,7 +10,6 @@
 #include <errno.h>
 #include <time.h>
 #include <limits.h>
-#include <libgen.h>
 
 // ダンプ先（デフォルト）
 #ifndef DUMP_BASE
@@ -18,31 +17,26 @@
 #endif
 
 #define MAX_PATH 4096
-#define CHUNK_SIZE (1024 * 1024)      // 1MB
-#define MAX_FILE_SIZE (64 * 1024 * 1024) // 64MB
+#define CHUNK_SIZE (1024 * 1024)          // 1MB
+#define MAX_FILE_SIZE (64 * 1024 * 1024)  // 64MB
 #define BLOCK_READ_SIZE (2 * 1024 * 1024) // ブロックデバイスは先頭2MB
 
-// 安全な文字列結合
-static void safe_concat(char *dest, const char *src, size_t max) {
-    size_t len = strlen(dest);
-    if (len + strlen(src) + 1 < max) {
-        strcat(dest, src);
-    }
-}
+// タイムスタンプを取得（グローバル）
+static char g_timestamp[32];
 
-// 再帰的ディレクトリ作成
-static void mkdir_recursive(const char *path) {
+// 安全なファイル名生成（パスをファイル名に変換：スラッシュ→アンダースコア）
+static void path_to_filename(const char *path, char *out, size_t out_size) {
     char tmp[MAX_PATH];
-    char *p;
-    snprintf(tmp, sizeof(tmp), "%s", path);
-    for (p = tmp + 1; *p; p++) {
-        if (*p == '/') {
-            *p = '\0';
-            mkdir(tmp, 0755);
-            *p = '/';
-        }
+    strncpy(tmp, path, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+    // 先頭の / を除去
+    char *p = tmp;
+    if (*p == '/') p++;
+    // スラッシュをアンダースコアに置換
+    for (int i = 0; p[i]; i++) {
+        if (p[i] == '/') p[i] = '_';
     }
-    mkdir(tmp, 0755);
+    snprintf(out, out_size, "%s_%s", p, g_timestamp);
 }
 
 // ファイルの完全コピー（サイズ制限付き）
@@ -89,8 +83,8 @@ static void dump_block_partial(const char *src, const char *dst) {
     close(fd_out);
 }
 
-// ディレクトリ再帰ダンプ（相対パスを保持）
-static void dump_dir_recursive(const char *base, const char *rel, const char *dest_root) {
+// ディレクトリを再帰的に探索し、各ファイルをダンプ（外部コマンドなし）
+static void dump_dir_recursive(const char *base, const char *rel, const char *dest_prefix) {
     char path[MAX_PATH];
     snprintf(path, sizeof(path), "%s/%s", base, rel[0] ? rel : "");
     DIR *dir = opendir(path);
@@ -103,20 +97,19 @@ static void dump_dir_recursive(const char *base, const char *rel, const char *de
         snprintf(full, sizeof(full), "%s/%s", path, entry->d_name);
         struct stat st;
         if (lstat(full, &st) == 0) {
-            char dest_path[MAX_PATH];
-            snprintf(dest_path, sizeof(dest_path), "%s/%s/%s", dest_root, rel[0] ? rel : "", entry->d_name);
             if (S_ISDIR(st.st_mode)) {
-                mkdir_recursive(dest_path);
                 char sub_rel[MAX_PATH];
                 snprintf(sub_rel, sizeof(sub_rel), "%s/%s", rel[0] ? rel : "", entry->d_name);
-                dump_dir_recursive(base, sub_rel, dest_root);
+                dump_dir_recursive(base, sub_rel, dest_prefix);
             } else if (S_ISREG(st.st_mode)) {
-                char dest_dir[MAX_PATH];
-                strncpy(dest_dir, dest_path, sizeof(dest_dir));
-                char *last = strrchr(dest_dir, '/');
-                if (last) *last = '\0';
-                mkdir_recursive(dest_dir);
-                dump_file_full(full, dest_path);
+                char dst_file[MAX_PATH];
+                // 相対パスをファイル名に変換（スラッシュ→アンダースコア）
+                char rel_path[MAX_PATH];
+                snprintf(rel_path, sizeof(rel_path), "%s/%s", rel[0] ? rel : "", entry->d_name);
+                path_to_filename(rel_path, dst_file, sizeof(dst_file));
+                char dst[MAX_PATH];
+                snprintf(dst, sizeof(dst), "%s%s", dest_prefix, dst_file);
+                dump_file_full(full, dst);
             }
         }
     }
@@ -124,30 +117,35 @@ static void dump_dir_recursive(const char *base, const char *rel, const char *de
 }
 
 // 特定のパス一覧をダンプ（ファイル or ディレクトリ）
-static void dump_path_list(const char *dest_root, const char *paths[], int count) {
+static void dump_path_list(const char *dest_prefix, const char *paths[], int count) {
     for (int i = 0; i < count; i++) {
         const char *src = paths[i];
         struct stat st;
         if (lstat(src, &st) == 0) {
-            char dest[MAX_PATH];
-            snprintf(dest, sizeof(dest), "%s/%s", dest_root, basename((char*)src));
+            char dst_file[MAX_PATH];
+            path_to_filename(src, dst_file, sizeof(dst_file));
+            char dst[MAX_PATH];
+            snprintf(dst, sizeof(dst), "%s%s", dest_prefix, dst_file);
             if (S_ISDIR(st.st_mode)) {
-                mkdir_recursive(dest);
-                dump_dir_recursive(src, "", dest);
+                // ディレクトリの場合は再帰的にダンプ（相対パスは空）
+                dump_dir_recursive(src, "", dest_prefix);
             } else if (S_ISREG(st.st_mode)) {
-                dump_file_full(src, dest);
+                dump_file_full(src, dst);
             }
         }
     }
 }
 
 // ブロックデバイス一括ダンプ（mmcblk0p0〜68）
-static void dump_block_devices(const char *dest_dir) {
+static void dump_block_devices(const char *dest_prefix) {
     for (int i = 0; i <= 68; i++) {
-        char src[MAX_PATH], dst[MAX_PATH];
+        char src[MAX_PATH];
         snprintf(src, sizeof(src), "/dev/block/mmcblk0p%d", i);
         if (access(src, F_OK) == 0) {
-            snprintf(dst, sizeof(dst), "%s/block_mmcblk0p%d", dest_dir, i);
+            char dst_file[MAX_PATH];
+            snprintf(dst_file, sizeof(dst_file), "block_mmcblk0p%d_%s", i, g_timestamp);
+            char dst[MAX_PATH];
+            snprintf(dst, sizeof(dst), "%s%s", dest_prefix, dst_file);
             dump_block_partial(src, dst);
         }
     }
@@ -155,38 +153,30 @@ static void dump_block_devices(const char *dest_dir) {
 
 // メイン
 int main(int argc, char **argv) {
-    char base_dir[MAX_PATH] = DUMP_BASE;
-    if (argc > 1) {
-        snprintf(base_dir, sizeof(base_dir), "%s", argv[1]);
-    }
-    // タイムスタンプ付きサブディレクトリ
+    // タイムスタンプ生成
     time_t t = time(NULL);
     struct tm *tm = localtime(&t);
-    char timestamp[32];
-    strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", tm);
-    char dump_root[MAX_PATH];
-    snprintf(dump_root, sizeof(dump_root), "%s/dump_%s", base_dir, timestamp);
-    mkdir_recursive(dump_root);
+    strftime(g_timestamp, sizeof(g_timestamp), "%Y%m%d_%H%M%S", tm);
+
+    // ダンプ先ディレクトリ（/cache/ 直下）
+    const char *base_dir = DUMP_BASE;
+    if (argc > 1) {
+        base_dir = argv[1];
+    }
+
+    // /cache/ に書き込めるか確認（存在しなければ作成はしない）
+    // 実際にはすでに存在するはず
 
     // 1. /proc/self/ 以下
-    char proc_dest[MAX_PATH];
-    snprintf(proc_dest, sizeof(proc_dest), "%s/proc_self", dump_root);
-    mkdir_recursive(proc_dest);
-    dump_dir_recursive("/proc/self", "", proc_dest);
+    dump_dir_recursive("/proc/self", "", base_dir);
 
-    // 2. /vendor/bin/
-    char vendor_dest[MAX_PATH];
-    snprintf(vendor_dest, sizeof(vendor_dest), "%s/vendor_bin", dump_root);
-    mkdir_recursive(vendor_dest);
-    dump_dir_recursive("/vendor/bin", "", vendor_dest);
+    // 2. /vendor/bin/ 以下
+    dump_dir_recursive("/vendor/bin", "", base_dir);
 
     // 3. ブロックデバイス
-    char block_dest[MAX_PATH];
-    snprintf(block_dest, sizeof(block_dest), "%s/block", dump_root);
-    mkdir_recursive(block_dest);
-    dump_block_devices(block_dest);
+    dump_block_devices(base_dir);
 
-    // 4. システムディレクトリ（読み取り可能なもの）
+    // 4. 特定のシステムファイル/ディレクトリ
     const char *system_paths[] = {
         "/system/build.prop",
         "/default.prop",
@@ -200,56 +190,22 @@ int main(int argc, char **argv) {
         "/etc/hosts",
         "/system/etc/hosts"
     };
-    char sys_dest[MAX_PATH];
-    snprintf(sys_dest, sizeof(sys_dest), "%s/system_misc", dump_root);
-    mkdir_recursive(sys_dest);
-    dump_path_list(sys_dest, system_paths, sizeof(system_paths)/sizeof(system_paths[0]));
+    dump_path_list(base_dir, system_paths, sizeof(system_paths)/sizeof(system_paths[0]));
 
     // 5. /data/system/ 全体（権限があれば）
-    char data_sys_dest[MAX_PATH];
-    snprintf(data_sys_dest, sizeof(data_sys_dest), "%s/data_system", dump_root);
-    mkdir_recursive(data_sys_dest);
-    dump_dir_recursive("/data/system", "", data_sys_dest);
+    dump_dir_recursive("/data/system", "", base_dir);
 
     // 6. /data/misc/ 全体
-    char data_misc_dest[MAX_PATH];
-    snprintf(data_misc_dest, sizeof(data_misc_dest), "%s/data_misc", dump_root);
-    mkdir_recursive(data_misc_dest);
-    dump_dir_recursive("/data/misc", "", data_misc_dest);
+    dump_dir_recursive("/data/misc", "", base_dir);
 
-    // 7. /data/local/tmp/ など（もし権限があれば）→ シェルが読める場所にダンプ
-    // ただし system_app は通常読み書き不可なのでスキップ
+    // 7. ファイル一覧を作成（外部コマンドを使わず、自分で探索）
+    // ただし、/以下を全探索するのは時間がかかるので、主要ディレクトリに限定
+    // ここでは簡易的に、/proc, /sys, /data, /system, /vendor, /etc, /dev など
+    // 実際には / 全体を探索すると非常に時間がかかるので、コメントアウト
+    // 代わりに、重要なディレクトリを個別に指定する
+    // ここでは既に上記で多くのものをカバーしているので省略
 
-    // 8. ファイル一覧作成（find / -type f -readable 相当）
-    char list_path[MAX_PATH];
-    snprintf(list_path, sizeof(list_path), "%s/file_list.txt", dump_root);
-    int fd = open(list_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd >= 0) {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "find / -type f -readable 2>/dev/null | head -1000");
-        FILE *fp = popen(cmd, "r");
-        if (fp) {
-            char line[1024];
-            while (fgets(line, sizeof(line), fp)) {
-                write(fd, line, strlen(line));
-            }
-            pclose(fp);
-        }
-        close(fd);
-    }
-
-    // 完了メッセージ（ファイルに出力）
-    char done_path[MAX_PATH];
-    snprintf(done_path, sizeof(done_path), "%s/COMPLETE", dump_root);
-    fd = open(done_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd >= 0) {
-        char msg[256];
-        snprintf(msg, sizeof(msg), "Dump completed at %s\n", dump_root);
-        write(fd, msg, strlen(msg));
-        close(fd);
-    }
-
-    // 標準出力にも表示（logcatで見えるように）
-    fprintf(stderr, "Dump completed: %s\n", dump_root);
+    // 完了メッセージ（標準エラーに出力、logcatで見える）
+    fprintf(stderr, "Dump completed at %s\n", base_dir);
     return 0;
 }
