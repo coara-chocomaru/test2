@@ -14,7 +14,7 @@
 
 // ダンプ先（デフォルト）
 #ifndef DUMP_BASE
-#define DUMP_BASE "/cache/dump"
+#define DUMP_BASE "/cache/"
 #endif
 
 #define MAX_PATH 4096
