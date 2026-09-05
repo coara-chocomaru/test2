@@ -1,11 +1,14 @@
 /*
- * boot_flag_writer.c
+ * bruteforce_writer.c
  *
- * ユーザー空間から可能な限りの方法で apps_boot_info+0x08 に
- * 0x77665500 を書き込み、bootloader 再起動を試みる。
+ * ユーザー空間から apps_boot_info 周辺の物理メモリに対して
+ * 0x77665500 などのマジックナンバーを総当たりで書き込み、
+ * どのアドレス・値が正しいかを特定する。
  *
- * コンパイル: aarch64-linux-android-gcc -static -O2 -o boot_flag_writer boot_flag_writer.c
- * 実行: su -c /data/local/tmp/boot_flag_writer
+ * 再起動は行わない（手動で確認するため）
+ *
+ * コンパイル: aarch64-linux-android-gcc -static -O2 -o bruteforce_writer bruteforce_writer.c
+ * 実行: su -c /data/local/tmp/bruteforce_writer
  */
 
 #define _GNU_SOURCE
@@ -17,200 +20,168 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/mman.h>
-#include <sys/reboot.h>
-#include <sys/syscall.h>
-#include <linux/reboot.h>
-#include <time.h>
+#include <sys/stat.h>
+#include <dirent.h>
 
-#define TARGET_PADDR 0x8f69cf80UL
-#define MAGIC_VALUE  0x77665500UL
+// ターゲットアドレス範囲（中心 0x8f69cf78）
+#define BASE_ADDR 0x8f69cf78UL
+#define RANGE     0x30      // ±0x30 バイトをスキャン
+#define STEP      4         // 4バイト刻み
 
-static void msleep(int ms) {
-    struct timespec ts = { ms / 1000, (ms % 1000) * 1000000 };
-    nanosleep(&ts, NULL);
-}
+// 試すマジックナンバー（aboot が認識する可能性のある値）
+static const uint32_t magic_values[] = {
+    0x77665500,  // bootloader
+    0x77665501,  // normal (無視されるかもしれないが念のため)
+    0x77665502,  // recovery
+    0x77665503,  // rtc
+    0x77665508,  // dm-verity corrupted
+    0x77665509,  // dm-verity enforcing
+    0x7766550a,  // keys clear
+    0x6f656d00,  // oem-? (一部)
+};
+#define NUM_MAGIC (sizeof(magic_values) / sizeof(magic_values[0]))
 
-static int write_file(const char *path, const char *value) {
-    int fd = open(path, O_WRONLY);
-    if (fd < 0) return -errno;
-    ssize_t ret = write(fd, value, strlen(value));
-    close(fd);
-    return (ret == (ssize_t)strlen(value)) ? 0 : -EIO;
-}
-
-static int try_devmem(void) {
-    int fd, ret = -1;
-    void *map;
-    uint32_t val = MAGIC_VALUE;
-    uint32_t check;
-    int i;
-
-    printf("[*] Trying /dev/mem direct write...\n");
-    fd = open("/dev/mem", O_RDWR | O_SYNC);
+static int write_mem_direct(off_t paddr, uint32_t value, uint32_t *readback) {
+    int fd = open("/dev/mem", O_RDWR | O_SYNC);
     if (fd < 0) {
-        printf("[-] open(/dev/mem) failed: %s\n", strerror(errno));
-        return -errno;
+        // /dev/mem が開けない場合は /dev/kmem を試す
+        fd = open("/dev/kmem", O_RDWR | O_SYNC);
+        if (fd < 0) return -errno;
+        // kmem では lseek/write を使う
+        if (lseek(fd, paddr, SEEK_SET) == (off_t)-1) {
+            close(fd);
+            return -errno;
+        }
+        if (write(fd, &value, sizeof(value)) != sizeof(value)) {
+            close(fd);
+            return -errno;
+        }
+        if (lseek(fd, paddr, SEEK_SET) == (off_t)-1) {
+            close(fd);
+            return -errno;
+        }
+        if (read(fd, readback, sizeof(*readback)) != sizeof(*readback)) {
+            close(fd);
+            return -errno;
+        }
+        close(fd);
+        return 0;
     }
 
-    map = mmap(NULL, 4, PROT_READ | PROT_WRITE, MAP_SHARED, fd, TARGET_PADDR);
+    // /dev/mem 経由の mmap
+    void *map = mmap(NULL, 4, PROT_READ | PROT_WRITE, MAP_SHARED, fd, paddr);
     if (map == MAP_FAILED) {
-        printf("[-] mmap failed: %s\n", strerror(errno));
         close(fd);
         return -errno;
     }
 
-    printf("[+] Mapped 0x%lx to %p\n", TARGET_PADDR, map);
-
-    // 現在の値を読み取り
-    uint32_t old = *(volatile uint32_t *)map;
-    printf("[*] Current value: 0x%08x\n", old);
-
-    // 書き込み（リトライ）
-    for (i = 0; i < 5; i++) {
-        *(volatile uint32_t *)map = val;
-        __sync_synchronize();
-        msync(map, 4, MS_SYNC);
-        check = *(volatile uint32_t *)map;
-        if (check == val) {
-            printf("[+] Write SUCCESS (attempt %d)\n", i+1);
-            ret = 0;
-            break;
-        }
-        printf("[*] Readback: 0x%08x (attempt %d)\n", check, i+1);
-        msleep(100);
-    }
+    *readback = *(volatile uint32_t *)map;
+    *(volatile uint32_t *)map = value;
+    __sync_synchronize();
+    msync(map, 4, MS_SYNC);
+    *readback = *(volatile uint32_t *)map;
 
     munmap(map, 4);
     close(fd);
+    return 0;
+}
+
+static int try_sysfs_qpnp_pon(void) {
+    // /sys/class/qpnp-pon/ 以下に reboot_reason ファイルがあれば書き込む
+    DIR *dir = opendir("/sys/class/qpnp-pon");
+    if (!dir) return -1;
+    struct dirent *entry;
+    int ret = -1;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "qpnp-pon-", 9) == 0) {
+            char path[256];
+            snprintf(path, sizeof(path), "/sys/class/qpnp-pon/%s/reboot_reason", entry->d_name);
+            int fd = open(path, O_WRONLY);
+            if (fd >= 0) {
+                const char *val = "0x77665500";
+                if (write(fd, val, strlen(val)) == (ssize_t)strlen(val)) {
+                    printf("[+] Wrote to %s\n", path);
+                    ret = 0;
+                }
+                close(fd);
+            }
+        }
+    }
+    closedir(dir);
     return ret;
 }
 
-static int try_devkmem(void) {
-    int fd;
-    void *map;
-    uint32_t val = MAGIC_VALUE;
-    uint32_t check;
-
-    printf("[*] Trying /dev/kmem (if available)...\n");
-    fd = open("/dev/kmem", O_RDWR | O_SYNC);
-    if (fd < 0) {
-        printf("[-] open(/dev/kmem) failed: %s\n", strerror(errno));
-        return -errno;
-    }
-
-    // kmem では mmap できないことが多いので lseek/write を使う
-    if (lseek(fd, TARGET_PADDR, SEEK_SET) == -1) {
-        printf("[-] lseek failed: %s\n", strerror(errno));
-        close(fd);
-        return -errno;
-    }
-    if (write(fd, &val, sizeof(val)) != sizeof(val)) {
-        printf("[-] write failed: %s\n", strerror(errno));
-        close(fd);
-        return -errno;
-    }
-    lseek(fd, TARGET_PADDR, SEEK_SET);
-    if (read(fd, &check, sizeof(check)) != sizeof(check)) {
-        printf("[-] readback failed: %s\n", strerror(errno));
-        close(fd);
-        return -errno;
-    }
+static int try_debugfs_smem(void) {
+    // /sys/kernel/debug/msm_smem があれば読み書きを試す（稀）
+    int fd = open("/sys/kernel/debug/msm_smem", O_RDWR);
+    if (fd < 0) return -1;
+    // ここでは単にファイルが存在するかだけ確認
     close(fd);
-    if (check == val) {
-        printf("[+] /dev/kmem write SUCCESS!\n");
-        return 0;
-    } else {
-        printf("[-] /dev/kmem write FAILED (readback: 0x%08x)\n", check);
-        return -1;
-    }
-}
-
-static int try_sysfs(void) {
-    printf("[*] Trying /sys/class/reboot/mode ...\n");
-    if (write_file("/sys/class/reboot/mode", "bootloader") == 0) {
-        printf("[+] /sys/class/reboot/mode success.\n");
-        return 0;
-    }
-    if (write_file("/sys/class/reboot/reboot_mode", "bootloader") == 0) {
-        printf("[+] /sys/class/reboot/reboot_mode success.\n");
-        return 0;
-    }
-    printf("[-] sysfs methods failed.\n");
-    return -1;
-}
-
-static int try_setprop(void) {
-    printf("[*] Trying setprop ...\n");
-    int ret = system("setprop persist.sys.bootloader 1 2>/dev/null");
-    if (ret == 0) {
-        printf("[+] setprop success.\n");
-        return 0;
-    }
-    ret = system("setprop sys.bootloader 1 2>/dev/null");
-    if (ret == 0) {
-        printf("[+] setprop (sys) success.\n");
-        return 0;
-    }
-    printf("[-] setprop failed.\n");
-    return -1;
-}
-
-static void do_reboot(void) {
-    printf("\n[*] Rebooting to bootloader in 3 seconds...\n");
-    sleep(3);
-    sync();
-    long ret = syscall(__NR_reboot,
-                       LINUX_REBOOT_MAGIC1,
-                       LINUX_REBOOT_MAGIC2,
-                       LINUX_REBOOT_CMD_RESTART2,
-                       "bootloader");
-    if (ret != 0) {
-        perror("reboot syscall");
-        printf("[!] syscall failed, trying system() fallback...\n");
-        system("reboot bootloader");
-    }
+    return 0; // 本当はパースして apps_boot_info を探すが、複雑なのでパス
 }
 
 int main(int argc, char **argv) {
-    printf("=== Boot Flag Writer (User-space final attempt) ===\n");
-    printf("Target: 0x%lx, Magic: 0x%08x\n", TARGET_PADDR, MAGIC_VALUE);
-    printf("Note: This binary will try all possible methods.\n\n");
+    printf("=== Boot Flag Bruteforce Writer ===\n");
+    printf("Scanning address range 0x%lx - 0x%lx\n", BASE_ADDR - RANGE, BASE_ADDR + RANGE);
+    printf("Trying %d magic values.\n\n", NUM_MAGIC);
 
-    int success = 0;
-    int ret;
+    int found = 0;
+    uint32_t readback;
 
-    // 1. /dev/mem
-    ret = try_devmem();
-    if (ret == 0) success = 1;
-
-    // 2. /dev/kmem (fallback)
-    if (!success) {
-        ret = try_devkmem();
-        if (ret == 0) success = 1;
+    // アドレス総当たり
+    for (off_t addr = BASE_ADDR - RANGE; addr <= BASE_ADDR + RANGE; addr += STEP) {
+        for (int mi = 0; mi < NUM_MAGIC; mi++) {
+            uint32_t magic = magic_values[mi];
+            int ret = write_mem_direct(addr, magic, &readback);
+            if (ret == 0) {
+                if (readback == magic) {
+                    printf("[SUCCESS] Address 0x%lx: wrote 0x%08x, readback matches.\n", addr, magic);
+                    found++;
+                } else {
+                    printf("[INFO] Address 0x%lx: wrote 0x%08x, readback 0x%08x (mismatch)\n", addr, magic, readback);
+                }
+            } else {
+                // エラーの場合はアドレスごとに一度だけ表示
+                static off_t last_error_addr = 0;
+                if (addr != last_error_addr) {
+                    printf("[ERROR] Cannot access 0x%lx: %s\n", addr, strerror(-ret));
+                    last_error_addr = addr;
+                }
+                break; // このアドレスはアクセスできないので次のアドレスへ
+            }
+        }
     }
 
-    // 3. sysfs
-    if (!success) {
-        ret = try_sysfs();
-        if (ret == 0) success = 1;
-    }
-
-    // 4. setprop
-    if (!success) {
-        ret = try_setprop();
-        if (ret == 0) success = 1;
-    }
-
-    if (success) {
-        printf("\n[+] At least one method succeeded.\n");
-        do_reboot();
+    // 追加の sysfs 試行
+    printf("\n[*] Trying /sys/class/qpnp-pon/reboot_reason ...\n");
+    if (try_sysfs_qpnp_pon() == 0) {
+        printf("[+] qpnp-pon write succeeded.\n");
+        found++;
     } else {
-        printf("\n[!!!] ALL METHODS FAILED.\n");
-        printf("[!!!] This device likely has CONFIG_STRICT_DEVMEM enabled.\n");
-        printf("[!!!] User-space boot flag injection is IMPOSSIBLE.\n");
-        printf("[!!!] You MUST use a kernel module (.ko) or EDL firmware reflash.\n");
-        printf("[!!!] Exiting without reboot.\n");
-        return EXIT_FAILURE;
+        printf("[-] qpnp-pon write failed or not available.\n");
+    }
+
+    printf("\n[*] Trying /sys/kernel/debug/msm_smem (check only) ...\n");
+    if (try_debugfs_smem() == 0) {
+        printf("[+] debugfs msm_smem exists (may contain SMEM data).\n");
+        printf("[*] You can manually examine it with 'cat /sys/kernel/debug/msm_smem'\n");
+    } else {
+        printf("[-] debugfs msm_smem not available.\n");
+    }
+
+    if (found > 0) {
+        printf("\n[RESULT] At least one successful write occurred.\n");
+        printf("[*] Now try to reboot to bootloader manually:\n");
+        printf("    adb shell su -c 'reboot bootloader'\n");
+        printf("[*] If it works, the correct address/value is among the successes above.\n");
+    } else {
+        printf("\n[RESULT] No successful write detected.\n");
+        printf("[*] This means:\n");
+        printf("  1. /dev/mem and /dev/kmem are blocked (CONFIG_STRICT_DEVMEM).\n");
+        printf("  2. The target physical address range is not mappable.\n");
+        printf("  3. The device does not have any sysfs interface for reboot reason.\n");
+        printf("\n[CONCLUSION] User-space injection is IMPOSSIBLE on this device.\n");
+        printf("You must use a kernel module (.ko) or reflash firmware via EDL.\n");
     }
 
     return 0;
