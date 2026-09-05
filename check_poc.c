@@ -1,14 +1,10 @@
 /*
  * write_boot_flag.c
+ * 物理メモリ（apps_boot_info + 0x08）に 0x77665500 を書き込み、
+ * システムを bootloader モードで再起動する。
  *
- * ユーザー空間から物理メモリ（apps_boot_info + 0x08）に
- * ブートローダーマジック（0x77665500）を直接書き込み、
- * reboot bootloader を実行する。
- *
- * コンパイル: 静的リンク推奨（-static）
- * 実行: /data/local/tmp/write_boot_flag
- *
- * このプログラムはパーティションを一切変更しません。
+ * コンパイル: aarch64-linux-android-gcc -static -O2 -o write_boot_flag write_boot_flag.c
+ * 実行: /data/local/tmp/write_boot_flag (root必要)
  */
 
 #define _GNU_SOURCE
@@ -19,9 +15,10 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/reboot.h>
+#include <sys/syscall.h>
+#include <linux/reboot.h>
 #include <errno.h>
 #include <string.h>
-#include <linux/reboot.h>
 
 #define TARGET_PADDR 0x8f69cf80UL   // apps_boot_info + 0x08
 #define MAGIC_VALUE  0x77665500UL   // bootloader magic
@@ -43,7 +40,6 @@ int main(int argc, char **argv) {
     if (fd < 0) {
         die("open(/dev/mem)");
     }
-
     printf("write_boot_flag: /dev/mem opened successfully.\n");
 
     // 2. 物理アドレスをマッピング（4バイト）
@@ -52,7 +48,6 @@ int main(int argc, char **argv) {
         close(fd);
         die("mmap");
     }
-
     printf("write_boot_flag: Mapped physical address 0x%lx to virtual %p\n",
            TARGET_PADDR, map_base);
 
@@ -86,15 +81,18 @@ int main(int argc, char **argv) {
 
     printf("write_boot_flag: Successfully wrote 0x%08x.\n", new_val);
 
-    // 8. すぐに再起動（bootloader）
+    // 8. システムを bootloader モードで再起動（syscall を使用）
     printf("write_boot_flag: Rebooting to bootloader...\n");
     sync();
 
-    // reboot(RB_AUTOBOOT) では bootloader 引数が渡せないので syscall を使う
-    // LINUX_REBOOT_MAGIC1=0xfee1dead, LINUX_REBOOT_MAGIC2=0x28121969
-    if (reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
-               LINUX_REBOOT_CMD_RESTART2, (void *)"bootloader") < 0) {
-        die("reboot(RESTART2)");
+    // カーネルシステムコール reboot(RESTART2) を直接呼び出す
+    long ret = syscall(__NR_reboot,
+                       LINUX_REBOOT_MAGIC1,
+                       LINUX_REBOOT_MAGIC2,
+                       LINUX_REBOOT_CMD_RESTART2,
+                       "bootloader");
+    if (ret != 0) {
+        die("syscall(reboot)");
     }
 
     // ここには来ない
