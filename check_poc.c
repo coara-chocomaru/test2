@@ -1,8 +1,8 @@
 /*
- * set_fastboot_deep.c
- * 多角的アプローチで Fastboot 移行フラグを確実に設定する
- * コンパイル: aarch64-linux-android-gcc -static -O2 -o set_fastboot_deep set_fastboot_deep.c
- * 実行: adb shell su -c "/data/local/tmp/set_fastboot_deep"
+ * set_fastboot_final_real.c
+ * 正しい ID マッピング (ID 12, 9, 29, 34, 35) に基づく最終多角的アプローチ
+ * コンパイル: aarch64-linux-android-clang -static -O2 -o set_fastboot_final_real set_fastboot_final_real.c
+ * 実行: adb shell su -c "/data/local/tmp/set_fastboot_final_real"
  */
 
 #include <stdio.h>
@@ -19,12 +19,16 @@
 #define DNAND_IOCTL_WRITE   0x10
 #define DNAND_IOCTL_READ    0x11
 
-// ターゲット ID
-#define DNAND_ID_FASTBOOT_FLAG  29
-#define DNAND_ID_REBOOT_PARM    20
-#define DNAND_ID_OS_MODE        27
+/* ===== 正しい ID 定義 (再カウント済み) ===== */
+#define ID_FACTORY_CMDLINE      9   // カーネルコマンドライン追記
+#define ID_REBOOT_PARM          12  // ★再起動パラメータ文字列
+#define ID_FASTBOOT_FLAG        29  // フラグ
+#define ID_RESCUE_ENABL_FLG     32  // レスキューモード有効
+#define ID_OS_MODE              34  // OS モード
+#define ID_RECOVERY_MODE        35  // リカバリモード
+#define ID_FBDL_ENABLE          39  // Flash Boot Download (EDL)
 
-// 20バイトパック構造体
+// 20バイトパック構造体 (ドライバ期待値)
 struct __attribute__((packed)) dnand_req {
     uint32_t id;
     uint32_t value;
@@ -33,31 +37,13 @@ struct __attribute__((packed)) dnand_req {
 };
 _Static_assert(sizeof(struct dnand_req) == 20, "struct must be 20 bytes");
 
-/* ====== DNAND 基本 I/O ====== */
 static int dnand_open(void) {
     int fd = open(DNAND_DEVICE, O_RDWR);
-    if (fd < 0)
-        fprintf(stderr, "open %s failed: %s\n", DNAND_DEVICE, strerror(errno));
+    if (fd < 0) fprintf(stderr, "open %s failed: %s\n", DNAND_DEVICE, strerror(errno));
     return fd;
 }
 
-/* 読み取り (data_ptr にバッファを渡す) */
-static int dnand_read_id(int id, uint32_t *out) {
-    int fd = dnand_open();
-    if (fd < 0) return -1;
-    struct dnand_req req = {
-        .id = id,
-        .value = 0,
-        .data_ptr = (uint64_t)out,
-        .data_len = sizeof(*out)
-    };
-    int ret = ioctl(fd, DNAND_IOCTL_READ, &req);
-    close(fd);
-    if (ret < 0) fprintf(stderr, "read id %d failed: %s\n", id, strerror(errno));
-    return ret;
-}
-
-/* 数値書き込み (ID + value) */
+/* 数値書き込み */
 static int dnand_write_value(int id, uint32_t val) {
     int fd = dnand_open();
     if (fd < 0) return -1;
@@ -73,11 +59,11 @@ static int dnand_write_value(int id, uint32_t val) {
     return ret;
 }
 
-/* 文字列書き込み (ID + 文字列) */
+/* 文字列書き込み (ID 9, 12 など) */
 static int dnand_write_string(int id, const char *str) {
     int fd = dnand_open();
     if (fd < 0) return -1;
-    size_t len = strlen(str) + 1; // NULL終端含む
+    size_t len = strlen(str) + 1;
     struct dnand_req req = {
         .id = id,
         .value = 0,
@@ -90,7 +76,7 @@ static int dnand_write_string(int id, const char *str) {
     return ret;
 }
 
-/* ====== MISC パーティション書き込み (従来方式) ====== */
+/* /misc パーティション書き込み (複数バリエーションを試す) */
 static int write_misc(const char *data) {
     const char *paths[] = {
         "/dev/block/bootdevice/by-name/misc",
@@ -113,60 +99,63 @@ static int write_misc(const char *data) {
         fprintf(stderr, "misc write failed: %s\n", strerror(errno));
         return -1;
     }
-    printf("[+] misc パーティションに '%s' を書き込みました\n", data);
+    printf("[+] misc に '%s' 書き込み完了\n", data);
     return 0;
 }
 
-/* ====== メイン ====== */
-int main(void) {
-    uint32_t val29, val20, val27;
-
-    printf("=== Fastboot 移行フラグ ディープ設定 ===\n\n");
-
-    // 1. 現在値の読み取り
-    printf("[*] 現在の各フラグ値を読み取り中...\n");
-    if (dnand_read_id(DNAND_ID_FASTBOOT_FLAG, &val29) == 0)
-        printf("    ID 29 (FASTBOOT_FLAG) = %u\n", val29);
-    if (dnand_read_id(DNAND_ID_REBOOT_PARM, &val20) == 0)
-        printf("    ID 20 (REBOOT_PARM)   = %u (数値として)\n", val20);
-    if (dnand_read_id(DNAND_ID_OS_MODE, &val27) == 0)
-        printf("    ID 27 (OS_MODE)       = %u\n", val27);
-    printf("\n");
-
-    // 2. すべての関連フラグを設定
-    printf("[*] Fastboot 移行のための全フラグを設定します...\n");
-
-    // 2-1: FASTBOOT_FLAG = 1
-    if (dnand_write_value(DNAND_ID_FASTBOOT_FLAG, 1) == 0)
-        printf("[+] ID 29 (FASTBOOT_FLAG) = 1 設定完了\n");
-
-    // 2-2: REBOOT_PARM に "bootloader" を書き込む (文字列)
-    if (dnand_write_string(DNAND_ID_REBOOT_PARM, "bootloader") == 0)
-        printf("[+] ID 20 (REBOOT_PARM) に 'bootloader' 書き込み完了\n");
-
-    // 2-3: OS_MODE = 0 (通常起動? 1だとリカバリ? 0が安全)
-    if (dnand_write_value(DNAND_ID_OS_MODE, 0) == 0)
-        printf("[+] ID 27 (OS_MODE) = 0 設定完了\n");
-
-    printf("\n");
-
-    // 3. 従来の MISC パーティション方式も併用
-    printf("[*] /misc パーティションにも 'bootloader' を書き込みます\n");
-    write_misc("bootloader");
-
-    printf("\n");
-    printf("[完了] すべての設定が完了しました。\n");
-    printf("[注意] 必ず 'adb shell reboot' または 'reboot' で再起動してください。\n");
-    printf("       再起動後、デバイスが Fastboot モードで起動するはずです。\n");
-
-    // 念のため再読み取りして確認
-    printf("\n[*] 設定後の値を再確認...\n");
-    if (dnand_read_id(DNAND_ID_FASTBOOT_FLAG, &val29) == 0)
-        printf("    ID 29 (FASTBOOT_FLAG) = %u\n", val29);
-    if (dnand_read_id(DNAND_ID_REBOOT_PARM, &val20) == 0) {
-        // 文字列として読めるか試す (安全のため数値表示)
-        printf("    ID 20 (REBOOT_PARM)   = %u (数値)\n", val20);
+/* 現在の cmdline を表示 (デバッグ用) */
+static void check_cmdline(void) {
+    FILE *fp = fopen("/proc/cmdline", "r");
+    if (!fp) return;
+    char buf[1024];
+    if (fgets(buf, sizeof(buf), fp)) {
+        printf("[情報] 現在のカーネルコマンドライン:\n  %s\n", buf);
     }
+    fclose(fp);
+}
+
+int main(void) {
+    printf("=== 正しい ID マッピングに基づく Fastboot 移行 多角的総攻撃 ===\n\n");
+
+    // 0. 現在のカーネルコマンドラインを表示
+    check_cmdline();
+    printf("\n");
+
+    // 1. ID 9 (FACTORY_CMDLINE) に "androidboot.mode=fastboot" を追記 (最強)
+    printf("[*] ID 9 (FACTORY_CMDLINE) に androidboot.mode=fastboot を設定...\n");
+    dnand_write_string(ID_FACTORY_CMDLINE, "androidboot.mode=fastboot");
+
+    // 2. ID 12 (REBOOT_PARM) に "bootloader" を設定 (真のトリガー)
+    printf("[*] ID 12 (REBOOT_PARM) に 'bootloader' を設定...\n");
+    dnand_write_string(ID_REBOOT_PARM, "bootloader");
+
+    // 3. ID 29 (FASTBOOT_FLAG) を 1 に
+    printf("[*] ID 29 (FASTBOOT_FLAG) を 1 に設定...\n");
+    dnand_write_value(ID_FASTBOOT_FLAG, 1);
+
+    // 4. ID 34 (OS_MODE) を 1 (Fastboot を示す可能性) に
+    printf("[*] ID 34 (OS_MODE) を 1 に設定...\n");
+    dnand_write_value(ID_OS_MODE, 1);
+
+    // 5. ID 35 (RECOVERY_MODE) を 0 にクリア (念のため)
+    printf("[*] ID 35 (RECOVERY_MODE) を 0 にクリア...\n");
+    dnand_write_value(ID_RECOVERY_MODE, 0);
+
+    // 6. ID 32 (RESCUE_ENABL_FLG) も 1 に (一部デバイスではこれが Fastboot と同義)
+    printf("[*] ID 32 (RESCUE_ENABL_FLG) を 1 に設定...\n");
+    dnand_write_value(ID_RESCUE_ENABL_FLG, 1);
+
+    // 7. /misc パーティションに "bootloader" と "reboot-bootloader" を連続書き込み
+    printf("[*] /misc パーティションに 'bootloader' を書き込み...\n");
+    write_misc("bootloader");
+    printf("[*] /misc パーティションに 'reboot-bootloader' を書き込み...\n");
+    write_misc("reboot-bootloader");
+
+    printf("\n[完了] 全経路への書き込みが完了しました。\n");
+    printf("すぐに 'adb shell reboot' または 'reboot' で再起動してください。\n");
+    printf("もし再起動後も通常起動する場合、以下のデバッグ情報を提供してください:\n");
+    printf("  adb shell cat /proc/cmdline\n");
+    printf("  adb shell getprop | grep -i fastboot\n");
 
     return 0;
 }
