@@ -1,12 +1,11 @@
 /*
- * set_fastboot_multi.c
- * 複数の書き込みパターンを試して DNAND_ID_FASTBOOT_FLAG (ID=29) を設定する
- * コンパイル: aarch64-linux-android-gcc -static -O2 -o set_fastboot_multi set_fastboot_multi.c
+ * set_fastboot_fixed.c
+ * パディングを排除して /dev/dnand_cdev に正しく ioctl を送信する
+ * コンパイル: aarch64-linux-android-gcc -static -O2 -o set_fastboot_fixed set_fastboot_fixed.c
  * 使用法:
- *   ./set_fastboot_multi --get               → 現在の値を読み取る
- *   ./set_fastboot_multi --set 1             → 有効化 (Fastboot起動) を試行
- *   ./set_fastboot_multi --set 0             → 無効化
- *   ./set_fastboot_multi                     → デフォルトで読み取りのみ
+ *   ./set_fastboot_fixed --get
+ *   ./set_fastboot_fixed --set 1
+ *   ./set_fastboot_fixed --set 0
  */
 
 #include <stdio.h>
@@ -19,20 +18,22 @@
 #include <sys/ioctl.h>
 
 #define DNAND_DEVICE "/dev/dnand_cdev"
-
 #define DNAND_IOCTL_WRITE   0x10
 #define DNAND_IOCTL_READ    0x11
 #define DNAND_ID_FASTBOOT_FLAG 29
 
-/* カーネルとの通信構造体 (64bit アーキテクチャ準拠) */
-struct dnand_ioctl_req {
+/* パディングなし構造体 (20バイト) */
+struct __attribute__((packed)) dnand_ioctl_req {
     uint32_t id;       /* 0x00 */
-    uint32_t value;    /* 0x04 : 書き込み値 または 読み取りバッファサイズ */
-    uint64_t data_ptr; /* 0x08 : データバッファポインタ */
-    uint32_t data_len; /* 0x10 : バッファサイズ */
+    uint32_t value;    /* 0x04 */
+    uint64_t data_ptr; /* 0x08 */
+    uint32_t data_len; /* 0x10 */
 };
 
-/* ----- 基本 I/O 関数 ----- */
+/* 構造体サイズが期待通りかコンパイル時チェック */
+_Static_assert(sizeof(struct dnand_ioctl_req) == 20, "struct size must be 20 bytes");
+
+/* ----- 基本 I/O ----- */
 static int dnand_open(void) {
     int fd = open(DNAND_DEVICE, O_RDWR);
     if (fd < 0) {
@@ -41,7 +42,7 @@ static int dnand_open(void) {
     return fd;
 }
 
-/* 現在のフラグ値を読み取る (成功なら 0/1 を返し、*val に格納) */
+/* 読み取り */
 static int dnand_get_flag(int *val) {
     int fd = dnand_open();
     if (fd < 0) return -1;
@@ -63,10 +64,8 @@ static int dnand_get_flag(int *val) {
     return 0;
 }
 
-/* ----- 書き込みパターン ----- */
-
-/* パターン1: 従来通り value フィールドに直接 0/1 をセット (data_ptr=0, data_len=0) */
-static int write_pattern_value(int fd, int enable) {
+/* 書き込み (パディングなし構造体版) */
+static int write_with_packed_struct(int fd, int enable) {
     struct dnand_ioctl_req req = {
         .id = DNAND_ID_FASTBOOT_FLAG,
         .value = enable ? 1 : 0,
@@ -76,64 +75,55 @@ static int write_pattern_value(int fd, int enable) {
     return ioctl(fd, DNAND_IOCTL_WRITE, &req);
 }
 
-/* パターン2: value=0 にして data_ptr にバッファを指し、data_len でサイズ指定 (一部ドライバが data_ptr を優先する可能性) */
-static int write_pattern_data_ptr(int fd, int enable) {
-    uint32_t buf = enable ? 1 : 0;
-    struct dnand_ioctl_req req = {
-        .id = DNAND_ID_FASTBOOT_FLAG,
-        .value = 0,
-        .data_ptr = (uint64_t)&buf,
-        .data_len = sizeof(buf)
-    };
-    return ioctl(fd, DNAND_IOCTL_WRITE, &req);
+/* 書き込み (生バッファ版 – より確実) */
+static int write_with_raw_buffer(int fd, int enable) {
+    uint8_t buf[20] = {0};
+    uint32_t id = DNAND_ID_FASTBOOT_FLAG;
+    uint32_t val = enable ? 1 : 0;
+    uint64_t ptr = 0;
+    uint32_t len = 0;
+
+    memcpy(buf + 0, &id, 4);
+    memcpy(buf + 4, &val, 4);
+    memcpy(buf + 8, &ptr, 8);
+    memcpy(buf + 16, &len, 4);
+
+    return ioctl(fd, DNAND_IOCTL_WRITE, buf);
 }
 
-/* パターン3: value と data_ptr の両方に値をセット (互換性テスト) */
-static int write_pattern_both(int fd, int enable) {
-    uint32_t buf = enable ? 1 : 0;
-    struct dnand_ioctl_req req = {
-        .id = DNAND_ID_FASTBOOT_FLAG,
-        .value = enable ? 1 : 0,
-        .data_ptr = (uint64_t)&buf,
-        .data_len = sizeof(buf)
-    };
-    return ioctl(fd, DNAND_IOCTL_WRITE, &req);
-}
-
-/* 全パターンを順に試行し、成功したパターン番号を返す (0=失敗) */
-static int try_all_write_patterns(int enable) {
+/* 両方の方法を試行 */
+static int try_both_methods(int enable) {
     int fd = dnand_open();
-    if (fd < 0) return 0;
+    if (fd < 0) return -1;
 
-    int patterns[] = {1, 2, 3};
-    int (*funcs[])(int, int) = {
-        write_pattern_value,
-        write_pattern_data_ptr,
-        write_pattern_both
-    };
-    const char *names[] = {
-        "value direct",
-        "data_ptr only",
-        "both value and data_ptr"
-    };
-
-    int success = 0;
-    for (int i = 0; i < 3; i++) {
-        printf("[*] パターン %d (%s) を試行中... ", i+1, names[i]);
-        int ret = funcs[i](fd, enable);
-        if (ret == 0) {
-            printf("成功\n");
-            success = i+1;
-            break;
-        } else {
-            printf("失敗 (errno=%d)\n", errno);
-        }
+    int ret = -1;
+    // 方法1: パディングなし構造体
+    printf("[*] パディングなし構造体で書き込みを試行...\n");
+    ret = write_with_packed_struct(fd, enable);
+    if (ret == 0) {
+        printf("[+] 構造体方式成功\n");
+        close(fd);
+        return 1;
+    } else {
+        printf("[-] 構造体方式失敗 (errno=%d)\n", errno);
     }
+
+    // 方法2: 生バッファ
+    printf("[*] 生バッファで書き込みを試行...\n");
+    ret = write_with_raw_buffer(fd, enable);
+    if (ret == 0) {
+        printf("[+] 生バッファ方式成功\n");
+        close(fd);
+        return 2;
+    } else {
+        printf("[-] 生バッファ方式失敗 (errno=%d)\n", errno);
+    }
+
     close(fd);
-    return success;
+    return 0;
 }
 
-/* ----- メイン関数 ----- */
+/* ----- メイン ----- */
 int main(int argc, char *argv[]) {
     int do_set = 0;
     int set_val = 0;
@@ -154,7 +144,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // 現在値を読み取り
+    // 現在値読み取り
     int cur_val;
     if (dnand_get_flag(&cur_val) == 0) {
         printf("[情報] 現在の FASTBOOT_FLAG = %d\n", cur_val);
@@ -163,11 +153,9 @@ int main(int argc, char *argv[]) {
     }
 
     if (do_set) {
-        printf("\n[実行] FASTBOOT_FLAG を %d に設定するため、全パターンを試行します。\n", set_val);
-        int success = try_all_write_patterns(set_val);
+        printf("\n[実行] FASTBOOT_FLAG を %d に設定します。\n", set_val);
+        int success = try_both_methods(set_val);
         if (success) {
-            printf("\n[成功] パターン %d で書き込みに成功しました。\n", success);
-            // 読み取り検証
             int new_val;
             if (dnand_get_flag(&new_val) == 0) {
                 printf("[検証] 読み取り結果: %d\n", new_val);
@@ -178,7 +166,7 @@ int main(int argc, char *argv[]) {
                 }
             }
         } else {
-            printf("\n[エラー] 全ての書き込みパターンが失敗しました。\n");
+            printf("[エラー] 全ての書き込み方法が失敗しました。\n");
             return 1;
         }
     }
