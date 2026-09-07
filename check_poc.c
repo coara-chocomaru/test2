@@ -10,7 +10,6 @@
 
 #define DNAND_DEVICE        "/dev/dnand_cdev"
 #define DNAND_IOCTL_WRITE   0x10
-#define DNAND_IOCTL_READ    0x11
 #define DNAND_ID_FASTBOOT   29
 
 struct __attribute__((__packed__)) dnand_ioctl_args {
@@ -20,15 +19,16 @@ struct __attribute__((__packed__)) dnand_ioctl_args {
     uint32_t    len;
 };
 
-static int dnand_id_write(int id, uint32_t value, const void *data, uint32_t len) {
+static int dnand_id_write(int id, uint32_t value) {
     int fd = open(DNAND_DEVICE, O_RDWR);
-    if (fd < 0) return -1;
+    if (fd < 0)
+        return -1;
 
     struct dnand_ioctl_args args = {
         .id       = (uint32_t)id,
         .value    = value,
-        .data_ptr = (uint64_t)(uintptr_t)data,
-        .len      = len
+        .data_ptr = 0,
+        .len      = 0
     };
 
     int ret = ioctl(fd, DNAND_IOCTL_WRITE, &args);
@@ -38,22 +38,21 @@ static int dnand_id_write(int id, uint32_t value, const void *data, uint32_t len
 
 int main(void) {
     if (getuid() != 0) {
-        fprintf(stderr, "ERROR: Root privileges required.\n");
+        fprintf(stderr, "Root privileges required.\n");
         return EXIT_FAILURE;
     }
 
-    if (dnand_id_write(DNAND_ID_FASTBOOT, 1, NULL, 0) != 0) {
-        perror("dnand_id_write");
+    if (dnand_id_write(DNAND_ID_FASTBOOT, 1) != 0) {
+        perror("Failed to write DNAND");
         return EXIT_FAILURE;
     }
 
-    fprintf(stdout, "Fastboot flag set successfully. Rebooting...\n");
+    printf("Fastboot flag set. Rebooting...\n");
     fflush(stdout);
-
     sync();
-    if (reboot(RB_AUTOBOOT) != 0) {
+
+    if (reboot(RB_AUTOBOOT) != 0)
         system("reboot bootloader");
-    }
 
     return EXIT_SUCCESS;
 }
