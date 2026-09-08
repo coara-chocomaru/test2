@@ -70,7 +70,7 @@ void run_fake_server(int listen_fd, const char *prop, const char *value) {
 
 int main(int argc, char **argv) {
     char *prop = "sys.usb.config";
-    char *value = "mtp,adb";
+    char *value = "mtp";
 
     if (argc >= 3) {
         prop = argv[1];
