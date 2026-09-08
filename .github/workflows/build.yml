@@ -11,10 +11,10 @@ jobs:
   build-android-arm64:
     runs-on: ubuntu-latest
     env:
-      NDK_VERSION: r25c
-      NDK_HOME: ${{ github.workspace }}/android-ndk-r25c
+      NDK_VERSION: r23c
+      NDK_HOME: ${{ github.workspace }}/android-ndk-r23c
       TARGET_ABI: arm64-v8a
-      API_LEVEL: android-31
+      API_LEVEL: android-22
       MODULE_NAME: check_poc
       SOURCE_FILE: check_poc.c
 
