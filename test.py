@@ -294,7 +294,7 @@ class DiagShell:
         return diag_exec_shell(self.ep_out, self.ep_in, combined, timeout=30.0, debug=self.debug)
 
     def interactive(self):
-        print("\n[DIAG シェル] (cd 実装版)")
+        print("\n[DIAG シェル] ")
         print(f"  現在のディレクトリ: {self.cwd}")
         print("  終了: Ctrl+C または 'exit'")
         print()
@@ -345,11 +345,11 @@ class DiagShell:
                 break
 
 def main():
-    parser = argparse.ArgumentParser(description="Kyocera DIAG シェル (cd 実装版)")
+    parser = argparse.ArgumentParser(description="Kyocera DIAG シェル ")
     parser.add_argument("--shell", action="store_true", help="インタラクティブシェルを開く")
     args = parser.parse_args()
 
-    print("=== Kyocera DIAG シェル (cd 実装版) ===")
+    print("=== Kyocera DIAG シェル ===")
 
     dev, intf_num, ep_out, ep_in = find_best_interface()
     if not dev:
