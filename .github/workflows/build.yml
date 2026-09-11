@@ -31,7 +31,7 @@ jobs:
           set -euxo pipefail
           apt-get update
           apt-get install -y --no-install-recommends \
-            ca-certificates curl wget unzip make file git bash \
+            ca-certificates curl wget unzip make file git bash coreutils \
             python2 python-is-python2 zstd
 
       - name: Checkout repository
@@ -48,31 +48,47 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.NDK_HOME }}
-          key: ndk-${{ env.NDK_VERSION }}-linux-x86_64-v1
+          key: ndk-${{ env.NDK_VERSION }}-linux-x86_64-v2
 
       - name: Download and setup Android NDK r10e
         if: steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
 
-          URL_PRIMARY="https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.bin"
-          URL_ARCHIVE="https://web.archive.org/web/2020id_/https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.bin"
+          URLS=(
+            "https://android.googlesource.com/platform/prebuilts/ndk/+/refs/heads/master/android-ndk-r10e-linux-x86_64.bin?format=TEXT"
+            "https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.zip"
+          )
 
-          echo "== Probe primary =="
-          STATUS_PRIMARY=$(curl -sL -o /dev/null -w "%{http_code}" "$URL_PRIMARY" || echo "000")
-          echo "Primary HTTP status: $STATUS_PRIMARY"
+          DOWNLOADED=0
+          for URL in "${URLS[@]}"; do
+            echo "== Trying: $URL =="
+            if wget -q --tries=2 --timeout=120 "$URL" -O ndk.bin; then
+              if file ndk.bin | grep -q "ASCII text"; then
+                echo "Detected base64 encoded file, decoding..."
+                base64 -d ndk.bin > ndk.decoded
+                mv ndk.decoded ndk.bin
+              fi
 
-          if [ "$STATUS_PRIMARY" = "200" ]; then
-            URL="$URL_PRIMARY"
-          else
-            echo "== Primary unavailable, fallback to archive.org =="
-            URL="$URL_ARCHIVE"
+              if file ndk.bin | grep -qE "executable|Zip archive"; then
+                echo "Download successful from: $URL"
+                DOWNLOADED=1
+                break
+              else
+                echo "Downloaded file is not a valid NDK package, trying next..."
+                rm -f ndk.bin
+              fi
+            else
+              echo "Download failed from: $URL"
+              rm -f ndk.bin
+            fi
+          done
+
+          if [ "$DOWNLOADED" -ne 1 ]; then
+            echo "Error: Failed to download NDK r10e from all mirrors."
+            exit 1
           fi
-          echo "Using URL: $URL"
 
-          cd /opt
-          wget -q --tries=3 --timeout=300 "$URL" -O ndk.bin
-          ls -la ndk.bin
           chmod +x ndk.bin
           ./ndk.bin > /dev/null
           rm -f ndk.bin
