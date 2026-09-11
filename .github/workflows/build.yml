@@ -13,6 +13,9 @@ jobs:
     container:
       image: ubuntu:20.04
       options: --user root
+    defaults:
+      run:
+        shell: bash
     env:
       DEBIAN_FRONTEND: noninteractive
       NDK_VERSION: r10e
@@ -25,15 +28,15 @@ jobs:
     steps:
       - name: Install base dependencies
         run: |
+          set -euxo pipefail
           apt-get update
           apt-get install -y --no-install-recommends \
-            ca-certificates curl wget unzip make file git \
+            ca-certificates curl wget unzip make file git bash \
             python2 python-is-python2 zstd
 
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # r10e 時代に合わせて Zulu JDK 7
       - name: Set up JDK 7 (Zulu)
         uses: actions/setup-java@v3
         with:
@@ -80,6 +83,7 @@ jobs:
 
       - name: Ensure source file exists
         run: |
+          set -euxo pipefail
           if [ ! -f "${{ env.SOURCE_FILE }}" ]; then
             C_FILE=$(ls *.c 2>/dev/null | head -n1)
             if [ -n "$C_FILE" ]; then
@@ -93,6 +97,7 @@ jobs:
 
       - name: Generate Android.mk
         run: |
+          set -euxo pipefail
           cat > Android.mk << 'EOF'
           LOCAL_PATH := $(call my-dir)
           include $(CLEAR_VARS)
@@ -136,7 +141,7 @@ jobs:
           file "$EXPECTED_BIN"
           ls -la "$EXPECTED_BIN"
 
-          echo "== Dynamic section (r10e は DT_FLAGS_1 / DT_GNU_HASH を出力しない) =="
+          echo "== Dynamic section =="
           readelf -d "$EXPECTED_BIN" | head -n 40 || true
 
       - name: Upload artifact
