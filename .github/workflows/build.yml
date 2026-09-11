@@ -1,4 +1,4 @@
-name: Build ARM64 Binary for Android 5.1+
+name: Build ARM64 Binary for Android 5.1+ (NDK r10e / Ubuntu 20.04)
 
 on:
   push:
@@ -23,31 +23,58 @@ jobs:
       SOURCE_FILE: check_poc.c
 
     steps:
-      - name: Install dependencies
+      - name: Install base dependencies
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            ca-certificates wget unzip make file git \
+            ca-certificates curl wget unzip make file git \
             python2 python-is-python2 zstd
 
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      # r10e 時代に合わせて Zulu JDK 7
+      - name: Set up JDK 7 (Zulu)
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: '7'
 
       - name: Cache Android NDK
         id: cache-ndk
         uses: actions/cache@v4
         with:
           path: ${{ env.NDK_HOME }}
-          key: ndk-${{ env.NDK_VERSION }}-linux-x86_64
+          key: ndk-${{ env.NDK_VERSION }}-linux-x86_64-v1
 
       - name: Download and setup Android NDK r10e
         if: steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
+          set -euxo pipefail
+
+          URL_PRIMARY="https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.bin"
+          URL_ARCHIVE="https://web.archive.org/web/2020id_/https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.bin"
+
+          echo "== Probe primary =="
+          STATUS_PRIMARY=$(curl -sL -o /dev/null -w "%{http_code}" "$URL_PRIMARY" || echo "000")
+          echo "Primary HTTP status: $STATUS_PRIMARY"
+
+          if [ "$STATUS_PRIMARY" = "200" ]; then
+            URL="$URL_PRIMARY"
+          else
+            echo "== Primary unavailable, fallback to archive.org =="
+            URL="$URL_ARCHIVE"
+          fi
+          echo "Using URL: $URL"
+
           cd /opt
-          wget -q https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.bin
-          chmod +x android-ndk-r10e-linux-x86_64.bin
-          ./android-ndk-r10e-linux-x86_64.bin > /dev/null
-          rm android-ndk-r10e-linux-x86_64.bin
+          wget -q --tries=3 --timeout=300 "$URL" -O ndk.bin
+          ls -la ndk.bin
+          chmod +x ndk.bin
+          ./ndk.bin > /dev/null
+          rm -f ndk.bin
+
+          echo "== NDK layout =="
           ls -d "$NDK_HOME"
           "$NDK_HOME/ndk-build" --version || true
 
@@ -80,8 +107,9 @@ jobs:
           EOF
           cat Android.mk
 
-      - name: Build with ndk-build
+      - name: Build with ndk-build (r10e / GCC 4.9)
         run: |
+          set -euxo pipefail
           export PATH="${{ env.NDK_HOME }}:${{ env.NDK_HOME }}/bin:$PATH"
           ndk-build \
             NDK_PROJECT_PATH=. \
@@ -92,17 +120,24 @@ jobs:
 
       - name: Verify and prepare binary
         run: |
+          set -euxo pipefail
           EXPECTED_DIR="libs/${{ env.TARGET_ABI }}"
           EXPECTED_BIN="$EXPECTED_DIR/${{ env.MODULE_NAME }}"
+
           if [ -f "$EXPECTED_BIN" ]; then
-            file "$EXPECTED_BIN"
-            ls -la "$EXPECTED_BIN"
+            echo "Binary found."
           else
             ALT_BIN=$(find libs -type f -executable 2>/dev/null | head -n1)
-            [ -n "$ALT_BIN" ] || { echo "No binary found"; exit 1; }
+            [ -n "$ALT_BIN" ] || { echo "No binary found in libs/"; exit 1; }
             mkdir -p "$EXPECTED_DIR"
             mv "$ALT_BIN" "$EXPECTED_BIN"
           fi
+
+          file "$EXPECTED_BIN"
+          ls -la "$EXPECTED_BIN"
+
+          echo "== Dynamic section (r10e は DT_FLAGS_1 / DT_GNU_HASH を出力しない) =="
+          readelf -d "$EXPECTED_BIN" | head -n 40 || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
