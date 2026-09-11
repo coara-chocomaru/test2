@@ -11,8 +11,8 @@ jobs:
   build-android-arm64:
     runs-on: ubuntu-latest
     env:
-      NDK_VERSION: r23c
-      NDK_HOME: ${{ github.workspace }}/android-ndk-r23c
+      NDK_VERSION: r10e
+      NDK_HOME: ${{ github.workspace }}/android-ndk-r10e
       TARGET_ABI: arm64-v8a
       API_LEVEL: android-22
       MODULE_NAME: check_poc
@@ -22,12 +22,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-
       - name: Cache Android NDK
         id: cache-ndk
         uses: actions/cache@v4
@@ -35,11 +29,13 @@ jobs:
           path: ${{ env.NDK_HOME }}
           key: ndk-${{ env.NDK_VERSION }}-${{ runner.os }}
 
-      - name: Download and setup Android NDK
+      # r10e は .bin（自己解凍形式）
+      - name: Download and setup Android NDK r10e
         if: steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
-          wget -q https://dl.google.com/android/repository/android-ndk-${{ env.NDK_VERSION }}-linux.zip
-          unzip -q android-ndk-${{ env.NDK_VERSION }}-linux.zip
+          wget -q https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.bin
+          chmod +x android-ndk-r10e-linux-x86_64.bin
+          ./android-ndk-r10e-linux-x86_64.bin
           echo "${{ env.NDK_HOME }}" >> $GITHUB_PATH
           echo "NDK_HOME=${{ env.NDK_HOME }}" >> $GITHUB_ENV
 
@@ -47,15 +43,8 @@ jobs:
         run: |
           if [ ! -f "${{ env.SOURCE_FILE }}" ]; then
             C_FILE=$(ls *.c 2>/dev/null | head -n1)
-            if [ -n "$C_FILE" ]; then
-              echo "Renaming $C_FILE to ${{ env.SOURCE_FILE }}"
-              mv "$C_FILE" "${{ env.SOURCE_FILE }}"
-            else
-              echo "Error: No .c file found!"
-              exit 1
-            fi
+            [ -n "$C_FILE" ] && mv "$C_FILE" "${{ env.SOURCE_FILE }}"
           fi
-          echo "Source file: ${{ env.SOURCE_FILE }}"
           ls -la *.c *.h 2>/dev/null || true
 
       - name: Generate Android.mk
@@ -67,12 +56,11 @@ jobs:
           LOCAL_MODULE := ${{ env.MODULE_NAME }}
           LOCAL_SRC_FILES := ${{ env.SOURCE_FILE }}
 
-          LOCAL_CFLAGS := -fPIE -Wall -Wextra -O2 -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -pthread
+          LOCAL_CFLAGS := -fPIE -Wall -Wextra -O2 -pthread
           LOCAL_LDFLAGS := -fPIE -pie
 
           include $(BUILD_EXECUTABLE)
           EOF
-          echo "Generated Android.mk:"
           cat Android.mk
 
       - name: Build with ndk-build
@@ -83,31 +71,7 @@ jobs:
             APP_BUILD_SCRIPT=./Android.mk \
             APP_ABI=${{ env.TARGET_ABI }} \
             APP_PLATFORM=${{ env.API_LEVEL }} \
-            APP_MIN_PLATFORM=${{ env.API_LEVEL }} \
-            -j$(nproc) \
-            V=1
-
-      - name: Verify and prepare binary for upload
-        run: |
-          EXPECTED_DIR="libs/${{ env.TARGET_ABI }}"
-          EXPECTED_BIN="$EXPECTED_DIR/${{ env.MODULE_NAME }}"
-          echo "Looking for binary at $EXPECTED_BIN"
-          if [ -f "$EXPECTED_BIN" ]; then
-            echo "Binary found."
-            file "$EXPECTED_BIN"
-            ls -la "$EXPECTED_BIN"
-          else
-            ALT_BIN=$(find libs -type f -executable 2>/dev/null | head -n1)
-            if [ -n "$ALT_BIN" ]; then
-              echo "Found alternative binary: $ALT_BIN"
-              mkdir -p "$EXPECTED_DIR"
-              mv "$ALT_BIN" "$EXPECTED_BIN"
-              echo "Renamed to $EXPECTED_BIN"
-            else
-              echo "Error: No binary found in libs/"
-              exit 1
-            fi
-          fi
+            -j$(nproc) V=1
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
