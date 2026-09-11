@@ -48,7 +48,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.NDK_HOME }}
-          key: ndk-${{ env.NDK_VERSION }}-linux-x86_64-v2
+          key: ndk-${{ env.NDK_VERSION }}-linux-x86_64-v3
 
       - name: Download and setup Android NDK r10e
         if: steps.cache-ndk.outputs.cache-hit != 'true'
@@ -56,31 +56,58 @@ jobs:
           set -euxo pipefail
 
           URLS=(
-            "https://android.googlesource.com/platform/prebuilts/ndk/+/refs/heads/master/android-ndk-r10e-linux-x86_64.bin?format=TEXT"
             "https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.zip"
+            "https://android.googlesource.com/platform/prebuilts/ndk/+/refs/heads/master/android-ndk-r10e-linux-x86_64.bin?format=TEXT"
           )
 
+          cd /opt
           DOWNLOADED=0
           for URL in "${URLS[@]}"; do
             echo "== Trying: $URL =="
-            if wget -q --tries=2 --timeout=120 "$URL" -O ndk.bin; then
-              if file ndk.bin | grep -q "ASCII text"; then
-                echo "Detected base64 encoded file, decoding..."
-                base64 -d ndk.bin > ndk.decoded
-                mv ndk.decoded ndk.bin
-              fi
+            rm -f dl_file
 
-              if file ndk.bin | grep -qE "executable|Zip archive"; then
-                echo "Download successful from: $URL"
-                DOWNLOADED=1
-                break
-              else
-                echo "Downloaded file is not a valid NDK package, trying next..."
-                rm -f ndk.bin
-              fi
-            else
+            if ! wget -q --tries=2 --timeout=300 "$URL" -O dl_file; then
               echo "Download failed from: $URL"
-              rm -f ndk.bin
+              rm -f dl_file
+              continue
+            fi
+
+            FTYPE=$(file -b dl_file)
+            echo "Downloaded file type: $FTYPE"
+
+            case "$FTYPE" in
+              *Zip*)
+                echo "== Extracting zip =="
+                mv dl_file ndk.zip
+                unzip -q ndk.zip -d /opt
+                rm -f ndk.zip
+                DOWNLOADED=1
+                ;;
+              *executable*|*shell*script*)
+                mv dl_file ndk.bin
+                chmod +x ndk.bin
+                echo "== Running self-extractor =="
+                ./ndk.bin > /dev/null
+                rm -f ndk.bin
+                DOWNLOADED=1
+                ;;
+              *ASCII*text*)
+                echo "== Base64 decoding =="
+                base64 -d dl_file > ndk.bin
+                rm -f dl_file
+                chmod +x ndk.bin
+                ./ndk.bin > /dev/null
+                rm -f ndk.bin
+                DOWNLOADED=1
+                ;;
+              *)
+                echo "Unknown file type, trying next mirror"
+                rm -f dl_file
+                ;;
+            esac
+
+            if [ "$DOWNLOADED" = "1" ]; then
+              break
             fi
           done
 
@@ -88,10 +115,6 @@ jobs:
             echo "Error: Failed to download NDK r10e from all mirrors."
             exit 1
           fi
-
-          chmod +x ndk.bin
-          ./ndk.bin > /dev/null
-          rm -f ndk.bin
 
           echo "== NDK layout =="
           ls -d "$NDK_HOME"
