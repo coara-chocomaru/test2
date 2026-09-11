@@ -10,15 +10,26 @@ on:
 jobs:
   build-android-arm64:
     runs-on: ubuntu-latest
+    container:
+      image: ubuntu:20.04
+      options: --user root
     env:
+      DEBIAN_FRONTEND: noninteractive
       NDK_VERSION: r10e
-      NDK_HOME: ${{ github.workspace }}/android-ndk-r10e
+      NDK_HOME: /opt/android-ndk-r10e
       TARGET_ABI: arm64-v8a
       API_LEVEL: android-22
       MODULE_NAME: check_poc
       SOURCE_FILE: check_poc.c
 
     steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates wget unzip make file git \
+            python2 python-is-python2 zstd
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -27,23 +38,29 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.NDK_HOME }}
-          key: ndk-${{ env.NDK_VERSION }}-${{ runner.os }}
+          key: ndk-${{ env.NDK_VERSION }}-linux-x86_64
 
-      # r10e は .bin（自己解凍形式）
       - name: Download and setup Android NDK r10e
         if: steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
+          cd /opt
           wget -q https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.bin
           chmod +x android-ndk-r10e-linux-x86_64.bin
-          ./android-ndk-r10e-linux-x86_64.bin
-          echo "${{ env.NDK_HOME }}" >> $GITHUB_PATH
-          echo "NDK_HOME=${{ env.NDK_HOME }}" >> $GITHUB_ENV
+          ./android-ndk-r10e-linux-x86_64.bin > /dev/null
+          rm android-ndk-r10e-linux-x86_64.bin
+          ls -d "$NDK_HOME"
+          "$NDK_HOME/ndk-build" --version || true
 
       - name: Ensure source file exists
         run: |
           if [ ! -f "${{ env.SOURCE_FILE }}" ]; then
             C_FILE=$(ls *.c 2>/dev/null | head -n1)
-            [ -n "$C_FILE" ] && mv "$C_FILE" "${{ env.SOURCE_FILE }}"
+            if [ -n "$C_FILE" ]; then
+              mv "$C_FILE" "${{ env.SOURCE_FILE }}"
+            else
+              echo "Error: No .c file found!"
+              exit 1
+            fi
           fi
           ls -la *.c *.h 2>/dev/null || true
 
@@ -72,6 +89,20 @@ jobs:
             APP_ABI=${{ env.TARGET_ABI }} \
             APP_PLATFORM=${{ env.API_LEVEL }} \
             -j$(nproc) V=1
+
+      - name: Verify and prepare binary
+        run: |
+          EXPECTED_DIR="libs/${{ env.TARGET_ABI }}"
+          EXPECTED_BIN="$EXPECTED_DIR/${{ env.MODULE_NAME }}"
+          if [ -f "$EXPECTED_BIN" ]; then
+            file "$EXPECTED_BIN"
+            ls -la "$EXPECTED_BIN"
+          else
+            ALT_BIN=$(find libs -type f -executable 2>/dev/null | head -n1)
+            [ -n "$ALT_BIN" ] || { echo "No binary found"; exit 1; }
+            mkdir -p "$EXPECTED_DIR"
+            mv "$ALT_BIN" "$EXPECTED_BIN"
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
