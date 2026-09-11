@@ -1,4 +1,4 @@
-name: Build ARM64 Binary for Android 11+
+name: Build ARM64 Binary for Android 5.1+
 
 on:
   push:
@@ -14,7 +14,7 @@ jobs:
       NDK_VERSION: r23c
       NDK_HOME: ${{ github.workspace }}/android-ndk-r23c
       TARGET_ABI: arm64-v8a
-      API_LEVEL: android-23
+      API_LEVEL: android-22
       MODULE_NAME: check_poc
       SOURCE_FILE: check_poc.c
 
@@ -77,13 +77,13 @@ jobs:
 
       - name: Build with ndk-build
         run: |
-          # PATH に NDK のルートと bin を追加（ndk-build はルートにあり、ツール類は bin にある）
           export PATH="${{ env.NDK_HOME }}:${{ env.NDK_HOME }}/bin:$PATH"
           ndk-build \
             NDK_PROJECT_PATH=. \
             APP_BUILD_SCRIPT=./Android.mk \
             APP_ABI=${{ env.TARGET_ABI }} \
             APP_PLATFORM=${{ env.API_LEVEL }} \
+            APP_MIN_PLATFORM=${{ env.API_LEVEL }} \
             -j$(nproc) \
             V=1
 
@@ -112,6 +112,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.MODULE_NAME }}_arm64_android11
+          name: ${{ env.MODULE_NAME }}_arm64_android5.1
           path: libs/${{ env.TARGET_ABI }}/${{ env.MODULE_NAME }}
           if-no-files-found: error
