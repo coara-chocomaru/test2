@@ -2,9 +2,9 @@ name: Build ARM64 Binary for Android 5.1+ (NDK r10e / Ubuntu 20.04)
 
 on:
   push:
-    branches: check3
+    branches: check4
   pull_request:
-    branches: check3
+    branches: check4
   workflow_dispatch:
 
 jobs:
