@@ -163,7 +163,7 @@ int main(int argc, char **argv)
     uint32_t fastboot_id  = DNAND_ID_FASTBOOT_FLAG;   /* 0x1d */
     uint32_t fastboot_val = 1;
     uint32_t reboot_id    = DNAND_ID_REBOOT_PARM;     /* 0x0c */
-    uint32_t reboot_val   = 0x77665500u;              /* Qualcomm bootloader magic */
+    uint32_t reboot_val   = 0x77665501u;              /* Qualcomm bootloader magic */
 
     if (argc > 1 && (strcmp(argv[1], "-h") == 0 ||
                      strcmp(argv[1], "--help") == 0)) {
